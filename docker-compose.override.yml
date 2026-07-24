@@ -1,0 +1,20 @@
+# Local-only overrides, auto-loaded by `docker compose` (no -f needed).
+#
+# The dev containers' default resolver can flake on crates.io behind some
+# local VM networks (OrbStack / Docker Desktop), so pin public DNS here. CI
+# runs the containers with `-f docker-compose.yml` only (skipping this file),
+# because forcing 8.8.8.8 there breaks the runner's own resolution — the
+# hosted runner's default DNS works fine inside the container.
+services:
+  dev:
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+  dev-el9:
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+  dev-debian:
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1

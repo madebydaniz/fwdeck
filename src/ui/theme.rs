@@ -127,8 +127,7 @@ impl Theme {
     #[must_use]
     pub fn detect(variant: Variant, color_enabled: bool) -> Self {
         let truecolor = std::env::var("COLORTERM")
-            .map(|v| v.contains("truecolor") || v.contains("24bit"))
-            .unwrap_or(false);
+            .is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"));
         Self::new(variant, color_enabled, truecolor)
     }
 

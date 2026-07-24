@@ -266,7 +266,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.theme, "dracula");
         assert_eq!(config.sidebar_width, 22);
-        assert_eq!(config.refresh_interval, Duration::from_millis(5000));
+        assert_eq!(config.refresh_interval, Duration::from_secs(5));
         assert_eq!(config.target, ConfigurationTarget::RuntimeAndPermanent);
         assert!(config.confirm_destructive);
         assert!(!config.read_only);

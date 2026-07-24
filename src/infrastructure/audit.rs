@@ -21,8 +21,7 @@ pub fn record(op_id: u64, outcome: &OperationOutcome) -> Result<(), String> {
     };
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |elapsed| elapsed.as_secs());
     let status = match outcome {
         OperationOutcome::Applied { .. } => "applied",
         OperationOutcome::PartiallyApplied { .. } => "partially-applied",

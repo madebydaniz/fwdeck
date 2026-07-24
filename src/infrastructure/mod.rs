@@ -33,9 +33,7 @@ pub fn process_uid() -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata("/proc/self")
-            .map(|m| m.uid())
-            .unwrap_or(0)
+        std::fs::metadata("/proc/self").map_or(0, |m| m.uid())
     }
     #[cfg(not(unix))]
     0

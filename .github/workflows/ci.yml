@@ -100,11 +100,13 @@ jobs:
             distro: almalinux-9 # firewalld 1.x
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # `-f docker-compose.yml` skips docker-compose.override.yml, whose local
+      # DNS pin (8.8.8.8) breaks crates.io resolution on hosted runners.
       - name: Build dev image
-        run: docker compose build ${{ matrix.service }}
+        run: docker compose -f docker-compose.yml build ${{ matrix.service }}
       - name: Run real-daemon suite (serial)
         run: |
-          docker compose run --rm ${{ matrix.service }} bash -c \
+          docker compose -f docker-compose.yml run --rm ${{ matrix.service }} bash -c \
             "cargo test --features dbus --test real_firewalld -- --ignored --test-threads=1"
 
   dependency-review:
