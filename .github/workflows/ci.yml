@@ -100,14 +100,24 @@ jobs:
             distro: almalinux-9 # firewalld 1.x
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      # `-f docker-compose.yml` skips docker-compose.override.yml, whose local
-      # DNS pin (8.8.8.8) breaks crates.io resolution on hosted runners.
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      # The dev container can't reach crates.io on hosted runners (fresh cargo
+      # cache, no container egress). Fetch the locked deps on the runner, which
+      # has network, then mount them in for a fully offline build. `-f
+      # docker-compose.yml` also skips docker-compose.override.yml (local-only).
+      - name: Pre-fetch crates on the runner
+        run: cargo fetch --locked
       - name: Build dev image
         run: docker compose -f docker-compose.yml build ${{ matrix.service }}
-      - name: Run real-daemon suite (serial)
+      - name: Run real-daemon suite (serial, offline)
         run: |
-          docker compose -f docker-compose.yml run --rm ${{ matrix.service }} bash -c \
-            "cargo test --features dbus --test real_firewalld -- --ignored --test-threads=1"
+          docker compose -f docker-compose.yml run --rm \
+            -e CARGO_HOME=/ci-cargo \
+            -v "$HOME/.cargo/registry:/ci-cargo/registry" \
+            ${{ matrix.service }} bash -c \
+            "cargo test --offline --features dbus --test real_firewalld -- --ignored --test-threads=1"
 
   dependency-review:
     name: Dependency review
