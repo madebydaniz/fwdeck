@@ -55,8 +55,7 @@ pub fn save(snapshot: &FirewallSnapshot) -> Result<String, String> {
     create_private_dir(&dir).map_err(|err| err.to_string())?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0);
+        .map_or(0, |elapsed| elapsed.as_millis());
     // Reserve a unique filename by *atomically* creating it (O_EXCL), bumping a
     // suffix on collision. This closes the check-then-create race a
     // `while path.exists()` loop leaves open: two saves in the same millisecond
