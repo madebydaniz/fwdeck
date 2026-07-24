@@ -2,9 +2,9 @@
 #
 # The dev containers' default resolver can flake on crates.io behind some
 # local VM networks (OrbStack / Docker Desktop), so pin public DNS here. CI
-# runs the containers with `-f docker-compose.yml` only (skipping this file),
-# because forcing 8.8.8.8 there breaks the runner's own resolution — the
-# hosted runner's default DNS works fine inside the container.
+# doesn't use this file (it runs `-f docker-compose.yml` only): the hosted
+# runner's containers have no reliable network egress at all, so CI builds
+# offline from crates pre-fetched on the runner instead (see ci.yml).
 services:
   dev:
     dns:
