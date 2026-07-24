@@ -1,0 +1,1 @@
+ipv4 filter INPUT 9 -p tcp --dport 12345 -j ACCEPT

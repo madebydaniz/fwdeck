@@ -1,0 +1,119 @@
+[package]
+name = "fwdeck"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+description = "A safety-first terminal user interface for inspecting and managing firewalld."
+authors = ["madebydaniz"]
+license = "MIT"
+readme = "README.md"
+
+homepage = "https://madebydaniz.com"
+repository = "https://github.com/madebydaniz/fwdeck"
+
+keywords = [
+    "firewalld",
+    "firewall",
+    "tui",
+    "linux",
+    "sysadmin",
+]
+
+categories = [
+    "command-line-utilities",
+    "network-programming",
+    "os::linux-apis",
+]
+
+[dependencies]
+anyhow = "1.0"
+
+clap = { version = "4.5", features = [
+    "derive",
+    "env",
+] }
+
+clap_complete = "4.5"
+clap_mangen = "0.2"
+
+crossterm = { version = "0.29", features = [
+    "event-stream",
+] }
+
+directories = "6.0"
+futures-util = "0.3"
+ratatui = "0.30.2"
+
+serde = { version = "1.0", features = [
+    "derive",
+] }
+
+serde_json = "1.0"
+
+strum = { version = "0.28", features = [
+    "derive",
+] }
+
+thiserror = "2.0"
+
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+
+toml = "1.1"
+tracing = "0.1"
+
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "fmt",
+] }
+
+zbus = { version = "5.17", default-features = false, features = [
+    "tokio",
+], optional = true }
+
+[features]
+default = []
+# Native firewalld D-Bus backend (ADR-4). Off by default: the CLI backend is
+# the reference implementation. Build with `--features dbus`.
+dbus = ["dep:zbus"]
+
+[dev-dependencies]
+insta = { version = "1", features = [
+    "yaml",
+] }
+
+pretty_assertions = "1.4"
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+dbg_macro = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

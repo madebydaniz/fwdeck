@@ -1,0 +1,37 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: fwdeck doctor output
+      description: Paste the output of `fwdeck doctor` (it never touches the firewall).
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      placeholder: e.g. Fedora 42, RHEL 9.4, Debian 13
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      placeholder: e.g. kitty over ssh, GNOME Terminal, tmux inside alacritty
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: "`~/.local/state/fwdeck/fwdeck.log` — run with `--log-level debug` if possible."
+      render: text

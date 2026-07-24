@@ -1,0 +1,799 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FWDeck Documentation</title>
+<link rel="icon" type="image/svg+xml" href="../assets/logo-dark.svg">
+<meta name="description" content="Install, verify, and operate FWDeck — the safety-first terminal UI for firewalld.">
+<style>
+:root{
+  --page:#0e0f16; --panel:#151622; --panel2:#1a1b29; --line:#262838; --line2:#34364c;
+  --fg:#eceef8; --muted:#8b90ad; --dim:#5c6183;
+  --purple:#bd93f9; --pink:#ff79c6; --cyan:#8be9fd; --green:#50fa7b;
+  --orange:#ffb86c; --red:#ff5555;
+  --grad:linear-gradient(100deg,#bd93f9 0%,#ff79c6 55%,#8be9fd 110%);
+  --mono:ui-monospace,'SF Mono','JetBrains Mono',Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:80px}
+body{background:var(--page);color:var(--fg);font-family:var(--sans);line-height:1.7}
+a{color:var(--cyan);text-decoration:none}
+a:hover{text-decoration:underline}
+nav.top{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);
+  background:rgba(14,15,22,.78);border-bottom:1px solid var(--line)}
+nav.top .in{max-width:1240px;margin:0 auto;padding:0 24px;display:flex;
+  justify-content:space-between;align-items:center;height:58px}
+nav.top .logo{font-weight:800;color:var(--fg)}
+nav.top .logo b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+nav.top .links a{color:var(--muted);font-size:.92rem;margin-left:22px}
+nav.top .links a:hover{color:var(--fg);text-decoration:none}
+.layout{max-width:1240px;margin:0 auto;display:grid;grid-template-columns:250px 1fr;gap:48px;padding:0 24px}
+aside{position:sticky;top:58px;height:calc(100vh - 58px);overflow-y:auto;padding:32px 0 60px;
+  border-right:1px solid var(--line)}
+aside .group{font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--dim);margin:22px 0 8px}
+aside .group:first-child{margin-top:0}
+aside a{display:block;color:var(--muted);font-size:.9rem;padding:5px 12px;border-left:2px solid transparent;
+  border-radius:0 6px 6px 0}
+aside a:hover{color:var(--fg);background:var(--panel);text-decoration:none}
+main{padding:40px 0 100px;min-width:0}
+main h1{font-size:2.2rem;font-weight:800;letter-spacing:-.02em}
+main .lead{color:var(--muted);font-size:1.08rem;margin:14px 0 8px;max-width:640px}
+section{padding-top:56px}
+section h2{font-size:1.5rem;font-weight:800;letter-spacing:-.01em;padding-bottom:10px;
+  border-bottom:1px solid var(--line);margin-bottom:18px}
+section h3{font-size:1.05rem;font-weight:700;margin:28px 0 10px}
+section p{color:var(--muted);margin-bottom:14px;max-width:720px}
+section p strong,section li strong{color:var(--fg)}
+section ul,section ol{color:var(--muted);margin:0 0 14px 22px;max-width:700px}
+section li{margin-bottom:6px}
+code{font-family:var(--mono);font-size:.86em;background:var(--panel2);border:1px solid var(--line);
+  border-radius:5px;padding:1px 6px;color:var(--orange)}
+pre{background:var(--panel);border:1px solid var(--line2);border-radius:12px;padding:16px 18px;
+  font-family:var(--mono);font-size:.83rem;overflow-x:auto;margin:0 0 16px;color:var(--fg);line-height:1.6}
+pre code{background:none;border:0;padding:0;color:inherit}
+pre .c{color:#4c5070}pre .g{color:var(--green)}
+table{border-collapse:collapse;width:100%;margin:0 0 16px;font-size:.9rem}
+th{text-align:left;color:var(--fg);border-bottom:1px solid var(--line2);padding:8px 12px 8px 0}
+td{color:var(--muted);border-bottom:1px solid var(--line);padding:8px 12px 8px 0;vertical-align:top}
+td:first-child{white-space:nowrap}
+kbd{font-family:var(--mono);font-size:.8rem;background:var(--panel2);border:1px solid var(--line2);
+  border-bottom-width:2px;border-radius:5px;padding:2px 7px;color:var(--fg)}
+img.shot{width:100%;border:1px solid var(--line2);border-radius:12px;margin:6px 0 18px;
+  box-shadow:0 16px 50px rgba(0,0,0,.4)}
+.note{border:1px solid var(--line2);border-left:3px solid var(--purple);background:var(--panel);
+  border-radius:0 10px 10px 0;padding:12px 18px;margin:0 0 16px;color:var(--muted);font-size:.92rem;max-width:720px}
+.note.warn{border-left-color:var(--orange)}
+.note strong{color:var(--fg)}
+@media(max-width:900px){.layout{grid-template-columns:1fr}aside{display:none}}
+</style>
+</head>
+<body>
+
+<nav class="top"><div class="in">
+  <div class="logo" style="display:flex;align-items:center;gap:9px"><img src="../assets/logo-dark.svg" alt="" width="22" height="22"><span>FW<b>Deck</b> <span style="color:var(--dim);font-weight:400">/ docs</span></span></div>
+  <div class="links">
+    <a href="../">Home</a>
+    <a href="https://github.com/madebydaniz/fwdeck/releases">Releases</a>
+    <a href="https://github.com/madebydaniz/fwdeck">GitHub ↗</a>
+  </div>
+</div></nav>
+
+<div class="layout">
+<aside>
+  <div class="group">Getting started</div>
+  <a href="#introduction">Introduction</a>
+  <a href="#installation">Installation</a>
+  <a href="#verification">Verifying releases</a>
+  <a href="#first-run">First run</a>
+  <a href="#from-firewall-cmd">Coming from firewall-cmd</a>
+  <div class="group">Using FWDeck</div>
+  <a href="#interface">The interface</a>
+  <a href="#views">Views</a>
+  <a href="#power">Search, diffs &amp; counters</a>
+  <a href="#cookbook">Workflows</a>
+  <a href="#safety">Safety features</a>
+  <a href="#remote">On a remote server</a>
+  <a href="#keybindings">Keybindings</a>
+  <div class="group">Reference</div>
+  <a href="#privileges">Privileges &amp; permissions</a>
+  <a href="#configuration">Configuration</a>
+  <a href="#offline">Offline mode &amp; backends</a>
+  <a href="#automation">Automation &amp; scope</a>
+  <a href="#faq">FAQ &amp; troubleshooting</a>
+  <div class="group">Project</div>
+  <a href="#development">Development</a>
+</aside>
+
+<main>
+<h1>FWDeck Documentation</h1>
+<p class="lead">Everything you need to install, verify, and operate FWDeck —
+the safety-first terminal UI for firewalld.</p>
+
+<section id="introduction">
+<h2>Introduction</h2>
+<p>FWDeck puts your entire firewalld state on one screen — every zone, service,
+port, forward, rich rule, and binding, with runtime vs permanent scope visible
+on every row — and puts a review step in front of every change.</p>
+<p><strong>Requirements:</strong> Linux with firewalld (<code>firewall-cmd</code>
+on PATH). Root or polkit authorization for mutations — without it FWDeck runs
+read-only with a visible explanation, and it never re-executes itself with sudo.</p>
+<div class="note warn"><strong>Early development.</strong> Don't test mutations on
+a remote-only system unless you have console access or another recovery path.</div>
+</section>
+
+<section id="installation">
+<h2>Installation</h2>
+<h3>Install script (recommended)</h3>
+<p>Downloads the right binary, verifies the SHA-256 checksum, and verifies the
+Cosign release signature before anything is installed:</p>
+<pre><span class="g">$</span> curl -fsSL https://raw.githubusercontent.com/madebydaniz/fwdeck/main/scripts/install.sh | bash</pre>
+<p>Options: <code>--version v0.1.0</code> · <code>--install-dir ~/bin</code> ·
+<code>--no-verify-signature</code> (not recommended).</p>
+<h3>Distribution packages (.deb / .rpm)</h3>
+<p>Every <a href="https://github.com/madebydaniz/fwdeck/releases">release</a> also
+ships native <code>.deb</code> and <code>.rpm</code> packages (amd64 and arm64)
+that install the binary, shell completions, and man page to the standard system
+paths and declare a dependency on <code>firewalld</code>. Their checksums are
+covered by the same Cosign-signed <code>checksums.txt</code>.</p>
+<pre><span class="c"># Debian / Ubuntu — download the .deb for your arch from the release, then:</span>
+<span class="g">$</span> sudo apt install ./fwdeck_*.deb
+
+<span class="c"># Fedora / RHEL — download the .rpm for your arch, then:</span>
+<span class="g">$</span> sudo dnf install ./fwdeck-*.rpm</pre>
+<div class="note">A hosted <code>apt</code>/<code>dnf</code> repository (so plain
+<code>apt install fwdeck</code> works without downloading first), and eventual
+inclusion in the official Debian and Fedora repositories, are on the roadmap.</div>
+<h3>Prebuilt binaries</h3>
+<p>Every release also ships signed archives for <code>x86_64</code> and
+<code>aarch64</code>, in glibc and fully-static musl variants. Each archive
+contains the binary, bash/zsh/fish completions, the man page, and the license.</p>
+<h3>From source</h3>
+<pre><span class="g">$</span> cargo install --git https://github.com/madebydaniz/fwdeck --locked</pre>
+<p>Needs Rust 1.88+.</p>
+</section>
+
+<section id="verification">
+<h2>Verifying releases</h2>
+<p>Releases are signed with <strong>Cosign keyless</strong> (Sigstore): the
+signature certificate is bound to this repository's release workflow identity —
+a signature from anywhere else fails verification.</p>
+<pre>VERSION=v0.1.0
+curl -fsSLO "https://github.com/madebydaniz/fwdeck/releases/download/${VERSION}/checksums.txt"
+curl -fsSLO "https://github.com/madebydaniz/fwdeck/releases/download/${VERSION}/checksums.txt.bundle"
+
+cosign verify-blob \
+  --bundle checksums.txt.bundle \
+  --certificate-identity-regexp "^https://github.com/madebydaniz/fwdeck/\.github/workflows/release-binaries\.yml@refs/(heads/main|tags/.+)$" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  checksums.txt
+
+sha256sum -c checksums.txt --ignore-missing</pre>
+</section>
+
+<section id="first-run">
+<h2>First run</h2>
+<pre><span class="g">$</span> fwdeck doctor        <span class="c"># checks your environment — never touches the firewall</span>
+<span class="g">$</span> fwdeck --read-only   <span class="c"># look around safely; mutations disabled in the engine</span>
+<span class="g">$</span> sudo fwdeck          <span class="c"># full control (or a user with polkit authorization)</span></pre>
+<p><code>doctor</code> reports the firewalld version, daemon state, netfilter
+backend, zone count, and whether FWDeck can read your configuration.</p>
+</section>
+
+<section id="from-firewall-cmd">
+<h2>Coming from firewall-cmd</h2>
+<p>FWDeck <em>drives</em> <code>firewall-cmd</code> under the hood — it is a
+review layer, not a replacement. Every mutation's confirmation shows the exact
+<code>$ firewall-cmd …</code> it will run, and you can always drop back to the
+CLI. If you know firewalld, here is where each command lives:</p>
+<table>
+<tr><th><code>firewall-cmd</code></th><th>In FWDeck</th></tr>
+<tr><td><code>--list-all-zones</code> / <code>--list-all</code></td><td>Zones view (<kbd>0</kbd>); <kbd>enter</kbd> on a zone → full overview</td></tr>
+<tr><td><code>--get-active-zones</code></td><td>the <code>ACTIVE</code> column in Zones</td></tr>
+<tr><td><code>--add-service</code> / <code>--remove-service</code></td><td>Services (<kbd>1</kbd>) → <kbd>a</kbd> / <kbd>d</kbd></td></tr>
+<tr><td><code>--add-port</code> / <code>--remove-port</code></td><td>Ports (<kbd>2</kbd>) → <kbd>a</kbd> / <kbd>d</kbd></td></tr>
+<tr><td><code>--add-forward-port</code></td><td>Forward (<kbd>3</kbd>) → <kbd>a</kbd></td></tr>
+<tr><td><code>--add-rich-rule</code></td><td>Rich Rules (<kbd>4</kbd>) → <kbd>a</kbd>, or <kbd>:</kbd> → <em>Build rich rule</em></td></tr>
+<tr><td><code>--add-interface</code> / <code>--add-source</code></td><td>Interfaces (<kbd>5</kbd>) / Sources (<kbd>6</kbd>) → <kbd>a</kbd></td></tr>
+<tr><td><code>--set-target</code></td><td>Zones → <kbd>:</kbd> → <em>Set target</em></td></tr>
+<tr><td><code>--add-masquerade</code> · <code>--add-forward</code> · <code>--add-icmp-block-inversion</code></td><td>Zones → <kbd>m</kbd> · <kbd>:</kbd> → <em>Toggle forwarding</em> / <em>Toggle inversion</em></td></tr>
+<tr><td><code>--add-source-port</code> · <code>--add-protocol</code></td><td>Zones → <kbd>:</kbd> → <em>Add source-port</em> / <em>Allow protocol</em></td></tr>
+<tr><td><code>--new-ipset</code> / <code>--ipset ... --add-entry</code></td><td>IPSets (<kbd>7</kbd>) → <kbd>:</kbd> → <em>Create ipset</em> / <em>Add ipset entry</em></td></tr>
+<tr><td><code>--set-default-zone</code></td><td>Zones → <kbd>:</kbd> → <em>Set default zone</em></td></tr>
+<tr><td><code>--permanent</code> (scope)</td><td>the mutation <strong>target</strong> (<code>--target</code> / config, or narrowed per-op); <kbd>t</kbd> flips the runtime/permanent view</td></tr>
+<tr><td><code>--reload</code></td><td><kbd>ctrl-r</kbd></td></tr>
+<tr><td><code>--runtime-to-permanent</code></td><td><kbd>:</kbd> → <em>Runtime to permanent</em></td></tr>
+<tr><td><code>--panic-on</code> / <code>--panic-off</code></td><td><kbd>:</kbd> → <em>panic</em></td></tr>
+</table>
+<div class="note"><strong>Not sure where something is?</strong> Press <kbd>:</kbd>
+for the command palette (fuzzy — everything is in there) or <kbd>ctrl-f</kbd> to
+search every view at once.</div>
+</section>
+
+<section id="interface">
+<h2>The interface</h2>
+<img class="shot" src="../assets/zones.png" alt="FWDeck zones view">
+<ul>
+<li><strong>Header</strong> — context, netfilter backend, selected zone, global
+runtime-vs-permanent state (<code>synced</code> / <code>different</code>),
+LogDenied, and live counters (zones, active, denied this session).</li>
+<li><strong>Breadcrumb</strong> — where you are: zone › view · scope ·
+<code>[viewing: runtime|permanent]</code> perspective.</li>
+<li><strong>Views sidebar</strong> — the ten views with row counts; switch with
+<kbd>0</kbd>–<kbd>9</kbd>.</li>
+<li><strong>Table</strong> — the current view's rows. Inactive zones are dimmed;
+the <code>≠</code> marker means that row differs between runtime and permanent.</li>
+<li><strong>Status bar</strong> — mutation target and the three always-on
+entries: <kbd>:</kbd> palette · <kbd>/</kbd> filter · <kbd>?</kbd> help.</li>
+</ul>
+</section>
+
+<section id="views">
+<h2>Views — the complete guide</h2>
+<p>Ten views, switched with <kbd>0</kbd>–<kbd>9</kbd> (or the sidebar). Each
+section below shows the view, explains what it is for, and walks through every
+action with a hands-on example. Every mutation opens a confirmation first —
+<kbd>y</kbd> applies, <kbd>s</kbd> stages it for a batch, <kbd>n</kbd> cancels.</p>
+
+<div class="note">
+<p><strong>The effective zone.</strong> Views <kbd>1</kbd>–<kbd>6</kbd> (services,
+ports, forwards, rich rules, interfaces, sources) always act on <em>one</em>
+zone — the <em>effective zone</em>, shown in the breadcrumb
+(<code>&lt;fw&gt; public › …</code>). To work on a different zone, go to
+<strong>Zones</strong> (<kbd>0</kbd>), highlight it, and press <kbd>enter</kbd>:
+that selects it as the effective zone (and opens its overview). Everything you
+do afterwards applies there until you pick another.</p>
+</div>
+
+<div class="note">
+<p><strong>Keys that work in every table.</strong> <kbd>j</kbd>/<kbd>k</kbd> or
+arrows move · <kbd>g</kbd>/<kbd>G</kbd> jump to first/last · <kbd>a</kbd> add ·
+<kbd>d</kbd> delete the selected row (or every <kbd>space</kbd>-marked row) ·
+<kbd>c</kbd> clone the row into a prefilled add form · <kbd>t</kbd> flip the
+runtime ⇄ permanent perspective · <kbd>Y</kbd> copy the row · <kbd>enter</kbd>
+row details · <kbd>:</kbd> palette · <kbd>/</kbd> filter · <kbd>ctrl-f</kbd>
+global search.</p>
+</div>
+
+<h3>0 · Zones</h3>
+<img class="shot" src="../assets/zones.png" alt="Zones view">
+<p><strong>What you see</strong> — every firewalld zone with its
+<code>TARGET</code> (the fate of unmatched packets), which are
+<code>ACTIVE</code> (have a binding) and which is <code>DEFAULT</code>, plus
+service/masquerade columns and the <code>≠</code> drift marker.</p>
+<p><strong>What you can do here</strong> — pick the effective zone, create and
+delete zones, and set every zone-wide attribute: default zone, target,
+masquerade, intra-zone forwarding, icmp-block inversion, source-ports, and
+protocols.</p>
+<p><strong>Examples</strong></p>
+<ul>
+<li><strong>Switch the working zone</strong>: highlight <code>home</code> →
+<kbd>enter</kbd>. The overview opens and every other view now acts on
+<code>home</code>.</li>
+<li><strong>Inspect all drift</strong>: <kbd>i</kbd> (or <kbd>enter</kbd>) opens
+the Zone Overview — services, ports, source-ports, protocols, forwards, rich
+rules, masquerade, forwarding, icmp-inversion, and target, each showing where
+runtime and permanent differ.</li>
+<li><strong>Create a zone</strong>: <kbd>a</kbd> → <code>dmz-lab</code> →
+<kbd>y</kbd>. Zones are permanent-only; press <kbd>ctrl-r</kbd> to reload and
+activate it.</li>
+<li><strong>Make it the default</strong>: <kbd>:</kbd> → <em>Set default
+zone</em> → <kbd>y</kbd>.</li>
+<li><strong>Harden the policy</strong>: <kbd>:</kbd> → <em>Set target of
+`…`</em> → <code>DROP</code>. A DROP/REJECT target warns you first — it blocks
+everything not explicitly allowed. Permanent-only; reload to activate.</li>
+<li><strong>Masquerade / forwarding / inversion</strong>: <kbd>m</kbd> toggles
+masquerade; <kbd>:</kbd> → <em>Toggle intra-zone forwarding</em> or <em>Toggle
+icmp-block inversion</em>.</li>
+<li><strong>Allow a protocol or source-port</strong>: <kbd>:</kbd> → <em>Allow
+protocol in `…`</em> → <code>gre</code> (VPN), or <em>Add source-port</em> →
+<code>68/udp</code>.</li>
+<li><strong>Delete a zone</strong>: <kbd>d</kbd> → <kbd>y</kbd> (permanent-only).</li>
+</ul>
+
+<h3>1 · Services</h3>
+<img class="shot" src="../assets/services.png" alt="Services view">
+<p><strong>What you see</strong> — the named services allowed in the effective
+zone. The <code>SCOPE</code> column is the core idea: <code>both</code> survives
+a reload, <code>runtime</code> disappears on reload, <code>permanent</code>
+takes effect only after one.</p>
+<p><strong>What you can do here</strong> — allow and remove services, browse the
+full service catalog, define custom services, and grant a temporary
+(auto-expiring) service.</p>
+<p><strong>Examples</strong></p>
+<ul>
+<li><strong>Allow a service</strong>: <kbd>a</kbd> → <code>https</code> →
+<kbd>y</kbd>.</li>
+<li><strong>Remove one</strong>: highlight <code>ssh</code> → <kbd>d</kbd> →
+<kbd>y</kbd>. Deletes narrow automatically to where the entry actually exists
+(runtime-only, permanent-only, or both).</li>
+<li><strong>Browse what's available</strong>: <kbd>:</kbd> → <em>Browse service
+catalog</em> lists every service firewalld knows.</li>
+<li><strong>Temporary allow</strong>: <kbd>:</kbd> → <em>Temporary service</em>
+→ <code>https 300</code> opens https for 300&nbsp;s (runtime-only,
+auto-removed by firewalld).</li>
+<li><strong>Custom service</strong>: <kbd>:</kbd> → <em>Create service</em> →
+<code>myapp</code>, then <em>Add port to service</em> → <code>myapp 9200/tcp</code>.
+Permanent-only; reload to use it.</li>
+</ul>
+
+<h3>2 · Ports</h3>
+<img class="shot" src="../assets/ports.png" alt="Ports view">
+<p><strong>What you see</strong> — individual ports and ranges open in the
+effective zone, each with its scope.</p>
+<p><strong>What you can do here</strong> — open and close ports/ranges.</p>
+<p><strong>Examples</strong></p>
+<ul>
+<li><strong>Open a port</strong>: <kbd>a</kbd> → <code>8080/tcp</code> →
+<kbd>y</kbd>.</li>
+<li><strong>Open a range</strong>: <kbd>a</kbd> → <code>5000-5010/udp</code> →
+<kbd>y</kbd>.</li>
+<li><strong>Close one</strong>: highlight the row → <kbd>d</kbd> → <kbd>y</kbd>
+(this can cut connections, so it warns first).</li>
+<li><strong>Clone-and-tweak</strong>: <kbd>c</kbd> on <code>8080/tcp</code>
+prefills the form so you can change it to <code>8081/tcp</code> and add.</li>
+</ul>
+
+<h3>3 · Forward</h3>
+<img class="shot" src="../assets/forward.png" alt="Forwarding view">
+<p><strong>What you see</strong> — port-forwarding (DNAT) rules of the effective
+zone.</p>
+<p><strong>What you can do here</strong> — add and remove forwards using the
+compact spec syntax.</p>
+<p><strong>Examples</strong></p>
+<ul>
+<li><strong>Forward a port</strong>: <kbd>a</kbd> →
+<code>port=8080:proto=tcp:toport=80</code> → <kbd>y</kbd>.</li>
+<li><strong>Forward to another host</strong>: add
+<code>:toaddr=10.0.0.5</code> to the spec. (DNAT needs masquerade — set it in
+the Zones view.)</li>
+<li><strong>Remove</strong>: <kbd>d</kbd> → <kbd>y</kbd>.</li>
+</ul>
+
+<h3>4 · Rich Rules</h3>
+<img class="shot" src="../assets/rich-rules.png" alt="Rich rules view">
+<p><strong>What you see</strong> — the effective zone's rich-language rules,
+stored and applied <em>verbatim</em>. FWDeck never reconstructs (and so never
+corrupts) your rule text.</p>
+<p><strong>What you can do here</strong> — write a rule by hand, or assemble one
+with the guided builder; remove or clone existing rules.</p>
+<p><strong>Examples</strong></p>
+<ul>
+<li><strong>Guided builder</strong>: <kbd>:</kbd> → <em>Build rich rule</em> →
+family <code>ipv4</code> → source <code>203.0.113.0/24</code> → match
+<em>(blank)</em> → action <code>reject</code>. A live preview shows the exact
+rule before you confirm.</li>
+<li><strong>Write one directly</strong>: <kbd>a</kbd> →
+<code>rule family="ipv4" source address="10.0.0.0/8" accept</code> →
+<kbd>y</kbd>.</li>
+<li><strong>Remove</strong>: highlight → <kbd>d</kbd> → <kbd>y</kbd>. (Removing a
+rule can cut connections, so it warns.)</li>
+</ul>
+
+<h3>5 · Interfaces</h3>
+<img class="shot" src="../assets/interfaces.png" alt="Interfaces view">
+<p><strong>What you see</strong> — the interfaces bound to the effective zone.
+Binding an interface is how a zone becomes <em>active</em>.</p>
+<p><strong>What you can do here</strong> — bind and unbind network interfaces.
+FWDeck knows which interface carries your SSH session and warns before you
+touch its zone.</p>
+<p><strong>Examples</strong></p>
+<ul>
+<li><strong>Bind an interface</strong>: <kbd>a</kbd> → <code>eth1</code> →
+<kbd>y</kbd>. The zone is now active.</li>
+<li><strong>Unbind</strong>: highlight → <kbd>d</kbd> → <kbd>y</kbd>. Traffic on
+that interface falls back to the default zone — the confirmation says so.</li>
+</ul>
+
+<h3>6 · Sources</h3>
+<img class="shot" src="../assets/sources.png" alt="Sources view">
+<p><strong>What you see</strong> — the source bindings of the effective zone.
+Source-based zoning routes traffic <em>from</em> an address into this zone,
+regardless of interface.</p>
+<p><strong>What you can do here</strong> — bind and unbind sources: an IP, a
+CIDR, a MAC address, or an ipset reference.</p>
+<p><strong>Examples</strong></p>
+<ul>
+<li><strong>Bind a subnet</strong>: <kbd>a</kbd> →
+<code>192.168.1.0/24</code> → <kbd>y</kbd>.</li>
+<li><strong>Bind an ipset</strong>: <kbd>a</kbd> →
+<code>ipset:blocklist</code> → <kbd>y</kbd> (see the IPSets view).</li>
+<li><strong>Bind a MAC</strong>: <kbd>a</kbd> →
+<code>aa:bb:cc:dd:ee:ff</code> → <kbd>y</kbd>.</li>
+<li><strong>Unbind</strong>: <kbd>d</kbd> → <kbd>y</kbd>.</li>
+</ul>
+
+<h3>7 · IPSets</h3>
+<img class="shot" src="../assets/ipsets.png" alt="IPSets view">
+<p><strong>What you see</strong> — defined ipsets and their entry counts.
+Ipsets are reusable block/allow lists you can then bind as a source.</p>
+<p><strong>What you can do here</strong> — create and delete ipsets and manage
+their entries. Ipset lifecycle is permanent-only (reload to activate).</p>
+<p><strong>Examples</strong></p>
+<ul>
+<li><strong>Create an ipset</strong>: <kbd>:</kbd> → <em>Create ipset</em> →
+<code>blocklist hash:ip</code> → <kbd>y</kbd>. (Type defaults to
+<code>hash:ip</code> if omitted.)</li>
+<li><strong>Add an entry</strong>: highlight the ipset → <kbd>:</kbd> → <em>Add
+ipset entry</em> → <code>203.0.113.9</code>. Compound types work too, e.g.
+<code>1.2.3.4,tcp:80</code> for a <code>hash:ip,port</code> set.</li>
+<li><strong>Remove an entry</strong>: <kbd>:</kbd> → <em>Remove ipset
+entry</em> → <code>203.0.113.9</code>.</li>
+<li><strong>Use it</strong>: bind <code>ipset:blocklist</code> as a source
+(view <kbd>6</kbd>) to drop or route that whole list.</li>
+</ul>
+
+<h3>8 · Direct</h3>
+<img class="shot" src="../assets/direct.png" alt="Direct rules view">
+<p><strong>What you see</strong> — firewalld's legacy direct (raw
+iptables/nftables passthrough) rules, with a deprecation warning.</p>
+<p><strong>What you can do here</strong> — this view is <strong>read-only</strong>.
+Direct rules bypass firewalld's model; FWDeck surfaces them for visibility but
+deliberately does not edit them. Manage them with <code>firewall-cmd
+--direct</code> if you must, and prefer rich rules or policies instead.</p>
+
+<h3>9 · Logs</h3>
+<img class="shot" src="../assets/logs.png" alt="Logs view">
+<p><strong>What you see</strong> — a live kernel/netfilter tail (via
+<code>journalctl -kf</code>, falling back to <code>dmesg --follow</code>) with a
+session denied-packet counter in the header.</p>
+<p><strong>What you can do here</strong> — watch dropped/rejected traffic in
+real time and filter it. This view is read-only.</p>
+<p><strong>Examples</strong></p>
+<ul>
+<li><strong>See denied traffic</strong>: it needs firewalld's
+<code>LogDenied</code> to be on. Turn it on with <code>firewall-cmd
+--set-log-denied=all</code> (see the <a href="#faq">FAQ</a>).</li>
+<li><strong>Filter</strong>: <kbd>/</kbd> → type an address or port to narrow
+the tail; <kbd>ctrl-f</kbd> searches log rows alongside every other view.</li>
+</ul>
+</section>
+
+<section id="power">
+<h2>Search, diffs &amp; counters</h2>
+<h3>Global search</h3>
+<p>Press <kbd>ctrl-f</kbd> to fuzzy-search rows across <em>every</em> view at
+once — type <code>zone</code>, a service name, a port, or an address and jump
+straight to the match (it switches view and selects the row). This is different
+from <kbd>/</kbd>, which filters only the current view.</p>
+<h3>Session diff — what changed since startup</h3>
+<p>FWDeck captures the first snapshot of the session as a baseline. The palette
+command <em>Session diff</em> shows a read-only list of every change since then
+— handy after a maintenance window to review exactly what you touched.</p>
+<h3>Snapshot diff</h3>
+<p><em>Diff against snapshot</em> shows a read-only diff of the live firewall
+against a saved snapshot — how the current state differs from that point in
+time. Unlike <em>Restore</em>, it never stages or applies anything.</p>
+<h3>Multi-level undo</h3>
+<p>Every applied-and-verified reversible change is pushed onto an undo stack.
+<kbd>u</kbd> (or the palette) reverts the most recent — and again for the one
+before it — each as a normal reviewed mutation. (This is separate from the
+countdown-based dead-man's-switch rollback; see <a href="#safety">Safety</a>.)</p>
+<h3>Rule-hit counters</h3>
+<p><em>Rule-hit counters</em> reads live nftables per-chain packet/byte counters
+(<code>nft -j list ruleset</code>) and lists the busiest firewalld chains first.
+Requires the nftables backend and root; firewalld only counters some rules, so
+an empty list is normal, not an error.</p>
+</section>
+
+<section id="cookbook">
+<h2>Workflows</h2>
+<p>Single-action recipes (allow a service, open a port, add a forward, set a
+target, …) live in the <a href="#views">per-view guide</a> above. This section
+covers the multi-step workflows that span views. Every mutation shows a
+confirmation first — <kbd>y</kbd> applies · <kbd>s</kbd> stages · <kbd>n</kbd>
+cancels.</p>
+<h3>Delete several rules at once</h3>
+<p>Mark rows with <kbd>space</kbd> (✓), then <kbd>d</kbd> — one confirmation
+lists everything that will be removed.</p>
+<h3>Risky change with a safety net</h3>
+<p>Changes that can cut your session start a <strong>rollback countdown</strong>
+after applying: confirm you still have a working session with <kbd>y</kbd>, or
+press <kbd>u</kbd> — or lose the session — and FWDeck reverts automatically.</p>
+<h3>Stage a batch, apply once</h3>
+<p>Answer <kbd>s</kbd> instead of <kbd>y</kbd> in any confirmation, repeat, then
+<kbd>:</kbd> → <em>Show staged plan</em> → review → apply. Export the plan as a
+<code>firewall-cmd</code> script, JSON, or Ansible playbook from the palette.</p>
+<h3>Snapshot before maintenance</h3>
+<p><kbd>:</kbd> → <em>Save configuration snapshot</em> before you start;
+<kbd>:</kbd> → <em>Restore from snapshot</em> after. Restore diffs the snapshot
+against the current state and <em>stages</em> the way back — you review before
+anything is applied.</p>
+<h3>Runtime-only experiment</h3>
+<pre><span class="g">$</span> fwdeck --target runtime   <span class="c"># a reboot reverts everything</span></pre>
+<p>Experiment freely, then <kbd>:</kbd> → <em>Runtime to permanent</em> to
+persist what worked.</p>
+<h3>Panic button</h3>
+<p><kbd>:</kbd> → <code>panic</code> → confirm. Drops all traffic; the same
+command turns it off.</p>
+</section>
+
+<section id="safety">
+<h2>Safety features</h2>
+<ul>
+<li><strong>Validation first</strong> — duplicates, unknown zones, and malformed
+input are rejected before any modal opens.</li>
+<li><strong>Confirmation modals</strong> — every mutation states the exact
+resource, zone, scope, and connectivity risk.</li>
+<li><strong>Dead-man's switch</strong> — risky changes auto-revert after
+<code>rollback_timeout_seconds</code>, on <kbd>u</kbd>, or when you quit inside
+the countdown, unless you confirm a working session. An out-of-process systemd
+watchdog is pre-armed <em>before</em> the change is applied, so the revert
+survives a crash, <code>SIGKILL</code>, or dropped SSH session; where
+systemd/root is unavailable it degrades to in-process rollback.</li>
+<li><strong>SSH awareness</strong> — FWDeck resolves the interface your SSH
+session uses and warns precisely when a change targets its zone.</li>
+<li><strong>Honest partial failures</strong> — runtime-applied / permanent-failed
+is reported as exactly that, with per-step invocations and a rollback hint.</li>
+<li><strong>Audit trail</strong> — every applied operation is recorded as JSONL
+under <code>~/.local/state/fwdeck/</code> with its exact invocations.</li>
+<li><strong>Read-only mode</strong> — <code>--read-only</code> disables mutations
+in the engine, not just the UI.</li>
+</ul>
+</section>
+
+<section id="remote">
+<h2>On a remote server</h2>
+<p>This is what FWDeck is built for: editing the firewall of a box you are
+connected to over SSH, without locking yourself out. The rails below make that
+safe — read this once before you touch a production firewall remotely.</p>
+
+<div class="note warn"><strong>Golden rule.</strong> Keep an independent way back
+in — a provider console, KVM/IPMI, or serial — before making connectivity
+changes. The safety net below is excellent, but out-of-band access is what turns
+a lockout from an incident into a shrug.</div>
+
+<h3>Before you start</h3>
+<ul>
+<li><strong>Run inside <code>tmux</code> or <code>screen</code></strong> —
+<code>tmux new -s fw</code> then <code>fwdeck</code>. If your SSH session drops,
+FWDeck keeps running; reconnect and <code>tmux attach -t fw</code>. (And even if
+the whole process dies, the out-of-process watchdog still reverts — see below.)</li>
+<li><strong>Look before you leap</strong> — start with
+<code>fwdeck --read-only</code> to explore, then relaunch with privileges.</li>
+<li><strong>Keep the rollback on</strong> — the dead-man's switch is on by
+default (<code>rollback_timeout_seconds = 30</code>). Don't set it to <code>0</code>
+on a remote box.</li>
+<li><strong>Snapshot first</strong> — <kbd>:</kbd> → <em>Save configuration
+snapshot</em> before a big change, so <em>Restore</em> and <em>Diff against
+snapshot</em> give you a clean way back.</li>
+</ul>
+
+<h3>How the safety net protects you</h3>
+<ul>
+<li><strong>SSH-aware warnings</strong> — FWDeck resolves the interface, source,
+or default zone your session actually rides on and warns precisely when a change
+targets it — not a vague "this might disconnect you".</li>
+<li><strong>Rollback countdown</strong> — any change that can cut connectivity
+(remove a service/port/rich-rule, a <code>DROP</code>/<code>REJECT</code> target,
+masquerade off, removing your SSH interface/source) starts a countdown after it
+applies. Confirm your session still works with <kbd>y</kbd>. If it doesn't — do
+nothing; FWDeck reverts automatically when the timer expires.</li>
+<li><strong>Survives a crash or dropped SSH</strong> — the revert is armed as an
+<em>out-of-process</em> systemd timer <em>before</em> the change is applied, so
+it fires even if FWDeck is killed, the terminal closes, or the SSH session drops
+mid-countdown. Without systemd/root it degrades to the in-process countdown.</li>
+<li><strong>Leftover-watchdog scan</strong> — on startup FWDeck warns about any
+<code>fwdeck-rollback-*</code> timer left by a previous crashed session.</li>
+</ul>
+
+<h3>A safe remote workflow</h3>
+<ol>
+<li><code>tmux new -s fw</code> → <code>sudo fwdeck</code> (or a polkit user).</li>
+<li>Explore in read-only if unsure; snapshot before big edits.</li>
+<li>Stage changes with <kbd>s</kbd> instead of applying one by one, review the
+plan (<kbd>:</kbd> → <em>Show staged plan</em>), then apply once.</li>
+<li>When the countdown starts, test the session from a <em>second</em> terminal
+(a fresh SSH connection). If it works, press <kbd>y</kbd> to keep; if not, let it
+revert.</li>
+</ol>
+
+<h3>Recovery — if you do get locked out</h3>
+<ol>
+<li><strong>Wait it out.</strong> If the rollback was armed, it reverts within
+the timeout (plus a watchdog grace margin) even with no connection.</li>
+<li><strong>Get in out-of-band.</strong> Provider web console, KVM/IPMI, or
+serial. From there you have a local shell regardless of the firewall.</li>
+<li><strong>Undo the last change.</strong> <code>firewall-cmd --reload</code>
+restores the permanent config into runtime (discarding a bad runtime-only edit),
+or <code>firewall-cmd --panic-off</code> if panic mode is stuck on.</li>
+<li><strong>Fix the permanent config offline.</strong> If the daemon or network
+is down, <code>fwdeck --offline</code> (or <code>firewall-offline-cmd</code>)
+edits the on-disk permanent config from a rescue shell — no daemon required —
+then reboot or start firewalld.</li>
+<li><strong>Last resort.</strong> <code>systemctl stop firewalld</code> to drop
+all filtering and regain access, then reconcile and restart it.</li>
+</ol>
+</section>
+
+<section id="keybindings">
+<h2>Keybindings</h2>
+<table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>0</kbd>–<kbd>9</kbd></td><td>switch view (clears filter)</td></tr>
+<tr><td><kbd>j</kbd>/<kbd>k</kbd>, arrows, <kbd>g</kbd>/<kbd>G</kbd>, PgUp/PgDn</td><td>navigate rows</td></tr>
+<tr><td><kbd>enter</kbd></td><td>zone overview (Zones) / row details</td></tr>
+<tr><td><kbd>a</kbd></td><td>add entry for the current view</td></tr>
+<tr><td><kbd>d</kbd></td><td>delete selected — or all marked — entries (confirmed)</td></tr>
+<tr><td><kbd>space</kbd></td><td>mark row (multi-select)</td></tr>
+<tr><td><kbd>c</kbd></td><td>clone selected entry into a prefilled form</td></tr>
+<tr><td><kbd>m</kbd></td><td>toggle masquerade</td></tr>
+<tr><td><kbd>i</kbd></td><td>zone overview</td></tr>
+<tr><td><kbd>:</kbd></td><td>command palette (fuzzy — everything is in here)</td></tr>
+<tr><td><kbd>/</kbd></td><td>filter rows live (current view)</td></tr>
+<tr><td><kbd>ctrl-f</kbd></td><td>global search across every view</td></tr>
+<tr><td><kbd>r</kbd> / <kbd>ctrl-r</kbd></td><td>refresh / reload firewalld (confirmed)</td></tr>
+<tr><td><kbd>y</kbd> / <kbd>s</kbd> / <kbd>n</kbd></td><td>confirm / stage / cancel</td></tr>
+<tr><td><kbd>y</kbd> / <kbd>u</kbd></td><td>keep / undo during a rollback countdown</td></tr>
+<tr><td><kbd>Y</kbd></td><td>copy selected row (works over SSH via OSC 52)</td></tr>
+<tr><td><kbd>?</kbd></td><td>help overlay</td></tr>
+<tr><td><kbd>esc</kbd> / <kbd>q</kbd></td><td>close / quit</td></tr>
+</table>
+</section>
+
+<section id="privileges">
+<h2>Privileges &amp; permissions</h2>
+<p>Reading firewalld and — especially — mutating it needs authorization. FWDeck
+never escalates on its own: it <strong>does not re-execute itself with sudo</strong>.
+Without the rights to mutate, it starts in read-only mode with a banner
+explaining why, so you always know where you stand.</p>
+<h3>Option A — sudo (simplest)</h3>
+<pre><span class="g">$</span> sudo fwdeck</pre>
+<div class="note"><strong>Heads up:</strong> under <code>sudo</code>, FWDeck's
+state (log, audit trail, snapshots) is written under <strong>root's</strong>
+<code>~/.local/state/fwdeck/</code>, not yours. Use <code>sudo -E</code> or a
+polkit user if you want them in your own home.</div>
+<h3>Option B — polkit (no blanket sudo)</h3>
+<p>firewalld authorizes mutations through polkit, so you can let a specific group
+manage the firewall as a normal user — cleaner than blanket <code>sudo</code>
+for shared boxes. Create a group, add your user, and drop in a rule:</p>
+<pre><span class="g">#</span> groupadd fwadmin &amp;&amp; usermod -aG fwadmin alice
+
+<span class="c"># /etc/polkit-1/rules.d/90-fwdeck.rules</span>
+polkit.addRule(function(action, subject) {
+  if (action.id.indexOf("org.fedoraproject.FirewallD1") === 0 &amp;&amp;
+      subject.isInGroup("fwadmin")) {
+    return polkit.Result.YES;
+  }
+});</pre>
+<p>Members of <code>fwadmin</code> can now run <code>fwdeck</code> (and
+<code>firewall-cmd</code>) without <code>sudo</code>, and state lands in their own
+home. Verify with <code>fwdeck doctor</code>, which reports your full
+authorization surface. Adjust the action prefix to your distro's firewalld
+polkit actions if it differs.</p>
+<h3>No privileges at all</h3>
+<p>FWDeck runs read-only: every view works, every mutation is disabled with a
+clear reason. Great for auditing a box you only have read access to.</p>
+</section>
+
+<section id="configuration">
+<h2>Configuration</h2>
+<p><code>~/.config/fwdeck/config.toml</code> — CLI flags always override:</p>
+<pre>[ui]
+theme = "dracula"                # dracula | high-contrast | mono
+color = true
+show_help_bar = true
+sidebar_width = 22
+
+[behavior]
+default_target = "runtime-and-permanent"   # or "runtime" / "permanent"
+refresh_interval_ms = 5000
+log_refresh_interval_ms = 1000
+confirm_destructive_actions = true
+rollback_timeout_seconds = 30   # dead-man's switch; 0 disables
+read_only = false
+
+[logging]
+level = "info"                  # file log: ~/.local/state/fwdeck/fwdeck.log</pre>
+<h3>CLI flags</h3>
+<pre>fwdeck --read-only          # inspection only
+fwdeck --zone public        # open with a zone selected
+fwdeck --target runtime     # default mutation target
+fwdeck --backend dbus       # native D-Bus backend (build with --features dbus)
+fwdeck --offline            # permanent config via firewall-offline-cmd
+fwdeck --no-color           # reduced-color terminals
+fwdeck completions zsh      # shell completions (bash|zsh|fish)
+fwdeck manpage              # man page to stdout</pre>
+</section>
+
+<section id="offline">
+<h2>Offline mode &amp; backends</h2>
+<h3>Offline mode</h3>
+<p><code>fwdeck --offline</code> manages the <em>permanent</em> configuration via
+<code>firewall-offline-cmd</code> — for rescue systems, chroots, and
+provisioning, where the daemon isn't running. The header shows
+<em>"offline · permanent config only"</em>; daemon-only operations (reload,
+panic mode, runtime-to-permanent) are reported as unsupported instead of
+failing cryptically.</p>
+<h3>Backends</h3>
+<p>FWDeck talks to firewalld through a swappable backend. The default drives
+<code>firewall-cmd</code> with typed, fixture-tested parsing. An optional native
+D-Bus backend (<code>cargo build --features dbus</code>, then
+<code>--backend dbus</code>) implements the same interface; it currently covers
+reads and runtime mutations and <em>refuses loudly</em> anything it can't do
+fully, rather than half-applying.</p>
+</section>
+
+<section id="automation">
+<h2>Automation &amp; scope</h2>
+<p>FWDeck is deliberately <strong>interactive</strong> and <strong>single-host</strong>
+— a human-in-the-loop review tool for one server's firewall. It is not a
+configuration-management engine, and that is a feature, not a gap.</p>
+<h3>Fitting it into automation</h3>
+<ul>
+<li><strong>Export a reviewed plan</strong> — stage your changes, then
+<kbd>:</kbd> → <em>Export staged plan</em> as a <code>firewall-cmd</code> script,
+JSON, or an Ansible playbook. Build it interactively, apply it repeatably.</li>
+<li><strong>Provisioning &amp; images</strong> — <code>fwdeck --offline</code>
+edits the permanent config with no running daemon, for chroots, golden images,
+and rescue environments.</li>
+<li><strong>Non-TUI subcommands</strong> — <code>fwdeck doctor</code> (scriptable
+environment check), <code>fwdeck completions bash|zsh|fish</code>, and
+<code>fwdeck manpage</code> run without the UI.</li>
+</ul>
+<h3>Many servers (a fleet)</h3>
+<p>For managing dozens of hosts, use a configuration-management tool — the
+<code>ansible.posix.firewalld</code> module is the natural fit. FWDeck is the
+companion you reach for to <em>inspect, understand, and safely hand-edit</em> one
+host — the export feature bridges the two.</p>
+<h3>Exit codes worth knowing</h3>
+<p>FWDeck surfaces firewalld's own conditions plainly: exit <code>252</code> =
+the daemon isn't running, <code>253</code> = you're not authorized (it falls back
+to read-only). A <code>--query-panic</code> exit <code>1</code> means panic is
+<em>off</em>, not an error. <code>fwdeck doctor</code> spells all of this out.</p>
+</section>
+
+<section id="faq">
+<h2>FAQ &amp; troubleshooting</h2>
+<h3>"INVALID_ZONE" after creating a zone?</h3>
+<p>Zone creation is permanent-only in firewalld (by design). Until you reload
+(<kbd>ctrl-r</kbd>), the new zone exists only in the permanent config — FWDeck
+automatically narrows your changes to permanent and tells you to reload to
+activate.</p>
+<h3>Everything is read-only?</h3>
+<p>You're not root and don't have polkit authorization. The header explains
+this. Run with <code>sudo</code> or configure polkit for your user.</p>
+<h3>The Logs view is empty?</h3>
+<p>Denied-packet logging is off by default in firewalld. Set LogDenied
+(<kbd>:</kbd> → <em>Set log denied</em> → <code>all</code>) and make sure your
+kernel logs reach <code>journald</code>/<code>dmesg</code>. Some container
+kernels can't emit netfilter logs at all.</p>
+<h3>An interface binding didn't persist?</h3>
+<p>On NetworkManager-managed systems, NM owns interface-zone assignment
+(<code>connection.zone</code>). FWDeck behaves exactly like
+<code>firewall-cmd</code>; for NM-managed connections consider making the
+binding permanent, or set the zone on the NM connection itself.</p>
+<h3>Where are logs, audit, snapshots?</h3>
+<p><code>~/.local/state/fwdeck/</code> — <code>fwdeck.log</code>,
+<code>audit.jsonl</code>, <code>snapshots/</code>, <code>exports/</code>.</p>
+</section>
+
+<section id="development">
+<h2>Development</h2>
+<p>Development runs against a <strong>real firewalld</strong> in a disposable
+container — the host firewall is never touched:</p>
+<pre><span class="g">$</span> docker compose run --rm dev   <span class="c"># Fedora + firewalld + Rust, repo mounted</span>
+<span class="g">$</span> cargo run                     <span class="c"># inside: the TUI with real data</span>
+<span class="g">$</span> cargo test                    <span class="c"># fixtures + fake-runner suite</span>
+<span class="g">$</span> cargo test --test real_firewalld -- --ignored --test-threads=1</pre>
+<p>Quality gates enforced in CI: <code>cargo fmt --check</code>,
+<code>clippy -D warnings</code> (both feature sets), tests, MSRV 1.88,
+cargo-deny, CodeQL. Commits follow
+<a href="https://www.conventionalcommits.org/">Conventional Commits</a> —
+release-please turns them into releases automatically. See
+<a href="https://github.com/madebydaniz/fwdeck/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>.</p>
+</section>
+
+</main>
+</div>
+
+<footer style="border-top:1px solid var(--line);padding:32px 24px;color:var(--dim);font-size:.85rem;text-align:center">
+FWDeck · MIT License · <a href="https://github.com/madebydaniz/fwdeck">GitHub</a> ·
+<a href="https://github.com/madebydaniz/fwdeck/issues">Issues</a> ·
+maintained by <a href="https://github.com/madebydaniz">Daniel Niazmand</a>
+</footer>
+
+</body>
+</html>
