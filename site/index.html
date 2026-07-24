@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FWDeck — a safety-first terminal UI for firewalld</title>
+<link rel="icon" type="image/svg+xml" href="assets/logo-dark.svg">
+<meta name="description" content="Manage your Linux firewall the way k9s manages Kubernetes — fast, keyboard-only, and with a confirmation in front of anything that could lock you out.">
+<style>
+:root{
+  --page:#0e0f16; --panel:#151622; --panel2:#1a1b29; --line:#262838; --line2:#34364c;
+  --fg:#eceef8; --muted:#8b90ad; --dim:#5c6183;
+  --purple:#bd93f9; --pink:#ff79c6; --cyan:#8be9fd; --green:#50fa7b;
+  --orange:#ffb86c; --red:#ff5555; --yellow:#f1fa8c; --blue:#6272a4;
+  --grad:linear-gradient(100deg,#bd93f9 0%,#ff79c6 55%,#8be9fd 110%);
+  --mono:ui-monospace,'SF Mono','JetBrains Mono',Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--page);color:var(--fg);font-family:var(--sans);line-height:1.65;
+  background-image:radial-gradient(1000px 500px at 50% -10%,rgba(189,147,249,.10),transparent 60%),
+                   radial-gradient(800px 400px at 85% 30%,rgba(139,233,253,.05),transparent 55%)}
+a{color:var(--cyan);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);
+  background:rgba(14,15,22,.72);border-bottom:1px solid var(--line)}
+nav .in{display:flex;justify-content:space-between;align-items:center;height:60px}
+nav .logo{font-weight:800;font-size:1.1rem;color:var(--fg);letter-spacing:-.01em}
+nav .logo b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+nav .links{display:flex;align-items:center;gap:26px}
+nav .links a{color:var(--muted);font-size:.92rem}
+nav .links a:hover{color:var(--fg);text-decoration:none}
+nav .gh{border:1px solid var(--line2);border-radius:8px;padding:7px 14px;color:var(--fg)!important;font-weight:600}
+nav .gh:hover{border-color:var(--purple)}
+.hero{padding:88px 0 30px;text-align:center;position:relative}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line2);border-radius:999px;
+  padding:6px 16px;font-size:.8rem;color:var(--muted);background:rgba(21,22,34,.6)}
+.eyebrow i{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;
+  box-shadow:0 0 10px var(--green)}
+.hero h1{margin-top:26px;font-size:clamp(2.3rem,6vw,4rem);font-weight:800;line-height:1.08;letter-spacing:-.03em}
+.hero h1 span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p.tag{max-width:660px;margin:22px auto 0;color:var(--muted);font-size:1.15rem}
+.cta{display:flex;gap:14px;justify-content:center;align-items:center;flex-wrap:wrap;margin-top:34px}
+.install{display:inline-flex;align-items:center;gap:14px;background:var(--panel);
+  border:1px solid var(--line2);border-radius:12px;padding:13px 18px;font-family:var(--mono);font-size:.85rem}
+.install .dollar{color:var(--green)}
+.install button{background:var(--line);border:0;color:var(--fg);border-radius:7px;padding:7px 12px;
+  cursor:pointer;font-size:.78rem;font-family:var(--sans)}
+.install button:hover{background:var(--purple);color:#12131c}
+.hero .alt{margin-top:14px;font-size:.85rem;color:var(--dim)}
+.hero .alt a{color:var(--muted)}
+/* ---------- faithful TUI reproduction ---------- */
+.shot{position:relative;margin:60px auto 0;max-width:1080px}
+.shot::before{content:"";position:absolute;inset:-40px -60px auto;height:340px;
+  background:radial-gradient(600px 220px at 50% 40%,rgba(189,147,249,.16),transparent 70%);
+  pointer-events:none;filter:blur(4px)}
+.term{position:relative;background:#1c1d29;border:1px solid var(--line2);border-radius:14px;
+  overflow:hidden;text-align:left;box-shadow:0 30px 90px rgba(0,0,0,.55),0 0 0 1px rgba(189,147,249,.06)}
+.term .bar{display:flex;gap:7px;padding:12px 15px;background:#14151f;border-bottom:1px solid var(--line)}
+.term .bar i{width:11px;height:11px;border-radius:50%}
+.term pre{padding:14px 16px 10px;font-family:var(--mono);font-size:.74rem;line-height:1.5;overflow-x:auto}
+.b{color:var(--blue)}.c{color:#9ecbff}.cy{color:var(--cyan)}.g{color:var(--green)}
+.p{color:var(--purple)}.pk{color:var(--pink)}.o{color:var(--orange)}.r{color:var(--red)}
+.y{color:var(--yellow)}.w{color:var(--fg);font-weight:700}.d{color:var(--dim)}
+.row-sel{background:#343650;display:inline-block;width:100%;color:var(--fg);font-weight:700}
+.statusbar{background:#14151f;border-top:1px solid var(--line);padding:6px 16px;display:flex;
+  justify-content:space-between;font-family:var(--mono);font-size:.74rem}
+/* ---------- sections ---------- */
+section{padding:84px 0}
+.sec-eyebrow{font-size:.78rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+  background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+section h2{font-size:clamp(1.5rem,3vw,2.1rem);font-weight:800;letter-spacing:-.02em;margin-top:10px}
+section .sub{color:var(--muted);margin-top:12px;margin-bottom:40px;max-width:620px;font-size:1.02rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:26px;
+  transition:transform .18s,border-color .18s}
+.card:hover{transform:translateY(-3px);border-color:var(--line2)}
+.card .ico{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;
+  font-size:1.05rem;background:linear-gradient(135deg,rgba(189,147,249,.16),rgba(255,121,198,.10));
+  border:1px solid var(--line2);margin-bottom:16px}
+.card h3{font-size:1.02rem;margin-bottom:8px;font-weight:700}
+.card p{color:var(--muted);font-size:.92rem}
+.card code{font-family:var(--mono);font-size:.84em;color:var(--orange)}
+.cook{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+.step{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:24px}
+.step h3{font-size:.98rem;margin-bottom:14px;font-weight:700}
+.keys{display:flex;flex-wrap:wrap;gap:7px;align-items:center;font-family:var(--mono);font-size:.8rem}
+.keys kbd{background:var(--panel2);border:1px solid var(--line2);border-bottom-width:2px;border-radius:6px;
+  padding:3px 9px;color:var(--fg)}
+.keys .txt{color:var(--orange)}
+.keys .arr{color:var(--dim)}
+.step p{margin-top:12px;color:var(--muted);font-size:.87rem}
+.safety{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line2);
+  border-radius:20px;padding:44px}
+.safety ul{list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px;margin-top:30px}
+.safety li{padding-left:30px;position:relative;color:var(--muted);font-size:.94rem}
+.safety li::before{content:"✓";position:absolute;left:0;top:0;width:20px;height:20px;border-radius:6px;
+  display:flex;align-items:center;justify-content:center;font-size:.72rem;color:#12131c;font-weight:800;
+  background:var(--green)}
+.safety li strong{color:var(--fg)}
+pre.code{background:var(--panel);border:1px solid var(--line2);border-radius:14px;padding:20px 22px;
+  font-family:var(--mono);font-size:.82rem;overflow-x:auto;color:var(--muted)}
+pre.code .g{color:var(--green)}
+footer{border-top:1px solid var(--line);padding:40px 0;color:var(--dim);font-size:.88rem;text-align:center}
+footer a{color:var(--muted)}
+footer a:hover{color:var(--fg)}
+@media(max-width:760px){.term pre{font-size:.55rem}nav .links a:not(.gh){display:none}}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap in">
+  <div class="logo" style="display:flex;align-items:center;gap:9px"><img src="assets/logo-dark.svg" alt="" width="24" height="24"><span>FW<b>Deck</b></span></div>
+  <div class="links">
+    <a href="#features">Features</a>
+    <a href="#cookbook">Cookbook</a>
+    <a href="#install">Install</a>
+    <a href="docs/">Docs</a>
+    <a class="gh" href="https://github.com/madebydaniz/fwdeck">GitHub ↗</a>
+  </div>
+</div></nav>
+
+<div class="wrap">
+
+<div class="hero">
+  <img src="assets/logo-dark.svg" alt="" width="88" height="88"
+       style="display:block;margin:0 auto 22px;filter:drop-shadow(0 0 24px rgba(189,147,249,.35))">
+  <span class="eyebrow"><i></i> Signed releases · Cosign keyless · MIT</span>
+  <h1>Your firewall, on one screen.<br><span>Nothing applied without review.</span></h1>
+  <p class="tag">FWDeck is a safety-first terminal UI for <strong>firewalld</strong>.
+  Zones, services, ports, and rules — fast, keyboard-only, runtime vs permanent always
+  visible, and a confirmation in front of anything that could lock you out.</p>
+  <div class="cta">
+    <div class="install">
+      <span><span class="dollar">$</span> curl -fsSL https://raw.githubusercontent.com/madebydaniz/fwdeck/main/scripts/install.sh | bash</span>
+      <button onclick="navigator.clipboard.writeText('curl -fsSL https://raw.githubusercontent.com/madebydaniz/fwdeck/main/scripts/install.sh | bash');this.textContent='copied ✓';setTimeout(()=>this.textContent='copy',1200)">copy</button>
+    </div>
+  </div>
+  <div class="alt"><a href="https://github.com/madebydaniz/fwdeck/releases">Prebuilt binaries</a> for x86_64 / aarch64, glibc &amp; static musl</div>
+
+  <div class="shot"><div class="term">
+    <div class="bar"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i></div>
+    <img src="assets/zones.png" alt="FWDeck — zones view with runtime vs permanent drift markers"
+         style="display:block;width:100%">
+  </div></div>
+</div>
+
+<section id="features">
+  <span class="sec-eyebrow">Why FWDeck</span>
+  <h2>Built for the operator, not the demo</h2>
+  <p class="sub">Everything firewalld can do, visible and reviewable — with the guard
+  rails you wish you had the last time a rule cut your SSH session.</p>
+  <div class="grid">
+    <div class="card"><div class="ico">⏱</div><h3>Dead-man's switch</h3>
+      <p>Risky changes start a rollback countdown. Confirm you still have a working
+      session — or FWDeck reverts automatically. Locking yourself out is no longer
+      a one-way door.</p></div>
+    <div class="card"><div class="ico">🔍</div><h3>Runtime vs permanent, always</h3>
+      <p>Every row shows its scope, the header shows drift, and Zone Overview shows
+      it per attribute. No more guessing what survives a reload.</p></div>
+    <div class="card"><div class="ico">📋</div><h3>Staged plans &amp; exports</h3>
+      <p>Stage changes, review the batch, apply once — or export it as a
+      <code>firewall-cmd</code> script, JSON, or an Ansible playbook.</p></div>
+    <div class="card"><div class="ico">📸</div><h3>Snapshots &amp; restore</h3>
+      <p>Save the configuration before maintenance. Restore diffs the snapshot against
+      the current state and stages the exact way back — reviewed, never automatic.</p></div>
+    <div class="card"><div class="ico">⌨️</div><h3>Everything in the palette</h3>
+      <p>A fuzzy command palette (<code>:</code>) with context-aware availability —
+      from allowing a service to panic mode. Guided rich-rule builder included.</p></div>
+    <div class="card"><div class="ico">✍️</div><h3>Honest results, signed builds</h3>
+      <p>Partial failures are reported as partial failures — never as success. JSONL
+      audit trail. Releases checksummed and Cosign-signed (Sigstore keyless).</p></div>
+  </div>
+</section>
+
+<section id="cookbook">
+  <span class="sec-eyebrow">Cookbook</span>
+  <h2>Common tasks, exact keystrokes</h2>
+  <p class="sub">Every mutation shows a confirmation stating the resource, zone, scope,
+  and connectivity risk. <code>y</code> applies · <code>s</code> stages · <code>n</code> cancels.</p>
+  <div class="cook">
+    <div class="step"><h3>Allow HTTPS</h3>
+      <div class="keys"><kbd>1</kbd><span class="arr">→</span><kbd>a</kbd><span class="arr">→</span>
+      <span class="txt">https</span><span class="arr">→</span><kbd>enter</kbd><span class="arr">→</span><kbd>y</kbd></div>
+      <p>Services view, add, type the name, review, apply.</p></div>
+    <div class="step"><h3>Open a port</h3>
+      <div class="keys"><kbd>2</kbd><span class="arr">→</span><kbd>a</kbd><span class="arr">→</span>
+      <span class="txt">8080/tcp</span><span class="arr">→</span><kbd>y</kbd></div>
+      <p>Ranges work too: <code>5000-5010/udp</code>.</p></div>
+    <div class="step"><h3>Forward 8080 → 80</h3>
+      <div class="keys"><kbd>3</kbd><span class="arr">→</span><kbd>a</kbd><span class="arr">→</span>
+      <span class="txt">port=8080:proto=tcp:toport=80</span><span class="arr">→</span><kbd>y</kbd></div>
+      <p>Optionally add <code>:toaddr=10.0.0.5</code>.</p></div>
+    <div class="step"><h3>Block a range</h3>
+      <div class="keys"><kbd>:</kbd><span class="arr">→</span><span class="txt">build</span>
+      <span class="arr">→</span><span class="txt">ipv4 · 203.0.113.0/24 · reject</span></div>
+      <p>The guided builder assembles valid rich-rule syntax step by step with a live preview.</p></div>
+    <div class="step"><h3>Activate a zone</h3>
+      <div class="keys"><kbd>5</kbd><span class="arr">→</span><kbd>a</kbd><span class="arr">→</span>
+      <span class="txt">eth1</span><span class="arr">→</span><kbd>y</kbd></div>
+      <p>A zone is active when it has interface or source bindings. Delete bindings with <kbd>d</kbd> to deactivate.</p></div>
+    <div class="step"><h3>Bulk delete</h3>
+      <div class="keys"><kbd>space</kbd><span class="arr">mark rows</span><span class="arr">→</span><kbd>d</kbd></div>
+      <p>One confirmation lists everything that will be removed.</p></div>
+  </div>
+</section>
+
+<section>
+  <div class="safety">
+    <span class="sec-eyebrow">Safety model</span>
+    <h2>What protects you</h2>
+    <ul>
+      <li><strong>Validation first</strong> — duplicates, unknown zones, and invalid input are rejected before any modal.</li>
+      <li><strong>SSH awareness</strong> — FWDeck knows which interface your session uses and warns precisely when a change targets its zone.</li>
+      <li><strong>Honest partial failures</strong> — runtime-applied / permanent-failed is reported as exactly that, with per-step details and a rollback hint.</li>
+      <li><strong>Audit trail</strong> — every applied operation recorded as JSONL with its exact invocations.</li>
+      <li><strong>Read-only mode</strong> — <code>--read-only</code> disables mutations in the engine, not just the buttons.</li>
+      <li><strong>Offline mode</strong> — fix the permanent config from rescue/chroot with <code>--offline</code>, no daemon needed.</li>
+    </ul>
+  </div>
+</section>
+
+<section style="padding-top:0;text-align:center">
+  <a href="docs/#cookbook" style="display:inline-block;border:1px solid var(--line2);border-radius:10px;
+     padding:12px 26px;color:var(--fg);font-weight:600">Full documentation →</a>
+</section>
+
+<section id="install">
+  <span class="sec-eyebrow">Get started</span>
+  <h2>Install in one line</h2>
+  <p class="sub">The install script checks the SHA-256 checksums and the Cosign keyless
+  signature before anything touches your disk.</p>
+<pre class="code"><span class="g">$</span> curl -fsSL https://raw.githubusercontent.com/madebydaniz/fwdeck/main/scripts/install.sh | bash
+<span class="g">$</span> fwdeck doctor        <span style="color:#4c5070"># checks your environment — never touches the firewall</span>
+<span class="g">$</span> fwdeck --read-only   <span style="color:#4c5070"># look around safely first</span>
+<span class="g">$</span> sudo fwdeck          <span style="color:#4c5070"># full control</span></pre>
+  <p style="margin-top:16px;color:var(--muted);font-size:.92rem">
+  Prebuilt for <code style="font-family:var(--mono)">x86_64</code> /
+  <code style="font-family:var(--mono)">aarch64</code>, glibc and static musl — every
+  archive includes shell completions and a man page. Verify any release yourself:
+  <a href="https://github.com/madebydaniz/fwdeck/blob/main/SECURITY.md">SECURITY.md</a>.</p>
+</section>
+
+</div>
+
+<footer><div class="wrap">
+  <p><strong>FWDeck</strong> · MIT License ·
+  <a href="https://github.com/madebydaniz/fwdeck">GitHub</a> ·
+  <a href="https://github.com/madebydaniz/fwdeck/issues">Issues</a> ·
+  <a href="https://github.com/madebydaniz/fwdeck/releases">Releases</a></p>
+  <p style="margin-top:8px">Developed and maintained by
+  <a href="https://github.com/madebydaniz">Daniel Niazmand</a> ·
+  <a href="https://madebydaniz.com">madebydaniz.com</a></p>
+  <p style="margin-top:8px">Made with ❤️ for operators who read the diff before they apply it.</p>
+</div></footer>
+
+</body>
+</html>

@@ -1,0 +1,147 @@
+<div align="center">
+    <a href="https://github.com/madebydaniz/fwdeck/actions/workflows/ci.yml">
+        <img alt="GitHub Actions Workflow Status" src="https://img.shields.io/github/actions/workflow/status/madebydaniz/fwdeck/ci.yml?branch=main" />
+    </a>
+    <a href="https://github.com/madebydaniz/fwdeck/releases">
+        <img alt="GitHub Release" src="https://img.shields.io/github/v/release/madebydaniz/fwdeck" />
+    </a>
+    <a href="https://github.com/madebydaniz/fwdeck/actions/workflows/release-binaries.yml">
+        <img alt="Signed releases" src="https://img.shields.io/badge/releases-cosign%20signed-blueviolet" />
+    </a>
+    <a href="LICENSE">
+        <img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg" />
+    </a>
+</div>
+
+<br>
+
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="FWDeck logo" src="assets/logo.svg" width="96">
+  </picture>
+  <h1>FWDeck</h1>
+</div>
+
+FWDeck is a safety-first terminal UI for **firewalld** — manage your Linux
+firewall the way k9s manages Kubernetes: fast, keyboard-only, and with a
+confirmation in front of anything that could lock you out.
+
+![FWDeck zones view](assets/zones.png)
+
+## Features
+
+- 🧭 Every firewalld object on one screen: zones, services, ports, source-ports, protocols, forwards, rich rules, interfaces, sources, ipsets, policies, direct rules — plus per-zone target, intra-zone forwarding, and icmp-block inversion.
+- 🔍 Runtime vs permanent scope on **every row** — you always know what survives a reload.
+- ⏱️ Dead-man's switch: risky changes auto-revert on a countdown, on undo, or on quit — unless you confirm your session still works. An out-of-process systemd watchdog is **pre-armed before the change is applied**, so the revert survives a crash, `SIGKILL`, or dropped SSH session (degrades to in-process rollback where systemd/root is unavailable).
+- ✅ A confirmation in front of every mutation: resource, zone, scope, connectivity risk.
+- 📋 Staged plans: batch changes, review once, apply once — or export as `firewall-cmd` script, JSON, or Ansible.
+- 📸 Configuration snapshots with diff-based restore (restore is staged, never automatic), plus read-only **snapshot diff** and **session diff** ("what changed since startup").
+- 🧙 Guided rich-rule builder — assemble valid rich-language syntax step by step.
+- ↩️ Multi-level undo — every verified reversible change stacks; undo pops the most recent.
+- 📊 Live nftables **rule-hit counters** per chain (nftables backend).
+- ⌨️ Fuzzy command palette (`:`) with context-aware availability; live filtering (`/`); **global search** (`ctrl-f`) across every view at once.
+- 🗑️ Multi-select bulk delete with one reviewed confirmation.
+- 📜 Live kernel/netfilter log tail with a denied-packet counter.
+- 🚨 SSH-aware: warns precisely when a change targets the zone your session depends on.
+- 🧯 Offline mode (`--offline`) — fix the permanent config from rescue/chroot, no daemon needed.
+- 🪪 Honest results: partial failures reported as partial failures, with per-step diagnostics and a JSONL audit trail.
+- 🔌 Two backends behind one trait: `firewall-cmd` (default, full-featured) and native D-Bus (reads + runtime edits; refuses what it can't do fully).
+- 🔏 Every release checksummed and signed with Cosign keyless (Sigstore).
+- 🩺 `fwdeck doctor`, shell completions, man page, XDG config, three themes.
+
+## Compatibility
+
+Every release is tested against a **real firewalld daemon** in CI on:
+
+| Distro | firewalld | Status |
+| ------ | --------- | ------ |
+| Fedora 44 | 2.4.x | ✅ CI |
+| Debian 13 | 2.3.x | ✅ CI |
+| AlmaLinux 9 (RHEL-compatible) | 1.3.x | ✅ CI |
+
+**⚠️ FWDeck is under heavy development.** Don't test mutations on a remote-only
+system unless you have console access or another recovery path.
+
+## Install
+
+Verifies checksums and the Cosign release signature before installing:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/madebydaniz/fwdeck/main/scripts/install.sh | bash
+```
+
+Then:
+
+```bash
+fwdeck doctor        # checks your environment — never touches the firewall
+fwdeck --read-only   # look around safely; mutations are disabled
+sudo fwdeck          # full control
+```
+
+Native **`.deb` / `.rpm`** packages (amd64 & arm64), prebuilt signed binaries
+for `x86_64`/`aarch64` (glibc & static musl), and shell completions + man page
+are on every [release](https://github.com/madebydaniz/fwdeck/releases):
+
+```bash
+sudo apt install ./fwdeck_*.deb    # Debian/Ubuntu (download the .deb for your arch first)
+sudo dnf install ./fwdeck-*.rpm    # Fedora/RHEL
+```
+
+Or build from source: `cargo install --git https://github.com/madebydaniz/fwdeck --locked`.
+
+## Documentation
+
+- [Getting started](https://madebydaniz.github.io/fwdeck/docs/#introduction)
+- [Installation & release verification](https://madebydaniz.github.io/fwdeck/docs/#installation)
+- [The interface & views](https://madebydaniz.github.io/fwdeck/docs/#interface)
+- [Cookbook — common tasks, exact keystrokes](https://madebydaniz.github.io/fwdeck/docs/#cookbook)
+- [Safety features](https://madebydaniz.github.io/fwdeck/docs/#safety)
+- [Configuration](https://madebydaniz.github.io/fwdeck/docs/#configuration)
+- [FAQ & troubleshooting](https://madebydaniz.github.io/fwdeck/docs/#faq)
+
+## Try it safely
+
+No firewalld on your machine, or don't want to touch it? The dev container runs
+a **real firewalld** with seeded data, fully isolated from your host:
+
+```bash
+git clone https://github.com/madebydaniz/fwdeck.git && cd fwdeck
+docker compose run --rm dev
+cargo run   # inside the container
+```
+
+## Why did I build it?
+
+Managing firewalld means the same loop every time: `firewall-cmd --list-all`,
+scroll, `--add-service`, forget `--permanent`, `--reload`, check again, lose
+track of which change was runtime-only. One mistyped rule on a remote box can
+cost you the SSH session you're typing in. I wanted the k9s experience for
+firewalld: everything visible on one screen, every change reviewed before it
+lands, and a safety net when a change goes wrong. Nothing like it existed —
+firewalld has no official TUI — so I built it.
+
+## Alternatives
+
+- [Cockpit](https://cockpit-project.org/): a great web console with a firewall
+  page. It covers services and ports, but not rich rules, masquerade, policies,
+  or ipsets — and it's a web service you have to run on a firewall host.
+- [firewall-config](https://firewalld.org/): the official GTK GUI — needs a
+  desktop session, so it rarely helps on servers.
+- [Webmin](https://webmin.com/): manages firewalld among many other things via
+  web UI; heavier footprint and again a web service on the host.
+- Raw `firewall-cmd`: always works, and FWDeck never hides it — every applied
+  step is recorded as the exact equivalent invocation. FWDeck is the review
+  layer, not a replacement.
+
+## Support
+
+If FWDeck saves you from one locked-out SSH session, drop a ⭐️ on the repo!
+
+- Bugs & feature requests: [GitHub Issues](https://github.com/madebydaniz/fwdeck/issues)
+- Security reports: see [SECURITY.md](SECURITY.md) — please use private reporting
+
+## License
+
+FWDeck is licensed under the [MIT License](LICENSE) and maintained by
+[Daniel Niazmand](https://github.com/madebydaniz) · [madebydaniz.com](https://madebydaniz.com).

@@ -1,0 +1,668 @@
+//! Native firewalld D-Bus backend (feature `dbus`). A second implementation of
+//! the same `FirewallBackend` port — proof that the trait boundary holds: the
+//! domain, application, and UI layers are untouched.
+//!
+//! Method names are pinned to firewalld's D-Bus API, verified by introspecting
+//! a live daemon (`busctl introspect org.fedoraproject.FirewallD1 …`).
+//!
+//! Coverage: `probe()` and `snapshot()` (runtime + permanent core zone
+//! attributes) and the common zone mutations. IP sets, policies, direct rules,
+//! and permanent-only object lifecycle (create zone/service/ipset/policy) route
+//! through the CLI backend for now; the D-Bus backend reports them as
+//! unsupported rather than failing silently. See `docs/backend.md`.
+
+use std::collections::{BTreeMap, HashMap};
+
+use zbus::zvariant::OwnedValue;
+use zbus::{Connection, proxy};
+
+use crate::application::ports::{FirewallBackend, FirewallError, OperationOutcome, StepReport};
+use crate::domain::{
+    ConfigurationTarget, FirewallOperation, FirewallSnapshot, FirewallStatus, ForwardPort,
+    IcmpType, InterfaceName, LogDenied, PortSpec, RichRule, ServiceName, SourceAddress,
+    ZoneDetails, ZoneName, ZoneTarget,
+};
+
+/// firewalld's main interface.
+#[proxy(
+    interface = "org.fedoraproject.FirewallD1",
+    default_service = "org.fedoraproject.FirewallD1",
+    default_path = "/org/fedoraproject/FirewallD1"
+)]
+trait FirewallD1 {
+    #[zbus(property, name = "version")]
+    fn version(&self) -> zbus::Result<String>;
+    #[zbus(name = "getDefaultZone")]
+    fn get_default_zone(&self) -> zbus::Result<String>;
+    #[zbus(name = "getLogDenied")]
+    fn get_log_denied(&self) -> zbus::Result<String>;
+    #[zbus(name = "queryPanicMode")]
+    fn query_panic_mode(&self) -> zbus::Result<bool>;
+    #[zbus(name = "listServices")]
+    fn list_services(&self) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "reload")]
+    fn reload(&self) -> zbus::Result<()>;
+    #[zbus(name = "runtimeToPermanent")]
+    fn runtime_to_permanent(&self) -> zbus::Result<()>;
+    #[zbus(name = "enablePanicMode")]
+    fn enable_panic_mode(&self) -> zbus::Result<()>;
+    #[zbus(name = "disablePanicMode")]
+    fn disable_panic_mode(&self) -> zbus::Result<()>;
+    #[zbus(name = "setDefaultZone")]
+    fn set_default_zone(&self, zone: &str) -> zbus::Result<()>;
+    #[zbus(name = "setLogDenied")]
+    fn set_log_denied(&self, value: &str) -> zbus::Result<()>;
+}
+
+/// Runtime zone interface — every getter takes the zone name.
+#[proxy(
+    interface = "org.fedoraproject.FirewallD1.zone",
+    default_service = "org.fedoraproject.FirewallD1",
+    default_path = "/org/fedoraproject/FirewallD1"
+)]
+trait Zone {
+    #[zbus(name = "getZones")]
+    fn get_zones(&self) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getActiveZones")]
+    fn get_active_zones(&self) -> zbus::Result<HashMap<String, HashMap<String, Vec<String>>>>;
+    #[zbus(name = "getServices")]
+    fn get_services(&self, zone: &str) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getPorts")]
+    fn get_ports(&self, zone: &str) -> zbus::Result<Vec<Vec<String>>>;
+    #[zbus(name = "getForwardPorts")]
+    fn get_forward_ports(&self, zone: &str) -> zbus::Result<Vec<Vec<String>>>;
+    #[zbus(name = "getRichRules")]
+    fn get_rich_rules(&self, zone: &str) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getInterfaces")]
+    fn get_interfaces(&self, zone: &str) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getSources")]
+    fn get_sources(&self, zone: &str) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getIcmpBlocks")]
+    fn get_icmp_blocks(&self, zone: &str) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "queryMasquerade")]
+    fn query_masquerade(&self, zone: &str) -> zbus::Result<bool>;
+    #[zbus(name = "getZoneSettings2")]
+    fn get_zone_settings2(&self, zone: &str) -> zbus::Result<HashMap<String, OwnedValue>>;
+
+    #[zbus(name = "addService")]
+    fn add_service(&self, zone: &str, service: &str, timeout: i32) -> zbus::Result<String>;
+    #[zbus(name = "removeService")]
+    fn remove_service(&self, zone: &str, service: &str) -> zbus::Result<String>;
+    #[zbus(name = "addPort")]
+    fn add_port(
+        &self,
+        zone: &str,
+        port: &str,
+        protocol: &str,
+        timeout: i32,
+    ) -> zbus::Result<String>;
+    #[zbus(name = "removePort")]
+    fn remove_port(&self, zone: &str, port: &str, protocol: &str) -> zbus::Result<String>;
+    #[zbus(name = "addMasquerade")]
+    fn add_masquerade(&self, zone: &str, timeout: i32) -> zbus::Result<String>;
+    #[zbus(name = "removeMasquerade")]
+    fn remove_masquerade(&self, zone: &str) -> zbus::Result<String>;
+    #[zbus(name = "addRichRule")]
+    fn add_rich_rule(&self, zone: &str, rule: &str, timeout: i32) -> zbus::Result<String>;
+    #[zbus(name = "removeRichRule")]
+    fn remove_rich_rule(&self, zone: &str, rule: &str) -> zbus::Result<String>;
+    #[zbus(name = "addInterface")]
+    fn add_interface(&self, zone: &str, interface: &str) -> zbus::Result<String>;
+    #[zbus(name = "removeInterface")]
+    fn remove_interface(&self, zone: &str, interface: &str) -> zbus::Result<String>;
+    #[zbus(name = "addSource")]
+    fn add_source(&self, zone: &str, source: &str) -> zbus::Result<String>;
+    #[zbus(name = "removeSource")]
+    fn remove_source(&self, zone: &str, source: &str) -> zbus::Result<String>;
+    #[zbus(name = "addIcmpBlock")]
+    fn add_icmp_block(&self, zone: &str, icmp: &str, timeout: i32) -> zbus::Result<String>;
+    #[zbus(name = "removeIcmpBlock")]
+    fn remove_icmp_block(&self, zone: &str, icmp: &str) -> zbus::Result<String>;
+}
+
+/// Permanent config interface: resolve a zone name to its config object path.
+#[proxy(
+    interface = "org.fedoraproject.FirewallD1.config",
+    default_service = "org.fedoraproject.FirewallD1",
+    default_path = "/org/fedoraproject/FirewallD1/config"
+)]
+trait Config {
+    #[zbus(name = "getZoneNames")]
+    fn get_zone_names(&self) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getZoneByName")]
+    fn get_zone_by_name(&self, name: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+}
+
+/// A permanent zone config object (path resolved via `Config::getZoneByName`).
+#[proxy(
+    interface = "org.fedoraproject.FirewallD1.config.zone",
+    default_service = "org.fedoraproject.FirewallD1"
+)]
+trait ConfigZone {
+    #[zbus(name = "getTarget")]
+    fn get_target(&self) -> zbus::Result<String>;
+    #[zbus(name = "getServices")]
+    fn get_services(&self) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getPorts")]
+    fn get_ports(&self) -> zbus::Result<Vec<(String, String)>>;
+    #[zbus(name = "getForwardPorts")]
+    fn get_forward_ports(&self) -> zbus::Result<Vec<(String, String, String, String)>>;
+    #[zbus(name = "getRichRules")]
+    fn get_rich_rules(&self) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getInterfaces")]
+    fn get_interfaces(&self) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getSources")]
+    fn get_sources(&self) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getIcmpBlocks")]
+    fn get_icmp_blocks(&self) -> zbus::Result<Vec<String>>;
+    #[zbus(name = "getMasquerade")]
+    fn get_masquerade(&self) -> zbus::Result<bool>;
+}
+
+/// `FirewallBackend` implementation over firewalld's system-bus D-Bus API.
+/// Zone getters run concurrently on the single multiplexed connection.
+/// Mutations are runtime-scoped only; wider targets and unsupported
+/// operations fail loudly with a pointer to the CLI backend.
+pub struct DbusBackend {
+    connection: Connection,
+}
+
+impl DbusBackend {
+    /// Connects to the system bus. Fails cleanly if D-Bus or firewalld is absent.
+    pub async fn connect() -> Result<Self, FirewallError> {
+        let connection = Connection::system()
+            .await
+            .map_err(|err| FirewallError::Process(format!("D-Bus connection failed: {err}")))?;
+        Ok(Self { connection })
+    }
+
+    async fn main(&self) -> Result<FirewallD1Proxy<'_>, FirewallError> {
+        FirewallD1Proxy::new(&self.connection)
+            .await
+            .map_err(dbus_err)
+    }
+
+    async fn zone(&self) -> Result<ZoneProxy<'_>, FirewallError> {
+        ZoneProxy::new(&self.connection).await.map_err(dbus_err)
+    }
+
+    /// One zone's runtime attributes. Errors propagate — a half-read zone
+    /// rendered as empty would misstate live firewall policy. The getters are
+    /// independent, so they run concurrently on the multiplexed connection.
+    async fn runtime_zone(
+        &self,
+        zone: &ZoneProxy<'_>,
+        name: &ZoneName,
+    ) -> Result<ZoneDetails, FirewallError> {
+        let n = name.as_str();
+        let (settings, services, ports, forwards, rich, interfaces, sources, icmp, masquerade) = tokio::join!(
+            zone.get_zone_settings2(n),
+            zone.get_services(n),
+            zone.get_ports(n),
+            zone.get_forward_ports(n),
+            zone.get_rich_rules(n),
+            zone.get_interfaces(n),
+            zone.get_sources(n),
+            zone.get_icmp_blocks(n),
+            zone.query_masquerade(n),
+        );
+        let mut details = ZoneDetails::empty(name.clone());
+        details.target = settings
+            .map_err(dbus_err)?
+            .get("target")
+            .and_then(|v| String::try_from(v.clone()).ok())
+            .and_then(|t| t.parse().ok())
+            .unwrap_or(ZoneTarget::Default);
+        details.services = parsed(&services.map_err(dbus_err)?, ServiceName::parse);
+        details.ports = ports
+            .map_err(dbus_err)?
+            .iter()
+            .filter_map(|pair| pair_to_port(pair.first()?, pair.get(1)?))
+            .collect();
+        details.forward_ports = forwards
+            .map_err(dbus_err)?
+            .iter()
+            .filter_map(|f| ForwardPort::from_parts(f.first()?, f.get(1)?, f.get(2)?, f.get(3)?))
+            .collect();
+        details.rich_rules = parsed(&rich.map_err(dbus_err)?, RichRule::parse);
+        details.interfaces = parsed(&interfaces.map_err(dbus_err)?, InterfaceName::parse);
+        details.sources = parsed(&sources.map_err(dbus_err)?, SourceAddress::parse);
+        details.icmp_blocks = parsed(&icmp.map_err(dbus_err)?, IcmpType::parse);
+        details.masquerade = masquerade.map_err(dbus_err)?;
+        Ok(details)
+    }
+
+    /// One zone's permanent config object. Errors propagate (e.g. a polkit
+    /// denial on the config interface must not masquerade as an empty config).
+    async fn permanent_zone(
+        &self,
+        config: &ConfigProxy<'_>,
+        raw: &str,
+    ) -> Result<Option<(ZoneName, ZoneDetails)>, FirewallError> {
+        // Unparseable zone names are skipped, not fatal (forward compatibility).
+        let Ok(name) = ZoneName::parse(raw) else {
+            return Ok(None);
+        };
+        let path = config.get_zone_by_name(raw).await.map_err(dbus_err)?;
+        let proxy = ConfigZoneProxy::builder(&self.connection)
+            .path(path)
+            .map_err(dbus_err)?
+            .build()
+            .await
+            .map_err(dbus_err)?;
+        let (target, services, ports, forwards, rich, interfaces, sources, icmp, masquerade) = tokio::join!(
+            proxy.get_target(),
+            proxy.get_services(),
+            proxy.get_ports(),
+            proxy.get_forward_ports(),
+            proxy.get_rich_rules(),
+            proxy.get_interfaces(),
+            proxy.get_sources(),
+            proxy.get_icmp_blocks(),
+            proxy.get_masquerade(),
+        );
+        let mut details = ZoneDetails::empty(name.clone());
+        details.target = target
+            .map_err(dbus_err)?
+            .parse()
+            .unwrap_or(ZoneTarget::Default);
+        details.services = parsed(&services.map_err(dbus_err)?, ServiceName::parse);
+        details.ports = ports
+            .map_err(dbus_err)?
+            .iter()
+            .filter_map(|(port, proto)| pair_to_port(port, proto))
+            .collect();
+        details.forward_ports = forwards
+            .map_err(dbus_err)?
+            .iter()
+            .filter_map(|(p, proto, tp, ta)| ForwardPort::from_parts(p, proto, tp, ta))
+            .collect();
+        details.rich_rules = parsed(&rich.map_err(dbus_err)?, RichRule::parse);
+        details.interfaces = parsed(&interfaces.map_err(dbus_err)?, InterfaceName::parse);
+        details.sources = parsed(&sources.map_err(dbus_err)?, SourceAddress::parse);
+        details.icmp_blocks = parsed(&icmp.map_err(dbus_err)?, IcmpType::parse);
+        details.masquerade = masquerade.map_err(dbus_err)?;
+        Ok(Some((name, details)))
+    }
+
+    async fn permanent_zones(&self) -> Result<BTreeMap<ZoneName, ZoneDetails>, FirewallError> {
+        let config = ConfigProxy::new(&self.connection).await.map_err(dbus_err)?;
+        let names = config.get_zone_names().await.map_err(dbus_err)?;
+        let fetched = futures_util::future::join_all(
+            names.iter().map(|raw| self.permanent_zone(&config, raw)),
+        )
+        .await;
+        let mut zones = BTreeMap::new();
+        for result in fetched {
+            if let Some((name, details)) = result? {
+                zones.insert(name, details);
+            }
+        }
+        Ok(zones)
+    }
+}
+
+impl FirewallBackend for DbusBackend {
+    async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
+        let main = self.main().await?;
+        // Only a missing bus name means "daemon not running" — authorization
+        // and transport failures must surface as themselves, not as a
+        // misleading "start firewalld" hint.
+        let daemon_running = match main.get_default_zone().await {
+            Ok(_) => true,
+            Err(err) => match dbus_err(err) {
+                FirewallError::DaemonNotRunning => false,
+                other => return Err(other),
+            },
+        };
+        let (log_denied, panic_mode) = if daemon_running {
+            let raw = main.get_log_denied().await.map_err(dbus_err)?;
+            let log_denied = raw
+                .parse()
+                .map_err(|err| FirewallError::Parse(format!("log-denied `{raw}`: {err}")))?;
+            (log_denied, main.query_panic_mode().await.map_err(dbus_err)?)
+        } else {
+            (LogDenied::Off, false)
+        };
+        Ok(FirewallStatus {
+            daemon_running,
+            version: main.version().await.ok(),
+            backend: super::netfilter_backend(),
+            log_denied,
+            panic_mode,
+        })
+    }
+
+    async fn snapshot(&self) -> Result<FirewallSnapshot, FirewallError> {
+        let status = self.probe().await?;
+        if !status.daemon_running {
+            return Err(FirewallError::DaemonNotRunning);
+        }
+        let main = self.main().await?;
+        let zone = self.zone().await?;
+
+        let default_zone = ZoneName::parse(&main.get_default_zone().await.map_err(dbus_err)?)
+            .map_err(|e| FirewallError::Parse(e.to_string()))?;
+
+        let mut active = BTreeMap::new();
+        for (name, sections) in zone.get_active_zones().await.map_err(dbus_err)? {
+            if let Ok(zone_name) = ZoneName::parse(&name) {
+                active.insert(
+                    zone_name,
+                    crate::domain::ActiveZone {
+                        interfaces: sections
+                            .get("interfaces")
+                            .map(|v| parsed(v, InterfaceName::parse))
+                            .unwrap_or_default(),
+                        sources: sections
+                            .get("sources")
+                            .map(|v| parsed(v, SourceAddress::parse))
+                            .unwrap_or_default(),
+                    },
+                );
+            }
+        }
+
+        let names: Vec<ZoneName> = zone
+            .get_zones()
+            .await
+            .map_err(dbus_err)?
+            .iter()
+            .filter_map(|raw| ZoneName::parse(raw).ok())
+            .collect();
+        let fetched = futures_util::future::join_all(names.into_iter().map(|name| {
+            let zone = &zone;
+            async move {
+                let details = self.runtime_zone(zone, &name).await?;
+                Ok::<_, FirewallError>((name, details))
+            }
+        }))
+        .await;
+        let mut runtime = BTreeMap::new();
+        for result in fetched {
+            let (name, details) = result?;
+            runtime.insert(name, details);
+        }
+        let permanent = self.permanent_zones().await?;
+        let available_services = parsed(
+            &main.list_services().await.map_err(dbus_err)?,
+            ServiceName::parse,
+        );
+
+        Ok(FirewallSnapshot {
+            status,
+            default_zone,
+            active,
+            runtime,
+            permanent,
+            // Not yet fetched via D-Bus — the CLI backend is the full-featured
+            // reference. Declared degraded so the UI shows "unknown", not "none".
+            ipsets: BTreeMap::new(),
+            service_definitions: BTreeMap::new(),
+            available_services,
+            policies: BTreeMap::new(),
+            direct_rules: Vec::new(),
+            degraded: vec![
+                "ipsets: not fetched by the D-Bus backend yet".to_owned(),
+                "policies: not fetched by the D-Bus backend yet".to_owned(),
+                "direct rules: not fetched by the D-Bus backend yet".to_owned(),
+            ],
+        })
+    }
+
+    async fn apply(&self, operation: &FirewallOperation) -> OperationOutcome {
+        match self.dispatch(operation).await {
+            Ok(steps) => OperationOutcome::Applied {
+                operation: operation.clone(),
+                steps,
+            },
+            Err(failed) => OperationOutcome::Failed {
+                operation: operation.clone(),
+                steps: vec![StepReport {
+                    target: "runtime",
+                    invocation: failed.invocation,
+                    result: Err(failed.error),
+                }],
+            },
+        }
+    }
+}
+
+/// A dispatch failure carrying the D-Bus method invocation that failed, so the
+/// audit trail and step display name the exact call (ports.rs contract).
+struct FailedStep {
+    invocation: Vec<String>,
+    error: FirewallError,
+}
+
+impl DbusBackend {
+    /// Executes an operation over D-Bus. Runtime-scoped only for now (the
+    /// permanent config-object mutation path is a documented follow-up).
+    #[allow(clippy::too_many_lines)] // one arm per supported operation
+    async fn dispatch(&self, operation: &FirewallOperation) -> Result<Vec<StepReport>, FailedStep> {
+        let connect = |error| FailedStep {
+            invocation: Vec::new(),
+            error,
+        };
+        let main = self.main().await.map_err(connect)?;
+        let zone = self.zone().await.map_err(connect)?;
+        let step = |invocation: Vec<String>| StepReport {
+            target: "runtime",
+            invocation,
+            result: Ok(()),
+        };
+        // Attaches the invocation to a failing D-Bus call.
+        let fail = |invocation: &[String]| {
+            let invocation = invocation.to_vec();
+            move |err: zbus::Error| FailedStep {
+                invocation,
+                error: dbus_err(err),
+            }
+        };
+
+        match operation {
+            FirewallOperation::Reload => {
+                let inv = vec!["reload".to_owned()];
+                main.reload().await.map_err(fail(&inv))?;
+                Ok(vec![step(inv)])
+            }
+            FirewallOperation::RuntimeToPermanent => {
+                let inv = vec!["runtimeToPermanent".to_owned()];
+                main.runtime_to_permanent().await.map_err(fail(&inv))?;
+                Ok(vec![step(inv)])
+            }
+            FirewallOperation::SetPanicMode { enabled } => {
+                let inv = vec![if *enabled {
+                    "enablePanicMode".to_owned()
+                } else {
+                    "disablePanicMode".to_owned()
+                }];
+                if *enabled {
+                    main.enable_panic_mode().await.map_err(fail(&inv))?;
+                } else {
+                    main.disable_panic_mode().await.map_err(fail(&inv))?;
+                }
+                Ok(vec![step(inv)])
+            }
+            FirewallOperation::SetDefaultZone { zone: name } => {
+                let inv = vec!["setDefaultZone".to_owned(), name.to_string()];
+                main.set_default_zone(name.as_str())
+                    .await
+                    .map_err(fail(&inv))?;
+                Ok(vec![step(inv)])
+            }
+            FirewallOperation::SetLogDenied { value } => {
+                let inv = vec!["setLogDenied".to_owned(), value.as_str().to_owned()];
+                main.set_log_denied(value.as_str())
+                    .await
+                    .map_err(fail(&inv))?;
+                Ok(vec![step(inv)])
+            }
+            FirewallOperation::AddService {
+                zone: z,
+                service,
+                target,
+            } => {
+                let inv = vec!["addService".to_owned(), service.to_string()];
+                runtime_only(*target, &inv)?;
+                zone.add_service(z.as_str(), service.as_str(), 0)
+                    .await
+                    .map_err(fail(&inv))?;
+                Ok(vec![step(inv)])
+            }
+            FirewallOperation::RemoveService {
+                zone: z,
+                service,
+                target,
+            } => {
+                let inv = vec!["removeService".to_owned(), service.to_string()];
+                runtime_only(*target, &inv)?;
+                zone.remove_service(z.as_str(), service.as_str())
+                    .await
+                    .map_err(fail(&inv))?;
+                Ok(vec![step(inv)])
+            }
+            FirewallOperation::AddPort {
+                zone: z,
+                port,
+                target,
+            } => {
+                let inv = vec!["addPort".to_owned(), port.to_string()];
+                runtime_only(*target, &inv)?;
+                zone.add_port(
+                    z.as_str(),
+                    &port.port.to_string(),
+                    port.protocol.as_str(),
+                    0,
+                )
+                .await
+                .map_err(fail(&inv))?;
+                Ok(vec![step(inv)])
+            }
+            FirewallOperation::RemovePort {
+                zone: z,
+                port,
+                target,
+            } => {
+                let inv = vec!["removePort".to_owned(), port.to_string()];
+                runtime_only(*target, &inv)?;
+                zone.remove_port(z.as_str(), &port.port.to_string(), port.protocol.as_str())
+                    .await
+                    .map_err(fail(&inv))?;
+                Ok(vec![step(inv)])
+            }
+            FirewallOperation::SetMasquerade {
+                zone: z,
+                enabled,
+                target,
+            } => {
+                let inv = vec![if *enabled {
+                    "addMasquerade".to_owned()
+                } else {
+                    "removeMasquerade".to_owned()
+                }];
+                runtime_only(*target, &inv)?;
+                if *enabled {
+                    zone.add_masquerade(z.as_str(), 0)
+                        .await
+                        .map_err(fail(&inv))?;
+                } else {
+                    zone.remove_masquerade(z.as_str())
+                        .await
+                        .map_err(fail(&inv))?;
+                }
+                Ok(vec![step(inv)])
+            }
+            other => Err(FailedStep {
+                invocation: Vec::new(),
+                error: FirewallError::Process(format!(
+                    "operation `{}` is not yet supported by the D-Bus backend — use the CLI backend",
+                    other.describe()
+                )),
+            }),
+        }
+    }
+}
+
+/// The D-Bus zone methods mutate runtime state only. Anything wider must fail
+/// loudly — accepting `RuntimeAndPermanent` here would apply the runtime half,
+/// report full success, and silently lose the permanent half on reload.
+fn runtime_only(target: ConfigurationTarget, invocation: &[String]) -> Result<(), FailedStep> {
+    if target == ConfigurationTarget::Runtime {
+        return Ok(());
+    }
+    Err(FailedStep {
+        invocation: invocation.to_vec(),
+        error: FirewallError::Process(
+            "the D-Bus backend applies runtime-only changes for now — \
+             use the CLI backend for permanent scope"
+                .to_owned(),
+        ),
+    })
+}
+
+// Owned by value so it can be used directly as a `map_err` function pointer.
+#[allow(clippy::needless_pass_by_value)]
+fn dbus_err(err: zbus::Error) -> FirewallError {
+    // Method errors carry a structured D-Bus error name — match on it, not on
+    // rendered text. firewalld raises polkit denials under
+    // `…slip.dbus.service.PolKit.NotAuthorizedException…` and its own errors as
+    // `org.fedoraproject.FirewallD1.Exception` with a `NOT_AUTHORIZED:` detail.
+    if let zbus::Error::MethodError(name, detail, _) = &err {
+        let name = name.as_str();
+        let detail = detail.as_deref().unwrap_or("");
+        if name == "org.freedesktop.DBus.Error.AccessDenied"
+            || name.contains("NotAuthorized")
+            || detail.starts_with("NOT_AUTHORIZED")
+        {
+            return FirewallError::PermissionDenied {
+                detail: err.to_string(),
+            };
+        }
+        if name == "org.freedesktop.DBus.Error.ServiceUnknown"
+            || name == "org.freedesktop.DBus.Error.NameHasNoOwner"
+        {
+            return FirewallError::DaemonNotRunning;
+        }
+        return FirewallError::Process(err.to_string());
+    }
+    // Transport-level errors (connection refused, disconnects, …).
+    FirewallError::Process(err.to_string())
+}
+
+/// Parses each item with `parse`, dropping anything invalid (defensive: the
+/// daemon is trusted, but a newer firewalld could return an unfamiliar token).
+fn parsed<T, E>(items: &[String], parse: impl Fn(&str) -> Result<T, E>) -> Vec<T> {
+    items.iter().filter_map(|item| parse(item).ok()).collect()
+}
+
+/// Joins D-Bus `(port, protocol)` pairs into the domain's `port/proto` spec.
+fn pair_to_port(port: &str, protocol: &str) -> Option<PortSpec> {
+    format!("{port}/{protocol}").parse().ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_rejects_everything_but_runtime() {
+        let inv = vec!["addService".to_owned()];
+        assert!(runtime_only(ConfigurationTarget::Runtime, &inv).is_ok());
+        for target in [
+            ConfigurationTarget::Permanent,
+            ConfigurationTarget::RuntimeAndPermanent,
+        ] {
+            let failed = runtime_only(target, &inv).err();
+            let failed = failed.expect("wider targets must fail loudly");
+            assert_eq!(failed.invocation, inv, "failure names the method");
+        }
+    }
+
+    #[test]
+    fn transport_errors_map_to_process() {
+        let err = zbus::Error::InvalidReply;
+        assert!(matches!(dbus_err(err), FirewallError::Process(_)));
+    }
+}

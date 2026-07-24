@@ -1,0 +1,37 @@
+# nFPM configuration for fwdeck RPM and DEB packages.
+# https://nfpm.goreleaser.com/configuration/
+#
+# Expanded environment variables (set by .github/workflows/release-binaries.yml):
+#   NFPM_ARCH    - package architecture (amd64 or arm64)
+#   NFPM_VERSION - package version, release tag without the leading v
+#   NFPM_STAGING - directory holding the built binary, completions, and man page
+
+name: fwdeck
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${NFPM_VERSION}
+maintainer: Daniel Niazmand
+description: A safety-first terminal user interface for inspecting and managing firewalld.
+license: MIT
+homepage: https://github.com/madebydaniz/fwdeck
+
+# fwdeck drives firewalld; it is useless without it.
+depends:
+  - firewalld
+
+contents:
+  - src: ${NFPM_STAGING}/fwdeck
+    dst: /usr/bin/fwdeck
+    file_info:
+      mode: 0755
+  - src: ${NFPM_STAGING}/completions/fwdeck.bash
+    dst: /usr/share/bash-completion/completions/fwdeck
+  - src: ${NFPM_STAGING}/completions/fwdeck.zsh
+    dst: /usr/share/zsh/site-functions/_fwdeck
+  - src: ${NFPM_STAGING}/completions/fwdeck.fish
+    dst: /usr/share/fish/vendor_completions.d/fwdeck.fish
+  # nfpm does not gzip man pages; the workflow gzips fwdeck.1 beforehand.
+  - src: ${NFPM_STAGING}/fwdeck.1.gz
+    dst: /usr/share/man/man1/fwdeck.1.gz
+  - src: ${NFPM_STAGING}/LICENSE
+    dst: /usr/share/licenses/fwdeck/LICENSE

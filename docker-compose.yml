@@ -1,0 +1,87 @@
+# Dev environment: real firewalld on Linux for interactive TUI testing from macOS.
+# Usage:
+#   docker compose build
+#   docker compose run --rm dev            # shell with firewalld running
+#   docker compose run --rm dev cargo run  # build + launch the TUI directly
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    # firewalld needs CAP_NET_ADMIN + netfilter; privileged keeps it simple for a dev box
+    privileged: true
+    # The container VM's default resolver can flake on crates.io; pin a public one.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - .:/workspace
+      - cargo-registry:/root/.cargo/registry
+      - cargo-target:/workspace/target-linux
+    environment:
+      TERM: xterm-256color
+      COLORTERM: truecolor
+      CARGO_TARGET_DIR: /workspace/target-linux
+      # Seed demo kernel-log lines by default so the Logs view has data — the
+      # container VM can't emit real netfilter logs (see docker/entrypoint.sh).
+      # Set to 0 to opt out.
+      FWDECK_DEMO_LOGS: "1"
+    stdin_open: true
+    tty: true
+
+  # Same environment on AlmaLinux 9 (EL9, firewalld 1.x) to verify RHEL-compatible
+  # distros. Separate target dir: EL9's older glibc/toolchain must not share build
+  # artifacts with the Fedora service.
+  dev-el9:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        BASE_IMAGE: almalinux:9
+    image: fwdeck-dev-el9
+    privileged: true
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - .:/workspace
+      - cargo-registry:/root/.cargo/registry
+      - cargo-target-el9:/workspace/target-el9
+    environment:
+      TERM: xterm-256color
+      COLORTERM: truecolor
+      CARGO_TARGET_DIR: /workspace/target-el9
+      FWDECK_DEMO_LOGS: "1"
+    stdin_open: true
+    tty: true
+
+  # Same environment on Debian 13 (trixie, firewalld 2.3.x) to verify the Debian
+  # family. Separate target dir for the same reason as dev-el9.
+  dev-debian:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        BASE_IMAGE: debian:13
+    image: fwdeck-dev-debian
+    privileged: true
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    volumes:
+      - .:/workspace
+      - cargo-registry:/root/.cargo/registry
+      - cargo-target-debian:/workspace/target-debian
+    environment:
+      TERM: xterm-256color
+      COLORTERM: truecolor
+      CARGO_TARGET_DIR: /workspace/target-debian
+      FWDECK_DEMO_LOGS: "1"
+    stdin_open: true
+    tty: true
+
+volumes:
+  cargo-registry:
+  cargo-target:
+  cargo-target-el9:
+  cargo-target-debian:
