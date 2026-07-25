@@ -3,6 +3,13 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.1.2](https://github.com/madebydaniz/fwdeck/compare/v0.1.1...v0.1.2) (2026-07-25)
+
+
+### Bug Fixes
+
+* **crate:** slim the published crate and enable crates.io publishing ([#11](https://github.com/madebydaniz/fwdeck/issues/11)) ([91741b1](https://github.com/madebydaniz/fwdeck/commit/91741b1d4099fc5fd9f5d9f25a9a5c965c2aced6))
+
 ## [0.1.1](https://github.com/madebydaniz/fwdeck/compare/v0.1.0...v0.1.1) (2026-07-25)
 
 
