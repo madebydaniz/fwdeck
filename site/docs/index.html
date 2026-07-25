@@ -93,7 +93,7 @@ img.shot{width:100%;border:1px solid var(--line2);border-radius:12px;margin:6px 
   <a href="#interface">The interface</a>
   <a href="#views">Views</a>
   <a href="#power">Search, diffs &amp; counters</a>
-  <a href="#cookbook">Workflows</a>
+  <a href="#cookbook">Cookbook</a>
   <a href="#safety">Safety features</a>
   <a href="#remote">On a remote server</a>
   <a href="#keybindings">Keybindings</a>
@@ -120,8 +120,6 @@ on every row — and puts a review step in front of every change.</p>
 <p><strong>Requirements:</strong> Linux with firewalld (<code>firewall-cmd</code>
 on PATH). Root or polkit authorization for mutations — without it FWDeck runs
 read-only with a visible explanation, and it never re-executes itself with sudo.</p>
-<div class="note warn"><strong>Early development.</strong> Don't test mutations on
-a remote-only system unless you have console access or another recovery path.</div>
 </section>
 
 <section id="installation">
@@ -468,9 +466,10 @@ against a saved snapshot — how the current state differs from that point in
 time. Unlike <em>Restore</em>, it never stages or applies anything.</p>
 <h3>Multi-level undo</h3>
 <p>Every applied-and-verified reversible change is pushed onto an undo stack.
-<kbd>u</kbd> (or the palette) reverts the most recent — and again for the one
-before it — each as a normal reviewed mutation. (This is separate from the
-countdown-based dead-man's-switch rollback; see <a href="#safety">Safety</a>.)</p>
+The palette command <em>Undo last operation</em> reverts the most recent — and
+again for the one before it — each as a normal reviewed mutation. (This is
+separate from the countdown-based dead-man's-switch rollback, which is what
+<kbd>u</kbd> triggers; see <a href="#safety">Safety</a>.)</p>
 <h3>Rule-hit counters</h3>
 <p><em>Rule-hit counters</em> reads live nftables per-chain packet/byte counters
 (<code>nft -j list ruleset</code>) and lists the busiest firewalld chains first.
@@ -479,7 +478,7 @@ an empty list is normal, not an error.</p>
 </section>
 
 <section id="cookbook">
-<h2>Workflows</h2>
+<h2>Cookbook</h2>
 <p>Single-action recipes (allow a service, open a port, add a forward, set a
 target, …) live in the <a href="#views">per-view guide</a> above. This section
 covers the multi-step workflows that span views. Every mutation shows a
