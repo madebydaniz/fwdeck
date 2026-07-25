@@ -3,6 +3,13 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## 0.1.0 (2026-07-25)
+
+
+### Features
+
+* initial public release ([c969daf](https://github.com/madebydaniz/fwdeck/commit/c969dafab69dd7ee0c346bd7fd2e8ca8963f36db))
+
 ## [Unreleased]
 
 ### Added
