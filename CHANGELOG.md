@@ -3,6 +3,13 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.1.1](https://github.com/madebydaniz/fwdeck/compare/v0.1.0...v0.1.1) (2026-07-25)
+
+
+### Documentation
+
+* align README/site — Workflows naming, undo key, dev notices, version badge ([#9](https://github.com/madebydaniz/fwdeck/issues/9)) ([e28f8b1](https://github.com/madebydaniz/fwdeck/commit/e28f8b1c03951838d2d5d27e2d736109949d2c56))
+
 ## 0.1.0 (2026-07-25)
 
 
