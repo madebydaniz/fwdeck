@@ -9,7 +9,8 @@ authors = ["madebydaniz"]
 license = "MIT"
 readme = "README.md"
 
-homepage = "https://madebydaniz.com"
+homepage = "https://madebydaniz.github.io/fwdeck/"
+documentation = "https://madebydaniz.github.io/fwdeck/docs/"
 repository = "https://github.com/madebydaniz/fwdeck"
 
 keywords = [
