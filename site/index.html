@@ -37,8 +37,6 @@ nav .gh:hover{border-color:var(--purple)}
 .hero{padding:88px 0 30px;text-align:center;position:relative}
 .eyebrow{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line2);border-radius:999px;
   padding:6px 16px;font-size:.8rem;color:var(--muted);background:rgba(21,22,34,.6)}
-.eyebrow i{width:7px;height:7px;border-radius:50%;background:var(--green);display:inline-block;
-  box-shadow:0 0 10px var(--green)}
 .hero h1{margin-top:26px;font-size:clamp(2.3rem,6vw,4rem);font-weight:800;line-height:1.08;letter-spacing:-.03em}
 .hero h1 span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
 .hero p.tag{max-width:660px;margin:22px auto 0;color:var(--muted);font-size:1.15rem}
@@ -127,7 +125,7 @@ footer a:hover{color:var(--fg)}
 <div class="hero">
   <img src="assets/logo-dark.svg" alt="" width="88" height="88"
        style="display:block;margin:0 auto 22px;filter:drop-shadow(0 0 24px rgba(189,147,249,.35))">
-  <span class="eyebrow"><i></i> Signed releases · Cosign keyless · MIT</span>
+  <span class="eyebrow" id="rel-ver">v0.1.0</span>
   <h1>Your firewall, on one screen.<br><span>Nothing applied without review.</span></h1>
   <p class="tag">FWDeck is a safety-first terminal UI for <strong>firewalld</strong>.
   Zones, services, ports, and rules — fast, keyboard-only, runtime vs permanent always
@@ -256,5 +254,13 @@ footer a:hover{color:var(--fg)}
   <p style="margin-top:8px">Made with ❤️ for operators who read the diff before they apply it.</p>
 </div></footer>
 
+<script>
+  // Show the latest published release in the hero badge; falls back to the
+  // hardcoded tag above if the API is unavailable.
+  fetch('https://api.github.com/repos/madebydaniz/fwdeck/releases/latest')
+    .then(function (r) { return r.ok ? r.json() : null })
+    .then(function (d) { if (d && d.tag_name) document.getElementById('rel-ver').textContent = d.tag_name; })
+    .catch(function () {});
+</script>
 </body>
 </html>
