@@ -244,11 +244,9 @@ pub fn for_row(
             title: format!("Service `{}`", cell(0)),
             lines: vec![
                 line("zone", zone.to_string()),
+                line("ports", cell(1)),
+                line("protocols", cell(2)),
                 line("scope", cell(3)),
-                line(
-                    "definition",
-                    "detailed service definition lookup (--info-service) is not shown here yet",
-                ),
             ],
         }),
         ViewId::Ports => Some(DetailsContent {
@@ -653,6 +651,27 @@ mod tests {
         let content = for_row(ViewId::RichRules, &snapshot, &zone, &row).unwrap();
         let rule_line = content.lines.iter().find(|(k, _)| k == "rule").unwrap();
         assert_eq!(rule_line.1, raw);
+    }
+
+    #[test]
+    fn service_row_details_show_ports_and_protocols_not_a_placeholder() {
+        let snapshot = mock::sample().unwrap();
+        let zone = snapshot.default_zone.clone();
+        // Cells as services_rows builds them: [name, ports, protocols, scope].
+        let row = vec![
+            "https".to_owned(),
+            "443/tcp".to_owned(),
+            "-".to_owned(),
+            "runtime".to_owned(),
+        ];
+        let content = for_row(ViewId::Services, &snapshot, &zone, &row).unwrap();
+        let ports = content.lines.iter().find(|(k, _)| k == "ports").unwrap();
+        assert_eq!(ports.1, "443/tcp");
+        assert!(content.lines.iter().any(|(k, _)| k == "protocols"));
+        assert!(
+            !content.lines.iter().any(|(_, v)| v.contains("not shown")),
+            "service detail must render real data, never a placeholder"
+        );
     }
 
     #[test]
