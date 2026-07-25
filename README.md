@@ -60,9 +60,6 @@ Every release is tested against a **real firewalld daemon** in CI on:
 | Debian 13 | 2.3.x | ✅ CI |
 | AlmaLinux 9 (RHEL-compatible) | 1.3.x | ✅ CI |
 
-**⚠️ FWDeck is under heavy development.** Don't test mutations on a remote-only
-system unless you have console access or another recovery path.
-
 ## Install
 
 Verifies checksums and the Cosign release signature before installing:
