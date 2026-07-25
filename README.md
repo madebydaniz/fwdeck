@@ -92,7 +92,7 @@ Or build from source: `cargo install --git https://github.com/madebydaniz/fwdeck
 - [Getting started](https://madebydaniz.github.io/fwdeck/docs/#introduction)
 - [Installation & release verification](https://madebydaniz.github.io/fwdeck/docs/#installation)
 - [The interface & views](https://madebydaniz.github.io/fwdeck/docs/#interface)
-- [Cookbook — multi-step tasks, exact keystrokes](https://madebydaniz.github.io/fwdeck/docs/#cookbook)
+- [Workflows — multi-step tasks, exact keystrokes](https://madebydaniz.github.io/fwdeck/docs/#workflows)
 - [Safety features](https://madebydaniz.github.io/fwdeck/docs/#safety)
 - [Configuration](https://madebydaniz.github.io/fwdeck/docs/#configuration)
 - [FAQ & troubleshooting](https://madebydaniz.github.io/fwdeck/docs/#faq)
