@@ -43,7 +43,6 @@ impl Default for UiSection {
 struct BehaviorSection {
     default_target: TargetSetting,
     refresh_interval_ms: u64,
-    log_refresh_interval_ms: u64,
     confirm_destructive_actions: bool,
     read_only: bool,
     rollback_timeout_seconds: u64,
@@ -54,7 +53,6 @@ impl Default for BehaviorSection {
         Self {
             default_target: TargetSetting::RuntimeAndPermanent,
             refresh_interval_ms: 5000,
-            log_refresh_interval_ms: 1000,
             confirm_destructive_actions: true,
             read_only: false,
             rollback_timeout_seconds: 30,
@@ -112,8 +110,6 @@ pub struct Config {
     pub target: ConfigurationTarget,
     /// How often the firewall snapshot is refreshed.
     pub refresh_interval: Duration,
-    /// Refresh cadence for the kernel-log tailer.
-    pub log_refresh_interval: Duration,
     /// Require a confirmation modal before a mutation is applied.
     pub confirm_destructive: bool,
     /// Never execute mutating operations.
@@ -158,7 +154,6 @@ impl Config {
             sidebar_width: file.ui.sidebar_width.clamp(16, 40),
             target: file.behavior.default_target.into(),
             refresh_interval: refresh_from_millis(file.behavior.refresh_interval_ms),
-            log_refresh_interval: refresh_from_millis(file.behavior.log_refresh_interval_ms),
             confirm_destructive: file.behavior.confirm_destructive_actions,
             read_only: file.behavior.read_only,
             offline: false,
@@ -305,12 +300,9 @@ mod tests {
     fn zero_refresh_interval_is_clamped_not_zero() {
         // A zero interval would panic tokio::time::interval — it must never
         // reach the engine.
-        let file: FileConfig =
-            toml::from_str("[behavior]\nrefresh_interval_ms = 0\nlog_refresh_interval_ms = 0\n")
-                .unwrap();
+        let file: FileConfig = toml::from_str("[behavior]\nrefresh_interval_ms = 0\n").unwrap();
         let config = Config::from_file(file);
         assert!(config.refresh_interval >= MIN_REFRESH);
-        assert!(config.log_refresh_interval >= MIN_REFRESH);
         assert!(!config.refresh_interval.is_zero());
     }
 
