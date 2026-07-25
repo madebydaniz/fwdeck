@@ -26,6 +26,25 @@ categories = [
     "os::linux-apis",
 ]
 
+# Keep the published crate lean: ship only what building the binary needs.
+# Screenshots, the website, CI config, the dev container, dev-tooling notes,
+# and the integration tests are not required by `cargo install`.
+exclude = [
+    "assets/",
+    "site/",
+    "docker/",
+    "docker-compose.yml",
+    "docker-compose.override.yml",
+    ".github/",
+    "scripts/",
+    "tests/",
+    "packaging/",
+    "deny.toml",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "GEMINI.md",
+]
+
 [dependencies]
 anyhow = "1.0"
 
