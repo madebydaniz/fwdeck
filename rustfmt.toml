@@ -1,0 +1,4 @@
+# Pin the format to the 2024 edition explicitly so `cargo fmt` is deterministic
+# across toolchains and CI. Everything else stays on rustfmt defaults.
+edition = "2024"
+style_edition = "2024"

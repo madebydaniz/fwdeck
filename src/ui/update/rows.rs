@@ -7,7 +7,7 @@ use crate::domain::{
 };
 use crate::ui::action::{Effect, UiAction};
 use crate::ui::details;
-use crate::ui::overlays::{Confirmation, FormKind, Overlay};
+use crate::ui::overlays::{FormKind, Overlay};
 use crate::ui::state::{ToastKind, UiState};
 use crate::ui::views::ViewId;
 
@@ -227,30 +227,12 @@ fn bulk_delete(state: &mut UiState) -> Vec<Effect> {
         state.toast(ToastKind::Info, "no removable rows in the selection");
         return Vec::new();
     }
-    let count = ops.len();
-    let mut body = vec![
-        format!(
-            "remove {count} selected entr{}",
-            if count == 1 { "y" } else { "ies" }
-        ),
-        format!("target: {}", state.target.label()),
-        "⚠ may cut existing connections using these rules".to_owned(),
-    ];
-    for op in ops.iter().take(6) {
-        body.push(format!("  · {}", op.describe()));
-    }
-    if count > 6 {
-        body.push(format!("  · … and {} more", count - 6));
-    }
     state.view_state_mut().marked.clear();
-    // Stage the batch so the operator applies it deliberately via the palette.
+    // Stage the batch and route it through the unified plan path, which builds
+    // the confirmation (with SSH-lockout analysis) and pre-arms the dead-man's
+    // switch — the same safety net a single delete gets.
     state.staged.extend(ops);
-    state.overlays.push(Overlay::Confirm(Confirmation {
-        title: "Confirm bulk delete".to_owned(),
-        body,
-        on_confirm: UiAction::ApplyStagedPlan,
-    }));
-    Vec::new()
+    super::plans::apply_staged_plan(state)
 }
 
 pub(super) fn yank_row(state: &mut UiState) -> Vec<Effect> {

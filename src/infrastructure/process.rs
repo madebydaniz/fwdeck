@@ -87,6 +87,37 @@ pub fn resolve_trusted(program: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(program)
 }
 
+/// Runs a best-effort startup probe (`ip`, `systemctl`, …) with a hard
+/// wall-clock bound, returning its stdout on success or `None` on
+/// failure/timeout. The child runs on a helper thread so a hung probe cannot
+/// freeze startup; a leaked child of a fast, trusted tool is harmless. The
+/// binary resolves from trusted dirs with a cleared, pinned-locale environment.
+#[must_use]
+pub fn probe_output(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    let path = resolve_trusted(program);
+    if !path.is_absolute() {
+        return None;
+    }
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        #[allow(clippy::disallowed_methods)] // absolute-checked path + env_clear: sanctioned probe
+        let output = std::process::Command::new(path)
+            .args(&args)
+            .env_clear()
+            .env("LC_ALL", "C")
+            .stderr(std::process::Stdio::null())
+            .output();
+        let _ = tx.send(output);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) if output.status.success() => {
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        _ => None,
+    }
+}
+
 /// Real runner on tokio. Binaries resolve from trusted directories, the
 /// environment is cleared down to a pinned-locale whitelist (no `LD_*` /
 /// `PYTHON*` inheritance into a privileged child), and `kill_on_drop` reaps
@@ -96,6 +127,8 @@ pub struct TokioRunner;
 impl CommandRunner for TokioRunner {
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, ProcessError> {
         let started = Instant::now();
+        // The CommandRunner itself: the one sanctioned spawn every mutation routes through.
+        #[allow(clippy::disallowed_methods)]
         let child = tokio::process::Command::new(resolve_trusted(request.program))
             .args(&request.args)
             .env_clear()

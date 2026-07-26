@@ -83,7 +83,52 @@ pub fn parse_active_zones(raw: &str) -> Result<BTreeMap<ZoneName, ActiveZone>, P
 /// `--list-all-zones` (runtime or `--permanent`): blank-line-separated blocks,
 /// two-space-indented `key: value` attributes, tab-indented entries for the
 /// multi-value sections (forward-ports, rich rules).
-pub fn parse_list_all_zones(raw: &str) -> Result<BTreeMap<ZoneName, ZoneDetails>, ParseError> {
+#[must_use]
+pub fn parse_list_all_zones(raw: &str) -> (BTreeMap<ZoneName, ZoneDetails>, Vec<String>) {
+    let mut zones: BTreeMap<ZoneName, ZoneDetails> = BTreeMap::new();
+    let mut degraded: Vec<String> = Vec::new();
+
+    // Group the output into per-zone blocks (a new block begins at each
+    // non-indented header line) and parse each one independently: a single
+    // malformed zone then degrades only itself instead of blanking the whole
+    // snapshot.
+    let mut block: Vec<&str> = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with([' ', '\t']) && !block.is_empty() {
+            flush_zone_block(&block, &mut zones, &mut degraded);
+            block.clear();
+        }
+        block.push(line);
+    }
+    flush_zone_block(&block, &mut zones, &mut degraded);
+    (zones, degraded)
+}
+
+/// Parses one zone block, recording a degraded entry (keyed by the zone header)
+/// instead of failing the whole listing when a single zone is malformed.
+fn flush_zone_block(
+    block: &[&str],
+    zones: &mut BTreeMap<ZoneName, ZoneDetails>,
+    degraded: &mut Vec<String>,
+) {
+    if block.is_empty() {
+        return;
+    }
+    match parse_zone_block(block) {
+        Ok((zone, details)) => {
+            zones.insert(zone, details);
+        }
+        Err(err) => {
+            let name = block.first().map_or("<unknown>", |header| header.trim());
+            degraded.push(format!("zone `{name}` unparseable: {err}"));
+        }
+    }
+}
+
+fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseError> {
     #[derive(Clone, Copy, PartialEq)]
     enum Section {
         None,
@@ -91,31 +136,23 @@ pub fn parse_list_all_zones(raw: &str) -> Result<BTreeMap<ZoneName, ZoneDetails>
         RichRules,
     }
 
-    let mut zones: BTreeMap<ZoneName, ZoneDetails> = BTreeMap::new();
-    let mut current: Option<ZoneName> = None;
+    let (header, rest) = block
+        .split_first()
+        .ok_or_else(|| ParseError::new("empty zone block"))?;
+    if header.starts_with([' ', '\t']) {
+        return Err(ParseError::new(format!(
+            "zone attribute before any zone header: `{header}`"
+        )));
+    }
+    let zone = parse_zone_header(header)?;
+    let mut details = ZoneDetails::empty(zone.clone());
     let mut section = Section::None;
 
-    for line in raw.lines() {
+    for line in rest {
         if line.trim().is_empty() {
             section = Section::None;
             continue;
         }
-
-        if !line.starts_with([' ', '\t']) {
-            let zone = parse_zone_header(line)?;
-            zones.insert(zone.clone(), ZoneDetails::empty(zone.clone()));
-            current = Some(zone);
-            section = Section::None;
-            continue;
-        }
-
-        let zone = current.as_ref().ok_or_else(|| {
-            ParseError::new(format!("zone attribute before any zone header: `{line}`"))
-        })?;
-        let Some(details) = zones.get_mut(zone) else {
-            continue;
-        };
-
         if line.starts_with('\t') {
             let entry = line.trim();
             match section {
@@ -185,7 +222,7 @@ pub fn parse_list_all_zones(raw: &str) -> Result<BTreeMap<ZoneName, ZoneDetails>
             _ => {}
         }
     }
-    Ok(zones)
+    Ok((zone, details))
 }
 
 /// `FirewallBackend=` from `/etc/firewalld/firewalld.conf`.
@@ -379,7 +416,7 @@ mod tests {
             protocols: gre esp\n  \
             forward: yes\n  \
             source-ports: 68/udp 546/udp\n";
-        let zones = parse_list_all_zones(raw).unwrap();
+        let (zones, _) = parse_list_all_zones(raw);
         let z = &zones[&ZoneName::parse("myzone").unwrap()];
         assert!(z.forward);
         assert!(z.icmp_block_inversion);
@@ -392,8 +429,8 @@ mod tests {
     #[test]
     fn empty_outputs_yield_empty_collections() {
         assert!(parse_active_zones("").unwrap().is_empty());
-        assert!(parse_list_all_zones("").unwrap().is_empty());
-        assert!(parse_list_all_zones("\n\n").unwrap().is_empty());
+        assert!(parse_list_all_zones("").0.is_empty());
+        assert!(parse_list_all_zones("\n\n").0.is_empty());
     }
 
     #[test]
@@ -405,7 +442,26 @@ mod tests {
     }
 
     #[test]
-    fn attribute_before_zone_header_is_an_error() {
-        assert!(parse_list_all_zones("  target: default\n").is_err());
+    fn attribute_before_zone_header_degrades_only_that_block() {
+        let (zones, degraded) = parse_list_all_zones("  target: default\n");
+        assert!(zones.is_empty(), "no valid zone parsed");
+        assert_eq!(
+            degraded.len(),
+            1,
+            "the malformed block is recorded as degraded, not fatal"
+        );
+    }
+
+    #[test]
+    fn one_bad_zone_degrades_only_itself() {
+        // A good zone, then a zone with an invalid target, then another good one.
+        let raw = "good1\n  target: default\n  services: ssh\n\nbadzone\n  target: \
+                   not-a-valid-target\n\ngood2\n  target: ACCEPT\n";
+        let (zones, degraded) = parse_list_all_zones(raw);
+        assert!(zones.contains_key(&ZoneName::parse("good1").unwrap()));
+        assert!(zones.contains_key(&ZoneName::parse("good2").unwrap()));
+        assert!(!zones.contains_key(&ZoneName::parse("badzone").unwrap()));
+        assert_eq!(degraded.len(), 1);
+        assert!(degraded[0].contains("badzone"));
     }
 }

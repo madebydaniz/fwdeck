@@ -31,7 +31,7 @@ use crate::config::Config;
 use crate::error::AppError;
 use std::ops::ControlFlow;
 
-use crate::infrastructure::logs::LogEntry;
+use crate::domain::LogEntry;
 
 use action::{Effect, UiAction};
 use state::UiState;
@@ -97,23 +97,13 @@ async fn event_loop(
                 Some(Err(err)) => return Err(AppError::Terminal(err)),
                 None => Some(UiAction::Quit),
             },
-            event = engine.events.recv(), if engine_alive => match event {
-                Some(EngineEvent::RefreshStarted) => Some(UiAction::RefreshStarted),
-                Some(EngineEvent::RefreshFinished(result)) => {
-                    Some(UiAction::RefreshCompleted(result))
-                }
-                Some(EngineEvent::OperationFinished { op_id, outcome }) => {
-                    Some(UiAction::OperationFinished { op_id, outcome })
-                }
-                Some(EngineEvent::PlanFinished { applied, remaining }) => {
-                    Some(UiAction::PlanFinished { applied, remaining })
-                }
-                None => {
-                    engine_alive = false;
-                    Some(UiAction::RefreshCompleted(Err(FirewallError::Process(
-                        "engine task stopped unexpectedly".to_owned(),
-                    ))))
-                }
+            event = engine.events.recv(), if engine_alive => if let Some(event) = event {
+                Some(engine_event_action(event))
+            } else {
+                engine_alive = false;
+                Some(UiAction::RefreshCompleted(Err(FirewallError::Process(
+                    "engine task stopped unexpectedly".to_owned(),
+                ))))
             },
             received = logs.recv_many(&mut log_batch, 64), if logs_alive => {
                 if received == 0 {
@@ -150,6 +140,50 @@ async fn event_loop(
     }
 }
 
+/// Maps an engine event to the UI action that handles it.
+fn engine_event_action(event: EngineEvent) -> UiAction {
+    match event {
+        EngineEvent::RefreshStarted => UiAction::RefreshStarted,
+        EngineEvent::RefreshFinished(result) => UiAction::RefreshCompleted(result),
+        EngineEvent::OperationFinished { op_id, outcome } => {
+            UiAction::OperationFinished { op_id, outcome }
+        }
+        EngineEvent::PlanFinished { applied, remaining } => {
+            UiAction::PlanFinished { applied, remaining }
+        }
+    }
+}
+
+/// Sends a request to the engine, draining engine events while waiting for a
+/// queue slot. Reserving (instead of a plain blocking send) means a momentarily
+/// full requests queue cannot deadlock against a full events queue — each side
+/// blocked on the other. Returns false if the engine is gone; drained events
+/// run as follow-up actions so no outcome is lost.
+async fn send_request(
+    engine: &mut EngineHandle,
+    pending: &mut std::collections::VecDeque<UiAction>,
+    request: EngineRequest,
+) -> bool {
+    let requests = &mut engine.requests;
+    let events = &mut engine.events;
+    loop {
+        tokio::select! {
+            permit = requests.reserve() => {
+                return match permit {
+                    Ok(permit) => {
+                        permit.send(request);
+                        true
+                    }
+                    Err(_) => false,
+                };
+            }
+            Some(event) = events.recv() => {
+                pending.push_back(engine_event_action(event));
+            }
+        }
+    }
+}
+
 /// Executes one effect. Reads run off the event-loop thread and feed their
 /// result back as a follow-up action on `pending`. Returns `Break` only for
 /// `Effect::Quit`, which the caller turns into a clean shutdown.
@@ -167,24 +201,14 @@ async fn execute_effect(
             let _ = engine.requests.try_send(EngineRequest::Refresh);
         }
         Effect::Apply(operation) => {
-            // Blocking send: mutations (rollbacks especially) must not be
-            // droppable just because the queue is momentarily full.
-            if engine
-                .requests
-                .send(EngineRequest::Apply(operation))
-                .await
-                .is_err()
-            {
+            // Reserving-send drains events while it waits, so a momentarily full
+            // queue can't drop a mutation (rollbacks especially) or deadlock.
+            if !send_request(engine, pending, EngineRequest::Apply(operation)).await {
                 state.toast(state::ToastKind::Error, "engine is gone — operation lost");
             }
         }
         Effect::ApplyPlan(operations) => {
-            if engine
-                .requests
-                .send(EngineRequest::ApplyPlan(operations))
-                .await
-                .is_err()
-            {
+            if !send_request(engine, pending, EngineRequest::ApplyPlan(operations)).await {
                 state.toast(state::ToastKind::Error, "engine is gone — plan not sent");
             }
         }
@@ -269,6 +293,31 @@ async fn execute_effect(
     ControlFlow::Continue(())
 }
 
+/// Builds the `systemd-run` argument vector for the rollback watchdog. Pure, so
+/// the exact flags are unit-tested. `firewall_cmd` is the resolved absolute
+/// binary; `inverse_args` is the runtime-inverse invocation to run on timeout.
+fn systemd_run_args(
+    unit: &str,
+    delay_secs: u64,
+    firewall_cmd: &std::path::Path,
+    inverse_args: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "--collect".to_owned(),
+        format!("--unit={unit}"),
+        format!("--on-active={delay_secs}s"),
+        "--timer-property=AccuracySec=1s".to_owned(),
+        firewall_cmd.to_string_lossy().into_owned(),
+    ];
+    args.extend(inverse_args.iter().cloned());
+    args
+}
+
+/// The `systemctl` arguments that cancel a watchdog timer.
+fn disarm_args(unit: &str) -> [String; 2] {
+    ["stop".to_owned(), format!("{unit}.timer")]
+}
+
 /// Pre-arms the out-of-process rollback: a systemd transient timer that runs
 /// the runtime inverse even if this process dies. Needs root and `systemd-run`;
 /// silently degrades to in-process-only protection otherwise (with one toast).
@@ -276,21 +325,24 @@ async fn arm_watchdog(state: &mut state::UiState, unit: &str, delay_secs: u64, a
     use crate::infrastructure::process::resolve_trusted;
     let systemd_run = resolve_trusted("systemd-run");
     let firewall_cmd = resolve_trusted("firewall-cmd");
-    if crate::infrastructure::process_uid() != 0 || !systemd_run.is_absolute() {
+    // Both binaries must resolve to an absolute trusted path: the watchdog runs
+    // as root, so a relative name that could be resolved via a poisoned PATH
+    // must never be armed — fall back to in-process rollback instead.
+    if crate::infrastructure::process_uid() != 0
+        || !systemd_run.is_absolute()
+        || !firewall_cmd.is_absolute()
+    {
         state.toast(
             state::ToastKind::Info,
             "watchdog unavailable (needs root + systemd) — in-process rollback only",
         );
         return;
     }
+    // resolve_trusted absolute path + env_clear above: the sanctioned watchdog spawn.
+    #[allow(clippy::disallowed_methods)]
     let mut command = tokio::process::Command::new(systemd_run);
     command
-        .arg("--collect")
-        .arg(format!("--unit={unit}"))
-        .arg(format!("--on-active={delay_secs}s"))
-        .arg("--timer-property=AccuracySec=1s")
-        .arg(firewall_cmd)
-        .args(args)
+        .args(systemd_run_args(unit, delay_secs, &firewall_cmd, args))
         .env_clear()
         .env("LC_ALL", "C")
         .stdin(std::process::Stdio::null())
@@ -324,9 +376,10 @@ async fn disarm_watchdog(unit: &str) {
     if !systemctl.is_absolute() {
         return;
     }
+    // resolve_trusted absolute path + env_clear: the sanctioned disarm spawn.
+    #[allow(clippy::disallowed_methods)]
     let _ = tokio::process::Command::new(systemctl)
-        .arg("stop")
-        .arg(format!("{unit}.timer"))
+        .args(disarm_args(unit))
         .env_clear()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -407,7 +460,7 @@ fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::base64_encode;
+    use super::{base64_encode, disarm_args, systemd_run_args};
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -416,5 +469,35 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn watchdog_run_args_have_the_exact_flags_and_inverse() {
+        let args = systemd_run_args(
+            "fwdeck-rollback-42-7-0",
+            45,
+            std::path::Path::new("/usr/bin/firewall-cmd"),
+            &["--zone=public".to_owned(), "--add-service=ssh".to_owned()],
+        );
+        assert_eq!(
+            args.iter().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "--collect",
+                "--unit=fwdeck-rollback-42-7-0",
+                "--on-active=45s",
+                "--timer-property=AccuracySec=1s",
+                "/usr/bin/firewall-cmd",
+                "--zone=public",
+                "--add-service=ssh",
+            ]
+        );
+    }
+
+    #[test]
+    fn disarm_stops_the_unit_timer() {
+        assert_eq!(
+            disarm_args("fwdeck-rollback-42-7-0"),
+            ["stop".to_owned(), "fwdeck-rollback-42-7-0.timer".to_owned()]
+        );
     }
 }

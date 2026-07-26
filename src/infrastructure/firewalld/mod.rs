@@ -230,7 +230,16 @@ impl<R: CommandRunner> CliBackend<R> {
     /// instead of "none".
     async fn ipsets(&self) -> (BTreeMap<IpSetName, IpSetInfo>, Option<String>) {
         let names = match self.run_ok(self.request(&["--get-ipsets"])).await {
-            Ok(raw) => parse::parse_ipset_names(&raw).unwrap_or_default(),
+            Ok(raw) => match parse::parse_ipset_names(&raw) {
+                Ok(names) => names,
+                Err(err) => {
+                    tracing::warn!(error = %err, "ipset listing unparseable");
+                    return (
+                        BTreeMap::new(),
+                        Some(format!("ipsets: unparseable listing: {err}")),
+                    );
+                }
+            },
             Err(err) => {
                 tracing::warn!(error = %err, "ipset listing failed");
                 return (BTreeMap::new(), Some(format!("ipsets: {err}")));
@@ -254,7 +263,16 @@ impl<R: CommandRunner> CliBackend<R> {
 
     async fn available_services(&self) -> (Vec<ServiceName>, Option<String>) {
         match self.run_ok(self.request(&["--get-services"])).await {
-            Ok(raw) => (parse::parse_service_names(&raw).unwrap_or_default(), None),
+            Ok(raw) => match parse::parse_service_names(&raw) {
+                Ok(names) => (names, None),
+                Err(err) => {
+                    tracing::warn!(error = %err, "service listing unparseable");
+                    (
+                        Vec::new(),
+                        Some(format!("services: unparseable listing: {err}")),
+                    )
+                }
+            },
             Err(err) => {
                 tracing::warn!(error = %err, "service listing failed");
                 (Vec::new(), Some(format!("services: {err}")))
@@ -266,7 +284,16 @@ impl<R: CommandRunner> CliBackend<R> {
     /// the failure is reported for honest display.
     async fn policies(&self) -> (BTreeMap<PolicyName, PolicyDetails>, Option<String>) {
         let names = match self.run_ok(self.request(&["--get-policies"])).await {
-            Ok(raw) => parse::parse_policy_names(&raw).unwrap_or_default(),
+            Ok(raw) => match parse::parse_policy_names(&raw) {
+                Ok(names) => names,
+                Err(err) => {
+                    tracing::warn!(error = %err, "policy listing unparseable");
+                    return (
+                        BTreeMap::new(),
+                        Some(format!("policies: unparseable listing: {err}")),
+                    );
+                }
+            },
             Err(err) => {
                 tracing::warn!(error = %err, "policy listing failed");
                 return (BTreeMap::new(), Some(format!("policies: {err}")));
@@ -388,20 +415,35 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
 
         // Offline: no daemon → no active zones, and the single permanent config
         // stands in for both runtime and permanent (there is no drift offline).
-        let (active, runtime, permanent) = if self.is_offline() {
+        // A single malformed zone degrades only itself (recorded below) rather
+        // than failing the whole refresh.
+        let (active, runtime, permanent, zone_degraded) = if self.is_offline() {
             let config = self.run_ok(self.request(&["--list-all-zones"])).await?;
-            let config = parse::parse_list_all_zones(&config)?;
-            (BTreeMap::new(), config.clone(), config)
+            let (config, degraded) = parse::parse_list_all_zones(&config);
+            let degraded: Vec<String> = degraded
+                .into_iter()
+                .map(|msg| format!("config {msg}"))
+                .collect();
+            (BTreeMap::new(), config.clone(), config, degraded)
         } else {
             let active = self.run_ok(self.request(&["--get-active-zones"])).await?;
             let active = parse::parse_active_zones(&active)?;
             let runtime = self.run_ok(self.request(&["--list-all-zones"])).await?;
-            let runtime = parse::parse_list_all_zones(&runtime)?;
+            let (runtime, runtime_degraded) = parse::parse_list_all_zones(&runtime);
+            let mut zone_degraded: Vec<String> = runtime_degraded
+                .into_iter()
+                .map(|msg| format!("runtime {msg}"))
+                .collect();
             let permanent = self
                 .run_ok(self.request(&["--permanent", "--list-all-zones"]))
                 .await?;
-            let permanent = parse::parse_list_all_zones(&permanent)?;
-            (active, runtime, permanent)
+            let (permanent, permanent_degraded) = parse::parse_list_all_zones(&permanent);
+            zone_degraded.extend(
+                permanent_degraded
+                    .into_iter()
+                    .map(|msg| format!("permanent {msg}")),
+            );
+            (active, runtime, permanent, zone_degraded)
         };
         // Tiered refresh: the per-object sections (one subprocess each) are
         // reused for a few refreshes; mutations invalidate the cache.
@@ -439,6 +481,7 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
                 self.fetch_heavy_sections().await
             };
         degraded.extend(services_err);
+        degraded.extend(zone_degraded);
 
         let mut snapshot = FirewallSnapshot {
             status,

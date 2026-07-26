@@ -13,16 +13,7 @@
 
 use std::collections::BTreeMap;
 
-/// Aggregated hit counter for one nft chain in the `firewalld` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChainCounter {
-    /// The nft chain name (e.g. `filter_IN_public`).
-    pub chain: String,
-    /// Total packets matched by countered rules in this chain.
-    pub packets: u64,
-    /// Total bytes matched by countered rules in this chain.
-    pub bytes: u64,
-}
+use crate::domain::ChainCounter;
 
 /// Runs `nft -j list ruleset` and returns per-chain counters, busiest first.
 ///
@@ -32,6 +23,7 @@ pub struct ChainCounter {
 pub fn read() -> Result<Vec<ChainCounter>, String> {
     // Resolve `nft` from trusted dirs with a cleared environment — this may run
     // as root, so a poisoned PATH must not choose the binary.
+    #[allow(clippy::disallowed_methods)] // resolve_trusted + env_clear: sanctioned nft probe
     let output = std::process::Command::new(crate::infrastructure::process::resolve_trusted("nft"))
         .args(["-j", "list", "ruleset"])
         .env_clear()

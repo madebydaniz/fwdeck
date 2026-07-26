@@ -213,6 +213,12 @@ pub fn render_breadcrumb(f: &mut Frame, area: Rect, state: &UiState, theme: &The
             theme.accent(),
         ));
     }
+    if !state.undo_stack.is_empty() {
+        spans.push(Span::styled(
+            format!("  ↩ {} undoable", state.undo_stack.len()),
+            theme.accent(),
+        ));
+    }
     if state.refreshing {
         spans.push(Span::styled("  ⟳ refreshing", theme.info()));
     }
@@ -300,7 +306,12 @@ pub fn render_table(f: &mut Frame, area: Rect, state: &mut UiState, theme: &Them
 
     if state.snapshot.is_none() && view != ViewId::Logs {
         let (message, style) = state.backend_error.as_ref().map_or_else(
-            || ("loading firewall state…".to_owned(), theme.muted()),
+            || {
+                (
+                    "loading firewall state…\n\npress ? for keys · : for commands".to_owned(),
+                    theme.muted(),
+                )
+            },
             |error| (error.to_string(), theme.danger()),
         );
         render_placeholder(f, area, block, message, style);
@@ -485,7 +496,11 @@ pub fn render_command_line(f: &mut Frame, area: Rect, state: &UiState, theme: &T
                     },
                 ];
                 if state.read_only {
-                    spans.push(Span::styled(" · read-only", theme.danger()));
+                    let label = state.read_only_reason.as_deref().map_or_else(
+                        || " · read-only".to_owned(),
+                        |reason| format!(" · read-only ({reason})"),
+                    );
+                    spans.push(Span::styled(label, theme.danger()));
                 }
                 Line::from(spans)
             };

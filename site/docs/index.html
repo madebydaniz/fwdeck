@@ -527,7 +527,10 @@ session uses and warns precisely when a change targets its zone.</li>
 <li><strong>Honest partial failures</strong> — runtime-applied / permanent-failed
 is reported as exactly that, with per-step invocations and a rollback hint.</li>
 <li><strong>Audit trail</strong> — every applied operation is recorded as JSONL
-under <code>~/.local/state/fwdeck/</code> with its exact invocations.</li>
+under <code>~/.local/state/fwdeck/</code> with its exact invocations. It is an
+<em>advisory, append-only</em> record (files are <code>0600</code>), not a
+cryptographically tamper-evident log — treat it as an operational history, and
+ship it to a central log store if you need integrity guarantees.</li>
 <li><strong>Read-only mode</strong> — <code>--read-only</code> disables mutations
 in the engine, not just the UI.</li>
 </ul>
@@ -679,7 +682,6 @@ sidebar_width = 22
 [behavior]
 default_target = "runtime-and-permanent"   # or "runtime" / "permanent"
 refresh_interval_ms = 5000
-log_refresh_interval_ms = 1000
 confirm_destructive_actions = true
 rollback_timeout_seconds = 30   # dead-man's switch; 0 disables
 read_only = false
@@ -708,11 +710,15 @@ panic mode, runtime-to-permanent) are reported as unsupported instead of
 failing cryptically.</p>
 <h3>Backends</h3>
 <p>FWDeck talks to firewalld through a swappable backend. The default drives
-<code>firewall-cmd</code> with typed, fixture-tested parsing. An optional native
-D-Bus backend (<code>cargo build --features dbus</code>, then
-<code>--backend dbus</code>) implements the same interface; it currently covers
-reads and runtime mutations and <em>refuses loudly</em> anything it can't do
-fully, rather than half-applying.</p>
+<code>firewall-cmd</code> with typed, fixture-tested parsing, and is the
+full-featured reference. An optional native D-Bus backend
+(<code>cargo build --features dbus</code>, then <code>--backend dbus</code>)
+implements the same interface but is <strong>runtime-only</strong>: it covers
+reads and runtime mutations, and <strong>permanent-config changes are not yet
+implemented over D-Bus</strong> — it <em>refuses them loudly</em> (use the
+default <code>firewall-cmd</code> backend for permanent changes) rather than
+half-applying. It also does not yet fetch ipsets, policies, direct rules, or
+service definitions, which show as <em>unknown</em> rather than empty.</p>
 </section>
 
 <section id="automation">

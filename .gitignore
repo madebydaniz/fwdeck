@@ -117,6 +117,12 @@ $RECYCLE.BIN/
 /target-*
 _site/
 
+# cargo-fuzz (dev-only harness); the targets and fuzz/Cargo.toml are committed
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/Cargo.lock
+
 # Local AI-assistant tooling config (never commit)
 /.claude/
 ROADMAP.md
