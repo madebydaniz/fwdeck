@@ -119,6 +119,9 @@ pub enum UiAction {
     RequestOperation(FirewallOperation),
     /// Dispatched by the confirmation modal: hands the operation to the engine.
     ApplyOperation(FirewallOperation),
+    /// Dispatched by the plan confirmation modal: arms the dead-man's switch for
+    /// the batch, then hands the whole staged plan to the engine.
+    ApplyPlanConfirmed(Vec<FirewallOperation>),
     /// The engine finished an operation; toast, audit, and maybe arm rollback.
     OperationFinished {
         /// Correlation id shared with tracing and the audit line.

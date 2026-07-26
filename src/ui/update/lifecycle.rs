@@ -83,6 +83,29 @@ pub(super) fn operation_finished(
 /// the apply never landed. The caller dispatches the returned effect (an
 /// `ArmWatchdog`, if systemd is usable) ahead of `Effect::Apply`.
 pub(super) fn pre_arm_rollback(state: &mut UiState, operation: &FirewallOperation) -> Vec<Effect> {
+    pre_arm_rollback_at(state, operation, 0)
+}
+
+/// Pre-arms the dead-man's switch for every connectivity-affecting operation in
+/// a staged plan / restore / bulk delete — each with its own watchdog unit — so
+/// the multi-change flows most likely to cut a remote admin off get the same
+/// safety net as a single operation.
+pub(super) fn pre_arm_plan_rollbacks(
+    state: &mut UiState,
+    operations: &[FirewallOperation],
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    for (index, operation) in operations.iter().enumerate() {
+        effects.extend(pre_arm_rollback_at(state, operation, index));
+    }
+    effects
+}
+
+fn pre_arm_rollback_at(
+    state: &mut UiState,
+    operation: &FirewallOperation,
+    index: usize,
+) -> Vec<Effect> {
     if state.rollback_ticks == 0 {
         return Vec::new();
     }
@@ -95,7 +118,13 @@ pub(super) fn pre_arm_rollback(state: &mut UiState, operation: &FirewallOperatio
     // The out-of-process net fires with a grace margin after the in-process
     // deadline (which disarms it on the happy path first).
     let delay_secs = state.rollback_ticks / 4 + 15;
-    let unit = format!("fwdeck-rollback-{}-{}", std::process::id(), state.tick);
+    // The index keeps units unique when a whole plan arms at the same tick.
+    let unit = format!(
+        "fwdeck-rollback-{}-{}-{}",
+        std::process::id(),
+        state.tick,
+        index
+    );
     // The watchdog restores RUNTIME connectivity: a single command, and exactly
     // the scope that can lock you out. (The in-process `inverse` above also
     // reverts the permanent config; the watchdog deliberately does not.)

@@ -18,7 +18,7 @@ use super::views::ViewId;
 
 use forms::{form_submit, rich_builder_commit};
 use lifecycle::fire_rollback;
-use plans::{apply_staged_plan, export_plan, stage_drift_sync};
+use plans::{apply_plan_now, apply_staged_plan, export_plan, stage_drift_sync};
 use rows::{activate_row, clone_entry, delete_entry, toggle_mark, yank_row};
 
 // fixed page size; wire to the rendered table height if it ever matters.
@@ -306,6 +306,9 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::ShowStagedPlan => state.overlays.push(Overlay::Details(plan_details(state))),
         UiAction::ApplyStagedPlan => return apply_staged_plan(state),
+        // The confirmed apply of a staged plan (carried by the plan confirm's
+        // on_confirm): arms the dead-man's switch, then dispatches the batch.
+        UiAction::ApplyPlanConfirmed(ops) => return apply_plan_now(state, ops),
         UiAction::DiscardStagedPlan => {
             let count = state.staged.len();
             state.staged.clear();
@@ -2007,8 +2010,26 @@ mod tests {
         assert_eq!(s.staged.len(), 1);
         assert!(s.overlays.is_empty(), "stage closes the modal");
 
+        // Applying a plan confirms first — it never skips the safety net.
         let effects = apply_staged_plan(&mut s);
-        assert_eq!(effects.len(), 1);
+        assert!(effects.is_empty(), "apply opens a confirmation");
+        assert!(
+            matches!(s.overlays.last(), Some(Overlay::Confirm(_))),
+            "plan apply confirms before touching the firewall"
+        );
+        assert_eq!(s.staged.len(), 1, "plan stays staged until confirmed");
+
+        // Confirming arms the dead-man's switch (removing http is risky) and
+        // dispatches the batch, draining the staging area.
+        let effects = update(&mut s, UiAction::ConfirmAccept);
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::ApplyPlan(_))),
+            "the confirmed plan is dispatched"
+        );
+        assert!(
+            !s.pending_rollback.is_empty(),
+            "a risky plan arms the rollback, just like a single risky op"
+        );
         assert!(s.staged.is_empty(), "plan drained after apply");
     }
 
