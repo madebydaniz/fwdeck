@@ -21,7 +21,7 @@ fn zone(name: &str) -> ZoneName {
 
 #[test]
 fn parses_all_eleven_fedora_zones() {
-    let zones = parse::parse_list_all_zones(LIST_ALL_RUNTIME).unwrap();
+    let zones = parse::parse_list_all_zones(LIST_ALL_RUNTIME).0;
     assert_eq!(zones.len(), 11);
     for name in [
         "public",
@@ -41,7 +41,7 @@ fn icmp_blocks_parse_from_list_all() {
     // but the committed fixture predates it — assert the parser handles the
     // attribute when present using an inline block.
     let block = "public\n  target: default\n  icmp-blocks: echo-request timestamp-reply\n";
-    let zones = parse::parse_list_all_zones(block).unwrap();
+    let zones = parse::parse_list_all_zones(block).0;
     let icmp = &zones[&zone("public")].icmp_blocks;
     assert_eq!(icmp.len(), 2);
     assert_eq!(icmp[0].as_str(), "echo-request");
@@ -49,7 +49,7 @@ fn icmp_blocks_parse_from_list_all() {
 
 #[test]
 fn public_zone_details_are_fully_typed() {
-    let zones = parse::parse_list_all_zones(LIST_ALL_RUNTIME).unwrap();
+    let zones = parse::parse_list_all_zones(LIST_ALL_RUNTIME).0;
     let public = &zones[&zone("public")];
 
     assert_eq!(public.target, ZoneTarget::Default);
@@ -70,7 +70,7 @@ fn public_zone_details_are_fully_typed() {
 
 #[test]
 fn tab_indented_forward_ports_and_rich_rules_attach_to_their_zone() {
-    let zones = parse::parse_list_all_zones(LIST_ALL_RUNTIME).unwrap();
+    let zones = parse::parse_list_all_zones(LIST_ALL_RUNTIME).0;
     let public = &zones[&zone("public")];
 
     assert_eq!(public.forward_ports.len(), 1);
@@ -93,7 +93,7 @@ fn tab_indented_forward_ports_and_rich_rules_attach_to_their_zone() {
 
 #[test]
 fn zone_targets_and_port_ranges_parse() {
-    let zones = parse::parse_list_all_zones(LIST_ALL_RUNTIME).unwrap();
+    let zones = parse::parse_list_all_zones(LIST_ALL_RUNTIME).0;
     assert_eq!(zones[&zone("block")].target, ZoneTarget::Reject);
     assert_eq!(zones[&zone("drop")].target, ZoneTarget::Drop);
     assert_eq!(zones[&zone("trusted")].target, ZoneTarget::Accept);
@@ -106,8 +106,8 @@ fn zone_targets_and_port_ranges_parse() {
 
 #[test]
 fn runtime_permanent_drift_is_visible_after_parsing() {
-    let runtime = parse::parse_list_all_zones(LIST_ALL_RUNTIME).unwrap();
-    let permanent = parse::parse_list_all_zones(LIST_ALL_PERMANENT).unwrap();
+    let runtime = parse::parse_list_all_zones(LIST_ALL_RUNTIME).0;
+    let permanent = parse::parse_list_all_zones(LIST_ALL_PERMANENT).0;
 
     let name = zone("public");
     let runtime_services: Vec<&str> = runtime[&name]
@@ -149,8 +149,12 @@ fn default_zone_fixture_parses() {
 
 #[test]
 fn malformed_port_yields_descriptive_error() {
-    let err = parse::parse_list_all_zones(MALFORMED).unwrap_err();
-    let message = err.to_string();
+    let (_zones, degraded) = parse::parse_list_all_zones(MALFORMED);
+    assert!(
+        !degraded.is_empty(),
+        "a malformed zone must be recorded as degraded"
+    );
+    let message = degraded.join(" ");
     assert!(message.contains("notaport"), "unhelpful error: {message}");
 }
 
