@@ -17,7 +17,7 @@ use super::state::{InputMode, ToastKind, UiState};
 use super::views::ViewId;
 
 use forms::{form_submit, rich_builder_commit};
-use lifecycle::fire_rollback;
+use lifecycle::{fire_expired_rollbacks, fire_rollback};
 use plans::{apply_plan_now, apply_staged_plan, export_plan, stage_drift_sync};
 use rows::{activate_row, clone_entry, delete_entry, toggle_mark, yank_row};
 
@@ -35,14 +35,15 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         UiAction::Tick => {
             state.tick += 1;
             state.prune_toasts();
-            // Any expired deadline fires every armed rollback: the operator
-            // did not confirm in time, so the whole risky batch reverts.
+            // Fire only the rollbacks whose own deadline has passed; a newer,
+            // still-live countdown keeps ticking (`fire_expired_rollbacks`
+            // retains it).
             if state
                 .pending_rollback
                 .iter()
                 .any(|pending| state.tick >= pending.deadline_tick)
             {
-                return fire_rollback(state);
+                return fire_expired_rollbacks(state);
             }
         }
         UiAction::Resize(w, h) => state.size = (w, h),
@@ -698,6 +699,25 @@ fn set_default_zone(state: &mut UiState) -> Vec<Effect> {
     request_operation(state, FirewallOperation::SetDefaultZone { zone })
 }
 
+/// If a reload would cut the SSH session — the zone carrying it differs between
+/// runtime and permanent, so activating permanent drops the protection — returns
+/// the warning to show. Reload has no inverse, so there is no auto-revert.
+fn reload_ssh_lockout_warning(state: &UiState, operation: &FirewallOperation) -> Option<String> {
+    if !matches!(operation, FirewallOperation::Reload) || !state.ssh_session {
+        return None;
+    }
+    let (ssh_zone, reason) = state.ssh_zone_with_reason()?;
+    let snapshot = state.snapshot.as_ref()?;
+    if snapshot.runtime.get(&ssh_zone) == snapshot.permanent.get(&ssh_zone) {
+        return None;
+    }
+    Some(format!(
+        "⚠ reload replaces the runtime config with the permanent one; zone \
+         `{ssh_zone}` protects your SSH session ({reason}) and differs between \
+         runtime and permanent — this may cut your connection with no auto-revert"
+    ))
+}
+
 /// Central mutation gate: read-only check, snapshot validation, then the
 /// confirmation modal (or direct dispatch when confirmations are disabled).
 fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<Effect> {
@@ -787,6 +807,9 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
                 ),
             }
         }
+    }
+    if let Some(warning) = reload_ssh_lockout_warning(state, &operation) {
+        body.push(warning);
     }
     // Exact-command preview: the operator sees precisely what will run.
     for planned in crate::infrastructure::firewalld::command::plan(
@@ -2031,6 +2054,48 @@ mod tests {
             "a risky plan arms the rollback, just like a single risky op"
         );
         assert!(s.staged.is_empty(), "plan drained after apply");
+    }
+
+    #[test]
+    fn expired_rollback_fires_without_cutting_a_newer_countdown() {
+        use crate::ui::state::PendingRollback;
+        let mut s = state();
+        let remove = |svc: &str| FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse(svc).unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        s.tick = 100;
+        // Two independent countdowns: one already due, one still live.
+        s.pending_rollback.push(PendingRollback {
+            forward: remove("http"),
+            inverse: remove("http").inverse().unwrap(),
+            deadline_tick: 100,
+            description: "due".to_owned(),
+            watchdog_unit: None,
+        });
+        s.pending_rollback.push(PendingRollback {
+            forward: remove("https"),
+            inverse: remove("https").inverse().unwrap(),
+            deadline_tick: 500,
+            description: "live".to_owned(),
+            watchdog_unit: None,
+        });
+        let effects = update(&mut s, UiAction::Tick);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Apply(_)))
+                .count(),
+            1,
+            "only the due countdown fires"
+        );
+        assert_eq!(
+            s.pending_rollback.len(),
+            1,
+            "the live countdown is retained"
+        );
+        assert_eq!(s.pending_rollback[0].description, "live");
     }
 
     #[test]
