@@ -41,6 +41,7 @@ exclude = [
     "tests/",
     "packaging/",
     "deny.toml",
+    "Makefile",
     "CLAUDE.md",
     "AGENTS.md",
     "GEMINI.md",
