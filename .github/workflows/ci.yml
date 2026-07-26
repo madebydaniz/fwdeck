@@ -193,7 +193,7 @@ jobs:
           version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           echo "crate version: ${version}"
           fail=0
-          pkg=$(grep -m1 '^pkgver=' packaging/aur/PKGBUILD | cut -d= -f2)
+          pkg=$(grep -m1 '^pkgver=' packaging/aur/PKGBUILD | cut -d= -f2 | awk '{print $1}')
           spec=$(grep -m1 '^Version:' packaging/fwdeck.spec | awk '{print $2}')
           flake=$(grep -m1 'version = "' flake.nix | cut -d'"' -f2)
           for entry in "PKGBUILD:${pkg}" "fwdeck.spec:${spec}" "flake.nix:${flake}"; do
