@@ -171,13 +171,31 @@ fn retract_pending_rollback(state: &mut UiState, operation: &FirewallOperation) 
     effects
 }
 
-/// Executes every armed inverse (newest first — unwinding in reverse order)
-/// and clears the pending rollbacks.
+/// Fires **every** armed inverse now (newest first) and clears the pending
+/// rollbacks — the explicit "undo now" path (`u`).
 pub(super) fn fire_rollback(state: &mut UiState) -> Vec<Effect> {
-    if state.pending_rollback.is_empty() {
-        return Vec::new();
-    }
     let pending: Vec<_> = state.pending_rollback.drain(..).collect();
+    fire_pending(state, pending)
+}
+
+/// Fires only the armed rollbacks whose own deadline has passed, retaining the
+/// rest so each countdown honors its independent deadline (a newer, still-live
+/// rollback is not cut short by an older one expiring).
+pub(super) fn fire_expired_rollbacks(state: &mut UiState) -> Vec<Effect> {
+    let now = state.tick;
+    let (expired, live): (Vec<_>, Vec<_>) = state
+        .pending_rollback
+        .drain(..)
+        .partition(|pending| now >= pending.deadline_tick);
+    state.pending_rollback = live;
+    fire_pending(state, expired)
+}
+
+/// Executes the given armed inverses newest first (unwinding in reverse order).
+fn fire_pending(
+    state: &mut UiState,
+    pending: Vec<crate::ui::state::PendingRollback>,
+) -> Vec<Effect> {
     let mut effects = Vec::new();
     for pending in pending.into_iter().rev() {
         state.toast(
