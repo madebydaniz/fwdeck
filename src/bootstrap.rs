@@ -117,15 +117,13 @@ pub fn ssh_interface() -> Option<String> {
 }
 
 fn interface_for_address(address: &str) -> Option<String> {
-    // Resolve `ip` from trusted dirs with a cleared environment — this may run
-    // as root, so a poisoned PATH must not decide which binary executes.
-    let output = std::process::Command::new(crate::infrastructure::process::resolve_trusted("ip"))
-        .args(["-o", "addr", "show"])
-        .env_clear()
-        .env("LC_ALL", "C")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    // Best-effort startup probe, hard-bounded so a hung `ip` can't freeze
+    // startup; resolved from trusted dirs with a cleared env (may run as root).
+    let text = crate::infrastructure::process::probe_output(
+        "ip",
+        &["-o", "addr", "show"],
+        std::time::Duration::from_secs(2),
+    )?;
     parse_ip_addr_interface(&text, address)
 }
 

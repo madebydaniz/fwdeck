@@ -230,7 +230,16 @@ impl<R: CommandRunner> CliBackend<R> {
     /// instead of "none".
     async fn ipsets(&self) -> (BTreeMap<IpSetName, IpSetInfo>, Option<String>) {
         let names = match self.run_ok(self.request(&["--get-ipsets"])).await {
-            Ok(raw) => parse::parse_ipset_names(&raw).unwrap_or_default(),
+            Ok(raw) => match parse::parse_ipset_names(&raw) {
+                Ok(names) => names,
+                Err(err) => {
+                    tracing::warn!(error = %err, "ipset listing unparseable");
+                    return (
+                        BTreeMap::new(),
+                        Some(format!("ipsets: unparseable listing: {err}")),
+                    );
+                }
+            },
             Err(err) => {
                 tracing::warn!(error = %err, "ipset listing failed");
                 return (BTreeMap::new(), Some(format!("ipsets: {err}")));
@@ -254,7 +263,16 @@ impl<R: CommandRunner> CliBackend<R> {
 
     async fn available_services(&self) -> (Vec<ServiceName>, Option<String>) {
         match self.run_ok(self.request(&["--get-services"])).await {
-            Ok(raw) => (parse::parse_service_names(&raw).unwrap_or_default(), None),
+            Ok(raw) => match parse::parse_service_names(&raw) {
+                Ok(names) => (names, None),
+                Err(err) => {
+                    tracing::warn!(error = %err, "service listing unparseable");
+                    (
+                        Vec::new(),
+                        Some(format!("services: unparseable listing: {err}")),
+                    )
+                }
+            },
             Err(err) => {
                 tracing::warn!(error = %err, "service listing failed");
                 (Vec::new(), Some(format!("services: {err}")))
@@ -266,7 +284,16 @@ impl<R: CommandRunner> CliBackend<R> {
     /// the failure is reported for honest display.
     async fn policies(&self) -> (BTreeMap<PolicyName, PolicyDetails>, Option<String>) {
         let names = match self.run_ok(self.request(&["--get-policies"])).await {
-            Ok(raw) => parse::parse_policy_names(&raw).unwrap_or_default(),
+            Ok(raw) => match parse::parse_policy_names(&raw) {
+                Ok(names) => names,
+                Err(err) => {
+                    tracing::warn!(error = %err, "policy listing unparseable");
+                    return (
+                        BTreeMap::new(),
+                        Some(format!("policies: unparseable listing: {err}")),
+                    );
+                }
+            },
             Err(err) => {
                 tracing::warn!(error = %err, "policy listing failed");
                 return (BTreeMap::new(), Some(format!("policies: {err}")));

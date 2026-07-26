@@ -116,17 +116,14 @@ async fn main() -> anyhow::Result<()> {
 /// Reports systemd `fwdeck-rollback-*` units left over from an earlier
 /// session (crash recovery visibility; read-only check).
 fn warn_stale_watchdogs() {
-    let systemctl = fwdeck::infrastructure::process::resolve_trusted("systemctl");
-    if !systemctl.is_absolute() {
-        return;
-    }
-    let Ok(output) = std::process::Command::new(systemctl)
-        .args(["list-units", "--plain", "--no-legend", "fwdeck-rollback-*"])
-        .output()
-    else {
+    // Best-effort, hard-bounded so a hung systemctl can't stall startup.
+    let Some(listing) = fwdeck::infrastructure::process::probe_output(
+        "systemctl",
+        &["list-units", "--plain", "--no-legend", "fwdeck-rollback-*"],
+        std::time::Duration::from_secs(2),
+    ) else {
         return;
     };
-    let listing = String::from_utf8_lossy(&output.stdout);
     for line in listing.lines().filter(|line| !line.trim().is_empty()) {
         eprintln!("warning: leftover rollback watchdog from a previous session: {line}");
         tracing::warn!(unit = %line, "stale rollback watchdog found at startup");
