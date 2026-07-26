@@ -1,0 +1,13 @@
+# Keep clippy's MSRV-aware lints honest against the declared floor: they must
+# not suggest APIs newer than what 1.88 ships. Mirrors Cargo.toml rust-version.
+msrv = "1.88.0"
+
+# Enforce the process-spawn boundary mechanically. Every child process must go
+# through the CommandRunner / `resolve_trusted` path (argv vectors, cleared
+# environment, absolute trusted binaries — never a shell). New spawn sites now
+# require an explicit `#[allow(clippy::disallowed_methods)]`, which forces a
+# reviewer to notice them. The sanctioned sites carry that allow today.
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "spawn via CommandRunner / resolve_trusted, not directly (see src/infrastructure/process.rs)" },
+    { path = "tokio::process::Command::new", reason = "spawn via CommandRunner / resolve_trusted, not directly (see src/infrastructure/process.rs)" },
+]

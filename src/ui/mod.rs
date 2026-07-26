@@ -338,6 +338,8 @@ async fn arm_watchdog(state: &mut state::UiState, unit: &str, delay_secs: u64, a
         );
         return;
     }
+    // resolve_trusted absolute path + env_clear above: the sanctioned watchdog spawn.
+    #[allow(clippy::disallowed_methods)]
     let mut command = tokio::process::Command::new(systemd_run);
     command
         .args(systemd_run_args(unit, delay_secs, &firewall_cmd, args))
@@ -374,6 +376,8 @@ async fn disarm_watchdog(unit: &str) {
     if !systemctl.is_absolute() {
         return;
     }
+    // resolve_trusted absolute path + env_clear: the sanctioned disarm spawn.
+    #[allow(clippy::disallowed_methods)]
     let _ = tokio::process::Command::new(systemctl)
         .args(disarm_args(unit))
         .env_clear()

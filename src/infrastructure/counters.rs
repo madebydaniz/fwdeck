@@ -23,6 +23,7 @@ use crate::domain::ChainCounter;
 pub fn read() -> Result<Vec<ChainCounter>, String> {
     // Resolve `nft` from trusted dirs with a cleared environment — this may run
     // as root, so a poisoned PATH must not choose the binary.
+    #[allow(clippy::disallowed_methods)] // resolve_trusted + env_clear: sanctioned nft probe
     let output = std::process::Command::new(crate::infrastructure::process::resolve_trusted("nft"))
         .args(["-j", "list", "ruleset"])
         .env_clear()
