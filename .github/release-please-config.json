@@ -7,7 +7,7 @@
     ".": {
       "package-name": "fwdeck",
       "changelog-path": "CHANGELOG.md",
-      "extra-files": []
+      "extra-files": ["flake.nix", "packaging/fwdeck.spec"]
     }
   },
   "changelog-sections": [

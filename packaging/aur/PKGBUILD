@@ -2,7 +2,7 @@
 # Builds fwdeck from the published crates.io source. Before submitting to the
 # AUR, refresh pkgver and run `updpkgsums` to fill in the real sha256sum.
 pkgname=fwdeck
-pkgver=0.1.2
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="A safety-first terminal UI for firewalld"
 arch=('x86_64' 'aarch64')
@@ -11,7 +11,7 @@ license=('MIT')
 depends=('firewalld')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::https://static.crates.io/crates/$pkgname/$pkgname-$pkgver.crate")
-sha256sums=('SKIP')
+sha256sums=('fd221bb02c25a2cf795b9bb9d8ce8e80563390e90dca11ff8dce20bd0ba3687f')
 
 prepare() {
     cd "$pkgname-$pkgver"
