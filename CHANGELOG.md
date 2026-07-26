@@ -3,6 +3,34 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.2.0](https://github.com/madebydaniz/fwdeck/compare/v0.1.2...v0.2.0) (2026-07-26)
+
+
+### Features
+
+* **ui:** make undo discoverable and read-only self-explanatory ([5de8f58](https://github.com/madebydaniz/fwdeck/commit/5de8f58811e1a1be534767a39b259249f1507a6f))
+
+
+### Bug Fixes
+
+* arm the dead-man's switch on staged plans, restores, and bulk deletes ([43fbdca](https://github.com/madebydaniz/fwdeck/commit/43fbdca8388cbc0429ed1d71ff2f4f805422e48e))
+* **concurrency:** drain events during sends and start the countdown on apply ([39c3caf](https://github.com/madebydaniz/fwdeck/commit/39c3caf3392aa3f137af490fffd31081ff4ffe94))
+* extend the rollback net to reloads and independent countdowns ([64fcdb0](https://github.com/madebydaniz/fwdeck/commit/64fcdb03c8d12b95de23377da5bd1e145963f95b))
+* **parse:** isolate zone parsing so one bad zone degrades only itself ([55caa5b](https://github.com/madebydaniz/fwdeck/commit/55caa5b44fc59a4c8e7d1c40f99270cb9f945fba))
+* remove shipped placeholders before release ([f4792de](https://github.com/madebydaniz/fwdeck/commit/f4792def01101bc472651fe4d79494d47f0098fb))
+* **security:** tighten cosign identity, watchdog PATH guard, audit honesty ([c2c86a4](https://github.com/madebydaniz/fwdeck/commit/c2c86a45ad7e6bc5e6bb94b3b40ecb1c5423ff5c))
+* surface swallowed parse errors and bound startup probes ([c5ce7cb](https://github.com/madebydaniz/fwdeck/commit/c5ce7cb5743e75a2f5c27d3818060f842001c515))
+
+
+### Refactoring
+
+* **arch:** move shared value types to domain, document boundaries ([918a0a7](https://github.com/madebydaniz/fwdeck/commit/918a0a7a7f45f214107e7443e160229172633a8b))
+
+
+### Documentation
+
+* restructure README and fix crate metadata for release ([723433e](https://github.com/madebydaniz/fwdeck/commit/723433eab9163c39d9ce9faa5560b04afd00caec))
+
 ## [0.1.2](https://github.com/madebydaniz/fwdeck/compare/v0.1.1...v0.1.2) (2026-07-25)
 
 
