@@ -114,6 +114,9 @@ pub struct Config {
     pub confirm_destructive: bool,
     /// Never execute mutating operations.
     pub read_only: bool,
+    /// Why read-only is in effect (flag, unprivileged, instance lock), for a
+    /// visible reason line. `None` when mutations are allowed. Not from file.
+    pub read_only_reason: Option<String>,
     /// Manage the permanent config via `firewall-offline-cmd` (no daemon).
     pub offline: bool,
     /// Dead-man's switch window for risky operations; 0 disables it.
@@ -156,6 +159,7 @@ impl Config {
             refresh_interval: refresh_from_millis(file.behavior.refresh_interval_ms),
             confirm_destructive: file.behavior.confirm_destructive_actions,
             read_only: file.behavior.read_only,
+            read_only_reason: None,
             offline: false,
             rollback_timeout: Duration::from_secs(file.behavior.rollback_timeout_seconds),
             log_level: file.logging.level,
@@ -201,6 +205,11 @@ pub fn load(cli: &Cli) -> Result<Config, AppError> {
 
     if cli.read_only {
         config.read_only = true;
+        config.read_only_reason = Some("--read-only".to_owned());
+    }
+    if config.read_only && config.read_only_reason.is_none() {
+        // Read-only from the config file, with no more specific reason.
+        config.read_only_reason = Some("read-only in config".to_owned());
     }
     if cli.no_color {
         config.color = false;

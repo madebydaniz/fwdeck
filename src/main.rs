@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("warning: unprivileged and no polkit found — starting read-only");
             tracing::warn!("no mutation authorization path; latching read-only");
             config.read_only = true;
+            config.read_only_reason = Some("unprivileged, no polkit".to_owned());
         }
     }
 
@@ -65,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("warning: fwdeck already running ({who}) — starting read-only");
             tracing::warn!(holder = %who, "instance lock held; forcing read-only");
             config.read_only = true;
+            config.read_only_reason = Some("another instance is running".to_owned());
             false
         }
     };
