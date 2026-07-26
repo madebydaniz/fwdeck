@@ -287,9 +287,15 @@ pub const HELP: &[(&str, &[HelpEntry])] = &[
             },
             HelpEntry {
                 keys: "u",
-                desc: "roll back last change now",
+                desc: "roll back last change now (during a countdown)",
                 codes: &[KeyCode::Char('u')],
                 action: Some(UiAction::RollbackNow),
+            },
+            HelpEntry {
+                keys: "U",
+                desc: "undo the last applied change",
+                codes: &[KeyCode::Char('U')],
+                action: Some(UiAction::UndoLastOperation),
             },
         ],
     ),

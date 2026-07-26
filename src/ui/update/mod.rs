@@ -186,6 +186,8 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.toast(ToastKind::Success, "changes kept");
                 return disarms;
             }
+            // `y` only confirms an active countdown; say so rather than no-op.
+            state.toast(ToastKind::Info, "no rollback countdown to keep");
         }
         UiAction::RollbackNow => return fire_rollback(state),
         UiAction::ShowAudit => state.overlays.push(Overlay::Details(audit_details(state))),

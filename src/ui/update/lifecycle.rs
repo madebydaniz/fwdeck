@@ -174,6 +174,16 @@ fn retract_pending_rollback(state: &mut UiState, operation: &FirewallOperation) 
 /// Fires **every** armed inverse now (newest first) and clears the pending
 /// rollbacks — the explicit "undo now" path (`u`).
 pub(super) fn fire_rollback(state: &mut UiState) -> Vec<Effect> {
+    if state.pending_rollback.is_empty() {
+        // `u` only reverts an active countdown. Say so, and point at the real
+        // undo — otherwise it silently does nothing and reads as broken.
+        state.toast(
+            ToastKind::Info,
+            "nothing to roll back — no countdown active; use the palette (:) \
+             › Undo last operation",
+        );
+        return Vec::new();
+    }
     let pending: Vec<_> = state.pending_rollback.drain(..).collect();
     fire_pending(state, pending)
 }
