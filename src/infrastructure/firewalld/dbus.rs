@@ -406,6 +406,7 @@ impl FirewallBackend for DbusBackend {
                 "ipsets: not fetched by the D-Bus backend yet".to_owned(),
                 "policies: not fetched by the D-Bus backend yet".to_owned(),
                 "direct rules: not fetched by the D-Bus backend yet".to_owned(),
+                "service definitions: not fetched by the D-Bus backend yet".to_owned(),
             ],
         })
     }

@@ -7,10 +7,10 @@ use ratatui::widgets::TableState;
 
 use crate::application::ports::FirewallError;
 use crate::config::Config;
+use crate::domain::LogEntry;
 use crate::domain::{
     ConfigurationTarget, FirewallOperation, FirewallSnapshot, InterfaceName, ZoneName,
 };
-use crate::infrastructure::logs::LogEntry;
 
 use super::overlays::Overlay;
 use super::palette::PaletteState;
@@ -179,6 +179,9 @@ pub struct UiState {
     pub tick: u64,
     /// Mutations are refused when set (`--read-only`).
     pub read_only: bool,
+    /// Why read-only is in effect, for a visible reason line (`None` when
+    /// mutations are allowed).
+    pub read_only_reason: Option<String>,
     /// The SSH client's IP address, when running inside an SSH session.
     pub ssh_client_ip: Option<std::net::IpAddr>,
     /// True when driving `firewall-offline-cmd` (permanent config, no daemon).
@@ -240,6 +243,7 @@ impl UiState {
             rollback_ticks: config.rollback_timeout.as_secs() * 4, // 250 ms ticks
             tick: 0,
             read_only: config.read_only,
+            read_only_reason: config.read_only_reason.clone(),
             ssh_client_ip: crate::bootstrap::ssh_client_ip(),
             offline,
             confirm_destructive: config.confirm_destructive,

@@ -17,8 +17,8 @@ use super::state::{InputMode, ToastKind, UiState};
 use super::views::ViewId;
 
 use forms::{form_submit, rich_builder_commit};
-use lifecycle::fire_rollback;
-use plans::{apply_staged_plan, export_plan, stage_drift_sync};
+use lifecycle::{fire_expired_rollbacks, fire_rollback};
+use plans::{apply_plan_now, apply_staged_plan, export_plan, stage_drift_sync};
 use rows::{activate_row, clone_entry, delete_entry, toggle_mark, yank_row};
 
 // fixed page size; wire to the rendered table height if it ever matters.
@@ -35,14 +35,15 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         UiAction::Tick => {
             state.tick += 1;
             state.prune_toasts();
-            // Any expired deadline fires every armed rollback: the operator
-            // did not confirm in time, so the whole risky batch reverts.
+            // Fire only the rollbacks whose own deadline has passed; a newer,
+            // still-live countdown keeps ticking (`fire_expired_rollbacks`
+            // retains it).
             if state
                 .pending_rollback
                 .iter()
                 .any(|pending| state.tick >= pending.deadline_tick)
             {
-                return fire_rollback(state);
+                return fire_expired_rollbacks(state);
             }
         }
         UiAction::Resize(w, h) => state.size = (w, h),
@@ -185,6 +186,8 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.toast(ToastKind::Success, "changes kept");
                 return disarms;
             }
+            // `y` only confirms an active countdown; say so rather than no-op.
+            state.toast(ToastKind::Info, "no rollback countdown to keep");
         }
         UiAction::RollbackNow => return fire_rollback(state),
         UiAction::ShowAudit => state.overlays.push(Overlay::Details(audit_details(state))),
@@ -306,6 +309,9 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::ShowStagedPlan => state.overlays.push(Overlay::Details(plan_details(state))),
         UiAction::ApplyStagedPlan => return apply_staged_plan(state),
+        // The confirmed apply of a staged plan (carried by the plan confirm's
+        // on_confirm): arms the dead-man's switch, then dispatches the batch.
+        UiAction::ApplyPlanConfirmed(ops) => return apply_plan_now(state, ops),
         UiAction::DiscardStagedPlan => {
             let count = state.staged.len();
             state.staged.clear();
@@ -695,6 +701,25 @@ fn set_default_zone(state: &mut UiState) -> Vec<Effect> {
     request_operation(state, FirewallOperation::SetDefaultZone { zone })
 }
 
+/// If a reload would cut the SSH session — the zone carrying it differs between
+/// runtime and permanent, so activating permanent drops the protection — returns
+/// the warning to show. Reload has no inverse, so there is no auto-revert.
+fn reload_ssh_lockout_warning(state: &UiState, operation: &FirewallOperation) -> Option<String> {
+    if !matches!(operation, FirewallOperation::Reload) || !state.ssh_session {
+        return None;
+    }
+    let (ssh_zone, reason) = state.ssh_zone_with_reason()?;
+    let snapshot = state.snapshot.as_ref()?;
+    if snapshot.runtime.get(&ssh_zone) == snapshot.permanent.get(&ssh_zone) {
+        return None;
+    }
+    Some(format!(
+        "⚠ reload replaces the runtime config with the permanent one; zone \
+         `{ssh_zone}` protects your SSH session ({reason}) and differs between \
+         runtime and permanent — this may cut your connection with no auto-revert"
+    ))
+}
+
 /// Central mutation gate: read-only check, snapshot validation, then the
 /// confirmation modal (or direct dispatch when confirmations are disabled).
 fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<Effect> {
@@ -784,6 +809,9 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
                 ),
             }
         }
+    }
+    if let Some(warning) = reload_ssh_lockout_warning(state, &operation) {
+        body.push(warning);
     }
     // Exact-command preview: the operator sees precisely what will run.
     for planned in crate::infrastructure::firewalld::command::plan(
@@ -1386,7 +1414,7 @@ mod tests {
 
     #[test]
     fn logs_receive_counts_denied_and_caps_buffer() {
-        use crate::infrastructure::logs::{LogAction, LogEntry};
+        use crate::domain::{LogAction, LogEntry};
         let mut s = state();
         let entry = |action: LogAction| LogEntry {
             time: "10:00:00".into(),
@@ -1568,7 +1596,7 @@ mod tests {
 
     #[test]
     fn counters_loaded_opens_overlay_and_errors_toast() {
-        use crate::infrastructure::counters::ChainCounter;
+        use crate::domain::ChainCounter;
         let mut s = state();
         update(
             &mut s,
@@ -1952,18 +1980,26 @@ mod tests {
     fn rollback_fires_on_deadline_and_applies_inverse() {
         let mut s = state();
         s.rollback_ticks = 2;
-        // Pre-armed at apply time; the outcome never arrives (operator walks
-        // away), so the deadline fires.
+        let op = FirewallOperation::RemovePort {
+            zone: ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        // Apply arms the rollback (its countdown is not started yet)...
+        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        // ...the applied outcome lands, which starts the countdown from now...
         update(
             &mut s,
-            UiAction::ApplyOperation(FirewallOperation::RemovePort {
-                zone: ZoneName::parse("public").unwrap(),
-                port: "8080/tcp".parse().unwrap(),
-                target: ConfigurationTarget::Runtime,
-            }),
+            UiAction::OperationFinished {
+                op_id: 1,
+                outcome: crate::application::ports::OperationOutcome::Applied {
+                    operation: op,
+                    steps: Vec::new(),
+                },
+            },
         );
-        // Two ticks reach the deadline → the watchdog is disarmed (we handle
-        // the rollback in-process) and the inverse (AddPort) is applied.
+        // ...the operator walks away: two ticks reach the deadline → the
+        // watchdog is disarmed (we revert in-process) and the inverse applies.
         update(&mut s, UiAction::Tick);
         let effects = update(&mut s, UiAction::Tick);
         match &effects[..] {
@@ -1974,6 +2010,82 @@ mod tests {
             other => panic!("expected disarm + inverse AddPort, got {other:?}"),
         }
         assert!(s.pending_rollback.is_empty());
+    }
+
+    #[test]
+    fn partial_failure_keeps_the_rollback_armed() {
+        let mut s = state();
+        let op = FirewallOperation::RemovePort {
+            zone: ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        assert!(
+            !s.pending_rollback.is_empty(),
+            "a risky op arms the rollback"
+        );
+        update(
+            &mut s,
+            UiAction::OperationFinished {
+                op_id: 1,
+                outcome: crate::application::ports::OperationOutcome::PartiallyApplied {
+                    operation: op,
+                    steps: Vec::new(),
+                    rollback_hint: None,
+                },
+            },
+        );
+        assert!(
+            !s.pending_rollback.is_empty(),
+            "runtime changed on a partial failure — the rollback must stay armed"
+        );
+    }
+
+    #[test]
+    fn indeterminate_outcome_keeps_the_rollback_armed() {
+        let mut s = state();
+        let op = FirewallOperation::RemovePort {
+            zone: ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        update(
+            &mut s,
+            UiAction::OperationFinished {
+                op_id: 1,
+                outcome: crate::application::ports::OperationOutcome::Indeterminate {
+                    operation: op,
+                    steps: Vec::new(),
+                },
+            },
+        );
+        assert!(
+            !s.pending_rollback.is_empty(),
+            "a timeout may have applied the change — the rollback must stay armed"
+        );
+    }
+
+    #[test]
+    fn arming_emits_a_watchdog_with_the_grace_delay() {
+        let mut s = state();
+        s.rollback_ticks = 40;
+        let effects = update(
+            &mut s,
+            UiAction::ApplyOperation(FirewallOperation::RemovePort {
+                zone: ZoneName::parse("public").unwrap(),
+                port: "8080/tcp".parse().unwrap(),
+                target: ConfigurationTarget::Runtime,
+            }),
+        );
+        let delay = effects.iter().find_map(|effect| match effect {
+            Effect::ArmWatchdog { delay_secs, .. } => Some(*delay_secs),
+            _ => None,
+        });
+        // The out-of-process net fires rollback_ticks/4 + 15s after arming, a
+        // grace margin past the in-process deadline.
+        assert_eq!(delay, Some(40 / 4 + 15), "watchdog grace delay formula");
     }
 
     #[test]
@@ -2007,9 +2119,69 @@ mod tests {
         assert_eq!(s.staged.len(), 1);
         assert!(s.overlays.is_empty(), "stage closes the modal");
 
+        // Applying a plan confirms first — it never skips the safety net.
         let effects = apply_staged_plan(&mut s);
-        assert_eq!(effects.len(), 1);
+        assert!(effects.is_empty(), "apply opens a confirmation");
+        assert!(
+            matches!(s.overlays.last(), Some(Overlay::Confirm(_))),
+            "plan apply confirms before touching the firewall"
+        );
+        assert_eq!(s.staged.len(), 1, "plan stays staged until confirmed");
+
+        // Confirming arms the dead-man's switch (removing http is risky) and
+        // dispatches the batch, draining the staging area.
+        let effects = update(&mut s, UiAction::ConfirmAccept);
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::ApplyPlan(_))),
+            "the confirmed plan is dispatched"
+        );
+        assert!(
+            !s.pending_rollback.is_empty(),
+            "a risky plan arms the rollback, just like a single risky op"
+        );
         assert!(s.staged.is_empty(), "plan drained after apply");
+    }
+
+    #[test]
+    fn expired_rollback_fires_without_cutting_a_newer_countdown() {
+        use crate::ui::state::PendingRollback;
+        let mut s = state();
+        let remove = |svc: &str| FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse(svc).unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        s.tick = 100;
+        // Two independent countdowns: one already due, one still live.
+        s.pending_rollback.push(PendingRollback {
+            forward: remove("http"),
+            inverse: remove("http").inverse().unwrap(),
+            deadline_tick: 100,
+            description: "due".to_owned(),
+            watchdog_unit: None,
+        });
+        s.pending_rollback.push(PendingRollback {
+            forward: remove("https"),
+            inverse: remove("https").inverse().unwrap(),
+            deadline_tick: 500,
+            description: "live".to_owned(),
+            watchdog_unit: None,
+        });
+        let effects = update(&mut s, UiAction::Tick);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Apply(_)))
+                .count(),
+            1,
+            "only the due countdown fires"
+        );
+        assert_eq!(
+            s.pending_rollback.len(),
+            1,
+            "the live countdown is retained"
+        );
+        assert_eq!(s.pending_rollback[0].description, "live");
     }
 
     #[test]

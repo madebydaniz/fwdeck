@@ -5,6 +5,9 @@
     <a href="https://github.com/madebydaniz/fwdeck/releases">
         <img alt="GitHub Release" src="https://img.shields.io/github/v/release/madebydaniz/fwdeck" />
     </a>
+    <a href="https://crates.io/crates/fwdeck">
+        <img alt="crates.io" src="https://img.shields.io/crates/v/fwdeck" />
+    </a>
     <a href="https://github.com/madebydaniz/fwdeck/actions/workflows/release-binaries.yml">
         <img alt="Signed releases" src="https://img.shields.io/badge/releases-cosign%20signed-blueviolet" />
     </a>
@@ -29,26 +32,101 @@ confirmation in front of anything that could lock you out.
 
 ![FWDeck zones view](assets/zones.png)
 
+## Requirements
+
+- **Linux with firewalld** — `firewall-cmd` on your `PATH`. (Or use `--offline`
+  to edit the permanent config with the daemon stopped, e.g. from a rescue shell
+  or chroot.)
+- **Root or polkit authorization** to make changes. Without it, FWDeck runs
+  read-only with a visible explanation and never re-executes itself with `sudo`.
+- **systemd + root** for the crash-proof rollback watchdog. Where they aren't
+  available (many containers, minimal systems), the dead-man's switch degrades
+  to in-process rollback.
+
+## Install
+
+Pick your platform's package manager:
+
+| Method | Command |
+| --- | --- |
+| **crates.io** (compile) | `cargo install fwdeck --locked` |
+| **Prebuilt binary** (no compile) | `cargo binstall fwdeck` |
+| **Arch (AUR)** | `paru -S fwdeck` · `yay -S fwdeck` |
+| **Nix** | `nix profile install github:madebydaniz/fwdeck` |
+| **Fedora/RHEL (Copr)** | `sudo dnf copr enable madebydaniz/fwdeck && sudo dnf install fwdeck` |
+
+Or grab a native **`.deb` / `.rpm`** (amd64 & arm64) from every
+[release](https://github.com/madebydaniz/fwdeck/releases) — download the one for
+your architecture, then:
+
+```bash
+sudo apt install ./fwdeck_*.deb    # Debian/Ubuntu
+sudo dnf install ./fwdeck-*.rpm    # Fedora/RHEL
+```
+
+Prebuilt signed binaries (`x86_64`/`aarch64`, glibc & static musl) with shell
+completions and a man page are on the same releases.
+
+Prefer a script? It verifies the SHA-256 checksums and the Cosign release
+signature before installing. Read it first, then run it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/madebydaniz/fwdeck/main/scripts/install.sh -o install-fwdeck.sh
+less install-fwdeck.sh    # inspect before running
+bash install-fwdeck.sh
+```
+
+Once installed:
+
+```bash
+fwdeck doctor        # checks your environment — never touches the firewall
+fwdeck --read-only   # look around safely; mutations are disabled
+sudo fwdeck          # full control
+```
+
+Development version (latest `main`, unreleased):
+
+```bash
+cargo install --git https://github.com/madebydaniz/fwdeck --locked
+```
+
+> FWDeck is distributed as an application. Its Rust library API is internal and
+> not currently covered by semantic-versioning guarantees.
+
 ## Features
 
+- ⏱️ **Dead-man's switch** — risky changes auto-revert on a countdown unless you
+  confirm your session still works. An out-of-process systemd watchdog is
+  pre-armed *before* the change is applied, so the revert survives a crash,
+  `SIGKILL`, or dropped SSH session.
+- 🔍 **Runtime vs permanent** scope on every row — you always know what survives
+  a reload.
+- 📋 **Staged plans** — batch changes, review once, apply once; or export as a
+  `firewall-cmd` script, JSON, or Ansible playbook.
+- 🚨 **SSH-aware** — warns precisely when a change targets the zone your session
+  depends on.
+- 📸 **Snapshots** with diff-based restore (staged, never automatic), plus
+  read-only snapshot and session diffs.
+- 🧯 **Offline mode** (`--offline`) — fix the permanent config from rescue/chroot,
+  no daemon needed.
+
+<details>
+<summary><strong>Full feature list</strong></summary>
+
 - 🧭 Every firewalld object on one screen: zones, services, ports, source-ports, protocols, forwards, rich rules, interfaces, sources, ipsets, policies, direct rules — plus per-zone target, intra-zone forwarding, and icmp-block inversion.
-- 🔍 Runtime vs permanent scope on **every row** — you always know what survives a reload.
-- ⏱️ Dead-man's switch: risky changes auto-revert on a countdown, on undo, or on quit — unless you confirm your session still works. An out-of-process systemd watchdog is **pre-armed before the change is applied**, so the revert survives a crash, `SIGKILL`, or dropped SSH session (degrades to in-process rollback where systemd/root is unavailable).
 - ✅ A confirmation in front of every mutation: resource, zone, scope, connectivity risk.
-- 📋 Staged plans: batch changes, review once, apply once — or export as `firewall-cmd` script, JSON, or Ansible.
-- 📸 Configuration snapshots with diff-based restore (restore is staged, never automatic), plus read-only **snapshot diff** and **session diff** ("what changed since startup").
 - 🧙 Guided rich-rule builder — assemble valid rich-language syntax step by step.
 - ↩️ Multi-level undo — every verified reversible change stacks; undo pops the most recent.
-- 📊 Live nftables **rule-hit counters** per chain (nftables backend).
-- ⌨️ Fuzzy command palette (`:`) with context-aware availability; live filtering (`/`); **global search** (`ctrl-f`) across every view at once.
+- 📊 Live nftables rule-hit counters per chain (nftables backend).
+- ⌨️ Fuzzy command palette (`:`) with context-aware availability; live filtering (`/`); global search (`ctrl-f`) across every view at once.
 - 🗑️ Multi-select bulk delete with one reviewed confirmation.
 - 📜 Live kernel/netfilter log tail with a denied-packet counter.
-- 🚨 SSH-aware: warns precisely when a change targets the zone your session depends on.
-- 🧯 Offline mode (`--offline`) — fix the permanent config from rescue/chroot, no daemon needed.
 - 🪪 Honest results: partial failures reported as partial failures, with per-step diagnostics and a JSONL audit trail.
 - 🔌 Two backends behind one trait: `firewall-cmd` (default, full-featured) and native D-Bus (reads + runtime edits; refuses what it can't do fully).
 - 🔏 Every release checksummed and signed with Cosign keyless (Sigstore).
 - 🩺 `fwdeck doctor`, shell completions, man page, XDG config, three themes.
+
+</details>
 
 ## Compatibility
 
@@ -59,33 +137,6 @@ Every release is tested against a **real firewalld daemon** in CI on:
 | Fedora 44 | 2.4.x | ✅ CI |
 | Debian 13 | 2.3.x | ✅ CI |
 | AlmaLinux 9 (RHEL-compatible) | 1.3.x | ✅ CI |
-
-## Install
-
-Verifies checksums and the Cosign release signature before installing:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/madebydaniz/fwdeck/main/scripts/install.sh | bash
-```
-
-Then:
-
-```bash
-fwdeck doctor        # checks your environment — never touches the firewall
-fwdeck --read-only   # look around safely; mutations are disabled
-sudo fwdeck          # full control
-```
-
-Native **`.deb` / `.rpm`** packages (amd64 & arm64), prebuilt signed binaries
-for `x86_64`/`aarch64` (glibc & static musl), and shell completions + man page
-are on every [release](https://github.com/madebydaniz/fwdeck/releases):
-
-```bash
-sudo apt install ./fwdeck_*.deb    # Debian/Ubuntu (download the .deb for your arch first)
-sudo dnf install ./fwdeck-*.rpm    # Fedora/RHEL
-```
-
-Or build from source: `cargo install --git https://github.com/madebydaniz/fwdeck --locked`.
 
 ## Documentation
 

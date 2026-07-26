@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use crate::application::ports::{FirewallError, OperationOutcome};
+use crate::domain::LogEntry;
 use crate::domain::{FirewallOperation, FirewallSnapshot};
-use crate::infrastructure::logs::LogEntry;
 
 use super::overlays::FormKind;
 use super::views::ViewId;
@@ -119,6 +119,9 @@ pub enum UiAction {
     RequestOperation(FirewallOperation),
     /// Dispatched by the confirmation modal: hands the operation to the engine.
     ApplyOperation(FirewallOperation),
+    /// Dispatched by the plan confirmation modal: arms the dead-man's switch for
+    /// the batch, then hands the whole staged plan to the engine.
+    ApplyPlanConfirmed(Vec<FirewallOperation>),
     /// The engine finished an operation; toast, audit, and maybe arm rollback.
     OperationFinished {
         /// Correlation id shared with tracing and the audit line.
@@ -156,7 +159,7 @@ pub enum UiAction {
     /// `CountersLoaded`.
     ShowCounters,
     /// The counter read finished (result of `Effect::LoadCounters`).
-    CountersLoaded(Result<Vec<crate::infrastructure::counters::ChainCounter>, String>),
+    CountersLoaded(Result<Vec<crate::domain::ChainCounter>, String>),
     /// Request the inverse of the last verified operation (reviewed like any
     /// other mutation).
     UndoLastOperation,

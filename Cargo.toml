@@ -9,7 +9,8 @@ authors = ["madebydaniz"]
 license = "MIT"
 readme = "README.md"
 
-homepage = "https://madebydaniz.com"
+homepage = "https://madebydaniz.github.io/fwdeck/"
+documentation = "https://madebydaniz.github.io/fwdeck/docs/"
 repository = "https://github.com/madebydaniz/fwdeck"
 
 keywords = [
@@ -38,12 +39,26 @@ exclude = [
     ".github/",
     "scripts/",
     "tests/",
+    "fuzz/",
     "packaging/",
     "deny.toml",
+    "clippy.toml",
+    "rustfmt.toml",
+    "_typos.toml",
+    "Makefile",
     "CLAUDE.md",
     "AGENTS.md",
     "GEMINI.md",
+    "flake.nix",
+    "flake.lock",
 ]
+
+# `cargo binstall fwdeck` fetches the signed release tarball instead of building
+# from source. The URL and in-archive path match release-binaries.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/fwdeck-v{ version }-{ target }.tar.gz"
+bin-dir = "fwdeck-v{ version }-{ target }/{ bin }"
+pkg-fmt = "tgz"
 
 [dependencies]
 anyhow = "1.0"
@@ -105,12 +120,7 @@ default = []
 dbus = ["dep:zbus"]
 
 [dev-dependencies]
-insta = { version = "1", features = [
-    "yaml",
-] }
-
-pretty_assertions = "1.4"
-tempfile = "3"
+# (none currently — the suite uses std assertions and in-repo fixtures)
 
 [lints.rust]
 unsafe_code = "forbid"

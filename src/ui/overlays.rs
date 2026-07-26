@@ -435,7 +435,10 @@ fn render_details(
         })
         .collect();
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled(" esc close", theme.muted())));
+    lines.push(Line::from(Span::styled(
+        " esc close  ·  : for actions on this object",
+        theme.muted(),
+    )));
 
     let height = u16::try_from(lines.len() + 2)
         .unwrap_or(u16::MAX)

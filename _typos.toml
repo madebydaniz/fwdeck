@@ -1,0 +1,14 @@
+# crate-ci/typos configuration. Run locally with `typos` (or `typos -w` to fix).
+[files]
+extend-exclude = [
+    "CHANGELOG.md",         # release-please owned; do not hand-edit
+    "Cargo.lock",
+    "assets/**",
+    "tests/fixtures/**",    # verbatim firewalld output — never hand-typed
+]
+
+[default.extend-words]
+# firewalld / netfilter / TUI vocabulary that must not be "corrected".
+ratatui = "ratatui"          # the TUI library — not "ratatouille"
+unparseable = "unparseable"  # accepted variant of "unparsable"; the author's choice
+fo = "fo"                    # base64 RFC-4648 test vector ("fo" -> "Zm8=")

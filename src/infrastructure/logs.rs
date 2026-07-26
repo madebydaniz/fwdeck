@@ -8,57 +8,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
-/// Netfilter verdict extracted from a kernel log line's rule-name prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogAction {
-    /// Packet was accepted (`ACCEPT` / `ALLOW` in the prefix).
-    Accept,
-    /// Packet was silently dropped (`DROP` / `DENIED`).
-    Drop,
-    /// Packet was rejected with an error response (`REJECT`).
-    Reject,
-    /// Line matched the netfilter format but named no known verdict.
-    Unknown,
-}
-
-impl LogAction {
-    /// Short display label (`"ACCEPT"`, `"DROP"`, `"REJECT"`, `"?"`).
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Accept => "ACCEPT",
-            Self::Drop => "DROP",
-            Self::Reject => "REJECT",
-            Self::Unknown => "?",
-        }
-    }
-
-    /// Whether the packet was blocked (`Drop` or `Reject`).
-    #[must_use]
-    pub const fn is_denied(self) -> bool {
-        matches!(self, Self::Drop | Self::Reject)
-    }
-}
-
-/// One parsed netfilter log line, ready for the Logs view. Fields keep the
-/// kernel's string form; missing fields are empty strings, not errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogEntry {
-    /// `HH:MM:SS` slice of the source timestamp (full token if not ISO-shaped).
-    pub time: String,
-    /// Verdict inferred from the rule-name prefix.
-    pub action: LogAction,
-    /// Source address (`SRC=`).
-    pub src: String,
-    /// Destination address (`DST=`).
-    pub dst: String,
-    /// Destination port (`DPT=`), empty for portless protocols like ICMP.
-    pub dport: String,
-    /// Protocol (`PROTO=`), e.g. `TCP`/`UDP`.
-    pub proto: String,
-    /// Ingress interface (`IN=`).
-    pub iface: String,
-}
+use crate::domain::{LogAction, LogEntry};
 
 /// Parses one netfilter log line (`LogDenied` output and friends). Non-netfilter
 /// lines return `None`. Format reference: kernel `nf_log` — stable for decades.
@@ -131,6 +81,7 @@ pub fn spawn_tailer(tx: mpsc::Sender<LogEntry>) {
 
 /// Streams one source until EOF. Returns whether it produced any output line.
 async fn tail(program: &str, args: &[&str], tx: &mpsc::Sender<LogEntry>) -> std::io::Result<bool> {
+    #[allow(clippy::disallowed_methods)] // resolve_trusted + env_clear: sanctioned log-tail spawn
     let mut child = tokio::process::Command::new(super::process::resolve_trusted(program))
         .args(args)
         .env_clear()

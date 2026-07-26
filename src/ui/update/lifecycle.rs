@@ -71,9 +71,27 @@ pub(super) fn operation_finished(
             effects.extend(retract_pending_rollback(state, operation));
         }
     }
+    // Start the countdown now that the apply has landed (applied, partial, or
+    // indeterminate — all mean the change may be live). A clean failure applied
+    // nothing and was retracted above, so it is skipped.
+    if !matches!(outcome, OperationOutcome::Failed { .. }) {
+        start_countdown(state, outcome.operation());
+    }
     // The durable JSONL write happens in the shell, not the reducer.
     effects.push(Effect::RecordAudit { op_id, outcome });
     effects
+}
+
+/// Starts the countdown for an armed rollback whose apply has just landed: sets
+/// its deadline relative to *now*, so the window is the operator's confirmation
+/// time and excludes apply round-trip latency. No-op if nothing matches.
+fn start_countdown(state: &mut UiState, operation: &FirewallOperation) {
+    let deadline = state.tick + state.rollback_ticks;
+    for pending in &mut state.pending_rollback {
+        if &pending.forward == operation && pending.deadline_tick == u64::MAX {
+            pending.deadline_tick = deadline;
+        }
+    }
 }
 
 /// Pre-arms the dead-man's switch for a risky, reversible operation **before**
@@ -83,6 +101,29 @@ pub(super) fn operation_finished(
 /// the apply never landed. The caller dispatches the returned effect (an
 /// `ArmWatchdog`, if systemd is usable) ahead of `Effect::Apply`.
 pub(super) fn pre_arm_rollback(state: &mut UiState, operation: &FirewallOperation) -> Vec<Effect> {
+    pre_arm_rollback_at(state, operation, 0)
+}
+
+/// Pre-arms the dead-man's switch for every connectivity-affecting operation in
+/// a staged plan / restore / bulk delete — each with its own watchdog unit — so
+/// the multi-change flows most likely to cut a remote admin off get the same
+/// safety net as a single operation.
+pub(super) fn pre_arm_plan_rollbacks(
+    state: &mut UiState,
+    operations: &[FirewallOperation],
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    for (index, operation) in operations.iter().enumerate() {
+        effects.extend(pre_arm_rollback_at(state, operation, index));
+    }
+    effects
+}
+
+fn pre_arm_rollback_at(
+    state: &mut UiState,
+    operation: &FirewallOperation,
+    index: usize,
+) -> Vec<Effect> {
     if state.rollback_ticks == 0 {
         return Vec::new();
     }
@@ -95,10 +136,21 @@ pub(super) fn pre_arm_rollback(state: &mut UiState, operation: &FirewallOperatio
     // The out-of-process net fires with a grace margin after the in-process
     // deadline (which disarms it on the happy path first).
     let delay_secs = state.rollback_ticks / 4 + 15;
-    let unit = format!("fwdeck-rollback-{}-{}", std::process::id(), state.tick);
+    // The index keeps units unique when a whole plan arms at the same tick.
+    let unit = format!(
+        "fwdeck-rollback-{}-{}-{}",
+        std::process::id(),
+        state.tick,
+        index
+    );
     // The watchdog restores RUNTIME connectivity: a single command, and exactly
     // the scope that can lock you out. (The in-process `inverse` above also
     // reverts the permanent config; the watchdog deliberately does not.)
+    //
+    // The in-process and out-of-process reverts can both fire in a narrow
+    // window (the design fails toward connectivity). The runtime inverse MUST
+    // therefore stay idempotent — re-applying it after it already ran is a
+    // harmless no-op, never an error — so a double-fire cannot do damage.
     let args = operation.inverse_runtime().and_then(|runtime_inverse| {
         crate::infrastructure::firewalld::command::plan(
             &runtime_inverse,
@@ -118,7 +170,10 @@ pub(super) fn pre_arm_rollback(state: &mut UiState, operation: &FirewallOperatio
         .push(crate::ui::state::PendingRollback {
             forward: operation.clone(),
             inverse,
-            deadline_tick: state.tick + state.rollback_ticks,
+            // Countdown not started yet: `operation_finished` sets the real
+            // deadline once the apply lands, so the window is the operator's
+            // confirmation time and does not include apply round-trip latency.
+            deadline_tick: u64::MAX,
             description: operation.describe(),
             watchdog_unit: effect.is_some().then_some(unit),
         });
@@ -142,13 +197,41 @@ fn retract_pending_rollback(state: &mut UiState, operation: &FirewallOperation) 
     effects
 }
 
-/// Executes every armed inverse (newest first — unwinding in reverse order)
-/// and clears the pending rollbacks.
+/// Fires **every** armed inverse now (newest first) and clears the pending
+/// rollbacks — the explicit "undo now" path (`u`).
 pub(super) fn fire_rollback(state: &mut UiState) -> Vec<Effect> {
     if state.pending_rollback.is_empty() {
+        // `u` only reverts an active countdown. Say so, and point at the real
+        // undo — otherwise it silently does nothing and reads as broken.
+        state.toast(
+            ToastKind::Info,
+            "nothing to roll back — no countdown active; use the palette (:) \
+             › Undo last operation",
+        );
         return Vec::new();
     }
     let pending: Vec<_> = state.pending_rollback.drain(..).collect();
+    fire_pending(state, pending)
+}
+
+/// Fires only the armed rollbacks whose own deadline has passed, retaining the
+/// rest so each countdown honors its independent deadline (a newer, still-live
+/// rollback is not cut short by an older one expiring).
+pub(super) fn fire_expired_rollbacks(state: &mut UiState) -> Vec<Effect> {
+    let now = state.tick;
+    let (expired, live): (Vec<_>, Vec<_>) = state
+        .pending_rollback
+        .drain(..)
+        .partition(|pending| now >= pending.deadline_tick);
+    state.pending_rollback = live;
+    fire_pending(state, expired)
+}
+
+/// Executes the given armed inverses newest first (unwinding in reverse order).
+fn fire_pending(
+    state: &mut UiState,
+    pending: Vec<crate::ui::state::PendingRollback>,
+) -> Vec<Effect> {
     let mut effects = Vec::new();
     for pending in pending.into_iter().rev() {
         state.toast(

@@ -1,8 +1,8 @@
 //! Staged-plan lifecycle: apply, drift sync, snapshot restore, and export.
 
 use crate::domain::{ConfigurationTarget, FirewallOperation};
-use crate::ui::action::Effect;
-use crate::ui::overlays::Overlay;
+use crate::ui::action::{Effect, UiAction};
+use crate::ui::overlays::{Confirmation, Overlay};
 use crate::ui::state::{ToastKind, UiState};
 
 use super::{blocked_read_only, blocked_stale, plan_details};
@@ -15,64 +15,131 @@ pub(super) fn apply_staged_plan(state: &mut UiState) -> Vec<Effect> {
         state.toast(ToastKind::Info, "no staged operations");
         return Vec::new();
     }
-    // Without a snapshot there is nothing to re-validate against (the
-    // never-refreshed case; a failed refresh is already caught by
-    // blocked_stale). Apply the staged plan as-is.
-    let Some(snapshot) = state.snapshot.clone() else {
-        let ops: Vec<FirewallOperation> = state.staged.drain(..).collect();
-        state.toast(
-            ToastKind::Info,
-            format!("applying {} staged operation(s)", ops.len()),
-        );
-        return vec![Effect::ApplyPlan(ops)];
-    };
 
     // Re-check each edit against the *current* snapshot (state may have drifted
-    // since staging), classifying into three buckets — crucially keeping
-    // "already satisfied" (a genuine no-op) distinct from "invalid" (a real
-    // error that must never be silently swallowed as satisfied).
-    let mut ops: Vec<FirewallOperation> = Vec::new();
+    // since staging), keeping "already satisfied" (a genuine no-op) distinct
+    // from "invalid" (a real error that must never be silently swallowed). With
+    // no snapshot (never refreshed; a failed refresh is caught by blocked_stale)
+    // there is nothing to re-validate against, so apply the plan as-is.
     let mut satisfied = 0usize;
-    let mut rejected: Vec<String> = Vec::new();
-    for op in &state.staged {
-        let narrowed = op.narrowed_for(&snapshot);
-        match narrowed.validate(&snapshot) {
-            Ok(()) => ops.push(narrowed),
-            Err(crate::domain::OperationError::NothingToDo(_)) => satisfied += 1,
-            Err(err) => rejected.push(format!("{}: {err}", narrowed.describe())),
+    let ops: Vec<FirewallOperation> = if let Some(snapshot) = state.snapshot.clone() {
+        let mut validated: Vec<FirewallOperation> = Vec::new();
+        let mut rejected: Vec<String> = Vec::new();
+        for op in &state.staged {
+            let narrowed = op.narrowed_for(&snapshot);
+            match narrowed.validate(&snapshot) {
+                Ok(()) => validated.push(narrowed),
+                Err(crate::domain::OperationError::NothingToDo(_)) => satisfied += 1,
+                Err(err) => rejected.push(format!("{}: {err}", narrowed.describe())),
+            }
         }
-    }
+        if !rejected.is_empty() {
+            // A validation failure is not "already satisfied": stop, name the
+            // offenders, and leave the whole plan staged for the operator to fix.
+            let detail = rejected.join("; ");
+            state.toast(
+                ToastKind::Error,
+                format!(
+                    "plan not applied — {} operation(s) invalid: {detail}",
+                    rejected.len()
+                ),
+            );
+            return Vec::new();
+        }
+        validated
+    } else {
+        state.staged.clone()
+    };
 
-    if !rejected.is_empty() {
-        // A validation failure is not "already satisfied": stop, name the
-        // offenders, and leave the whole plan staged for the operator to fix.
-        let detail = rejected.join("; ");
-        state.toast(
-            ToastKind::Error,
-            format!(
-                "plan not applied — {} operation(s) invalid: {detail}",
-                rejected.len()
-            ),
-        );
-        return Vec::new();
-    }
-
-    // Everything validated; the no-ops are safe to drop. Commit the drain now.
-    state.staged.clear();
     if ops.is_empty() {
+        state.staged.clear();
         state.toast(ToastKind::Info, "plan already satisfied — nothing to apply");
         return Vec::new();
     }
-    let mut message = format!("applying {} staged operation(s)", ops.len());
-    if satisfied > 0 {
-        use std::fmt::Write as _;
-        let _ = write!(message, " ({satisfied} already satisfied, skipped)");
+
+    // Route the whole batch through the same confirmation + dead-man's switch as
+    // a single op. Staged plans, restores and bulk deletes are the flows most
+    // likely to cut a remote admin off, so they must NOT skip the safety net.
+    if state.confirm_destructive {
+        let body = plan_confirm_body(state, &ops, satisfied);
+        state.overlays.push(Overlay::Confirm(Confirmation {
+            title: "Apply staged plan".to_owned(),
+            body,
+            on_confirm: UiAction::ApplyPlanConfirmed(ops),
+        }));
+        return Vec::new();
     }
-    state.toast(ToastKind::Info, message);
+    apply_plan_now(state, ops)
+}
+
+/// Applies a validated, confirmed plan: clears the staging area, pre-arms the
+/// dead-man's switch for every connectivity-affecting op, then dispatches the
+/// batch. Reached from the confirmation's `on_confirm`, or directly when
+/// destructive confirmation is disabled.
+pub(super) fn apply_plan_now(state: &mut UiState, ops: Vec<FirewallOperation>) -> Vec<Effect> {
+    state.staged.clear();
+    // Arm the rollback BEFORE dispatching, mirroring the single-op path.
+    let mut effects = super::lifecycle::pre_arm_plan_rollbacks(state, &ops);
+    state.toast(
+        ToastKind::Info,
+        format!("applying {} operation(s)", ops.len()),
+    );
     // The engine executes sequentially, stops on the first failure (fail-fast),
-    // and refreshes once at the end. Note: this is NOT atomic — a mid-plan
-    // failure leaves earlier operations applied and re-stages the rest.
-    vec![Effect::ApplyPlan(ops)]
+    // and refreshes once at the end. This is NOT atomic — a mid-plan failure
+    // leaves earlier operations applied and re-stages the rest.
+    effects.push(Effect::ApplyPlan(ops));
+    effects
+}
+
+/// Builds the confirmation body for a staged plan, surfacing per-batch
+/// connectivity and SSH-lockout risk the same way the single-op confirm does.
+fn plan_confirm_body(state: &UiState, ops: &[FirewallOperation], satisfied: usize) -> Vec<String> {
+    let mut body = vec![format!("apply {} staged operation(s)", ops.len())];
+    if satisfied > 0 {
+        body.push(format!("({satisfied} already satisfied, skipped)"));
+    }
+    let risky = ops
+        .iter()
+        .filter(|op| op.connectivity_warning().is_some())
+        .count();
+    if risky > 0 {
+        body.push(format!(
+            "⚠ {risky} operation(s) may cut existing connections"
+        ));
+        if state.ssh_session {
+            // Precise when a risky op touches the effective SSH zone; a blanket
+            // warning otherwise — mirroring the single-op confirm.
+            match state.ssh_zone_with_reason() {
+                Some((ssh_zone, reason))
+                    if ops.iter().any(|op| {
+                        op.connectivity_warning().is_some()
+                            && op.zone().is_some_and(|z| *z == ssh_zone)
+                    }) =>
+                {
+                    body.push(format!(
+                        "⚠ zone `{ssh_zone}` protects your SSH session ({reason}) — \
+                         you may cut your own connection"
+                    ));
+                }
+                _ => body.push(
+                    "⚠ SSH session detected — verify this plan cannot cut your connection"
+                        .to_owned(),
+                ),
+            }
+        }
+        if state.rollback_ticks > 0 {
+            body.push(format!(
+                "a rollback countdown will arm for the {risky} risky change(s)"
+            ));
+        }
+    }
+    for op in ops.iter().take(8) {
+        body.push(format!("  · {}", op.describe()));
+    }
+    if ops.len() > 8 {
+        body.push(format!("  · … and {} more", ops.len() - 8));
+    }
+    body
 }
 
 /// Stages permanent-scoped operations that bring the permanent config in line
