@@ -527,7 +527,10 @@ session uses and warns precisely when a change targets its zone.</li>
 <li><strong>Honest partial failures</strong> — runtime-applied / permanent-failed
 is reported as exactly that, with per-step invocations and a rollback hint.</li>
 <li><strong>Audit trail</strong> — every applied operation is recorded as JSONL
-under <code>~/.local/state/fwdeck/</code> with its exact invocations.</li>
+under <code>~/.local/state/fwdeck/</code> with its exact invocations. It is an
+<em>advisory, append-only</em> record (files are <code>0600</code>), not a
+cryptographically tamper-evident log — treat it as an operational history, and
+ship it to a central log store if you need integrity guarantees.</li>
 <li><strong>Read-only mode</strong> — <code>--read-only</code> disables mutations
 in the engine, not just the UI.</li>
 </ul>

@@ -3,6 +3,10 @@
 //! returned to the caller so the UI can surface them — a silent audit gap in
 //! a firewall tool is itself an incident. Files and the state dir are created
 //! private (`0700`/`0600`) — audit lines reveal topology.
+//!
+//! This is an *advisory, append-only* record, not a cryptographically
+//! tamper-evident log: anyone who can write the file can rewrite it. For
+//! integrity guarantees, ship the JSONL to a central log store.
 
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
