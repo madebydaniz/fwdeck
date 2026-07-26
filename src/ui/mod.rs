@@ -276,7 +276,13 @@ async fn arm_watchdog(state: &mut state::UiState, unit: &str, delay_secs: u64, a
     use crate::infrastructure::process::resolve_trusted;
     let systemd_run = resolve_trusted("systemd-run");
     let firewall_cmd = resolve_trusted("firewall-cmd");
-    if crate::infrastructure::process_uid() != 0 || !systemd_run.is_absolute() {
+    // Both binaries must resolve to an absolute trusted path: the watchdog runs
+    // as root, so a relative name that could be resolved via a poisoned PATH
+    // must never be armed — fall back to in-process rollback instead.
+    if crate::infrastructure::process_uid() != 0
+        || !systemd_run.is_absolute()
+        || !firewall_cmd.is_absolute()
+    {
         state.toast(
             state::ToastKind::Info,
             "watchdog unavailable (needs root + systemd) — in-process rollback only",
