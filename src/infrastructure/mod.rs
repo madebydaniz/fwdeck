@@ -33,7 +33,9 @@ pub fn process_uid() -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata("/proc/self").map_or(0, |m| m.uid())
+        // Bias toward "not root" when the probe fails: a false root reading
+        // would arm the root-only watchdog we can't actually run.
+        std::fs::metadata("/proc/self").map_or(u32::MAX, |m| m.uid())
     }
     #[cfg(not(unix))]
     0
