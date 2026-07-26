@@ -11,10 +11,9 @@ on:
         required: true
         type: string
 
+# Least privilege by default; jobs opt into the writes they actually need.
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 concurrency:
   group: release-binaries-${{ github.event.inputs.release_tag || github.event.release.tag_name || github.sha }}
@@ -43,12 +42,15 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
+          persist-credentials: false
 
       - name: Validate release tag
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.release_tag || github.event.release.tag_name }}"
+          TAG="${RELEASE_TAG}"
           if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::unexpected release tag '${TAG}' for release-binaries"
             exit 1
@@ -65,9 +67,8 @@ jobs:
           toolchain: "1.88"
           targets: ${{ matrix.target }}
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
+      # No build cache on the release path: signed, published binaries must be
+      # built from scratch so a poisoned cache can never reach a release.
       - name: Build fwdeck
         # The dbus feature ships in release binaries so `--backend dbus` works
         # out of the box.
@@ -75,9 +76,11 @@ jobs:
 
       - name: Package archive
         shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.release_tag || github.event.release.tag_name }}"
+          TAG="${RELEASE_TAG}"
           TARGET="${{ matrix.target }}"
           NAME="fwdeck-${TAG}-${TARGET}"
           BIN="target/${TARGET}/release/fwdeck"
@@ -97,11 +100,12 @@ jobs:
         if: endsWith(matrix.target, '-gnu')
         shell: bash
         env:
+          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
           # Multi-arch image (amd64 + arm64), pinned by index digest.
           NFPM_IMAGE: ghcr.io/goreleaser/nfpm@sha256:a662cb167d7b6d3a83920c83d76b12d02b8ac5dd2c13e5c62c15270b23f6df0c # v2.47.0
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.release_tag || github.event.release.tag_name }}"
+          TAG="${RELEASE_TAG}"
           TARGET="${{ matrix.target }}"
           NAME="fwdeck-${TAG}-${TARGET}"
           case "${TARGET}" in
@@ -143,12 +147,17 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - build
+    permissions:
+      contents: write # upload release assets
+      id-token: write # cosign keyless + SLSA provenance
+      attestations: write # attest-build-provenance
 
     steps:
       - name: Checkout release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
+          persist-credentials: false
 
       - name: Download all build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -198,7 +207,7 @@ jobs:
           upload-release-assets: false
 
       - name: Attest build provenance (SLSA)
-        uses: actions/attest-build-provenance@62fc1d596301d0ab9914e1fec14dc5c8d93f65cd # v3.2.0
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
         with:
           subject-path: |
             dist/*.tar.gz
@@ -207,6 +216,8 @@ jobs:
             dist/checksums.txt
 
       - name: Upload release assets
+        # zizmor: ignore[superfluous-actions] — action-gh-release gives multi-file
+        # upload + overwrite that a plain `gh release` script would reimplement.
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
@@ -236,6 +247,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -245,4 +257,6 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        # zizmor: ignore[use-trusted-publishing] — crates.io token is managed by the
+        # maintainer; trusted publishing (OIDC) is a deliberate future change.
         run: cargo publish --locked
