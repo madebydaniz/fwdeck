@@ -1125,6 +1125,16 @@ impl FirewallOperation {
                 Some("DROPS ALL PACKETS — remote sessions WILL be cut")
             }
             Self::Reload => Some("runtime-only changes will be lost"),
+            // Re-zoning: these silently decide what a session is allowed to do.
+            Self::SetDefaultZone { .. } => Some(
+                "re-homes every unbound interface and source — a restrictive default can cut your session",
+            ),
+            Self::AddInterface { .. } => Some(
+                "moves this interface's traffic under a new zone's rules — may cut sessions on it",
+            ),
+            Self::AddSource { .. } => Some(
+                "source bindings match at the highest precedence — binding your own client's address into a restrictive zone cuts you off",
+            ),
             _ => None,
         }
     }
@@ -1810,6 +1820,44 @@ mod tests {
         };
         assert_eq!(set_target.target(), ConfigurationTarget::Permanent);
         assert!(set_target.inverse().is_none());
+    }
+
+    #[test]
+    fn rezoning_ops_warn_and_are_reversible() {
+        // Regression guard: re-zoning is the classic self-lockout vector, so all
+        // three ops must carry a connectivity warning — that is what makes the
+        // SSH notice fire AND arms the dead-man's switch (both key off it).
+        let z = zone("public");
+        let iface = FirewallOperation::AddInterface {
+            zone: z.clone(),
+            interface: InterfaceName::parse("eth0").unwrap(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+        let src = FirewallOperation::AddSource {
+            zone: z.clone(),
+            source: SourceAddress::parse("203.0.113.0/24").unwrap(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+        let def = FirewallOperation::SetDefaultZone { zone: z };
+
+        for op in [&iface, &src, &def] {
+            assert!(
+                op.connectivity_warning().is_some(),
+                "missing connectivity warning for {op:?}"
+            );
+        }
+        // AddInterface / AddSource have clean inverses, so rollback can revert
+        // them; SetDefaultZone captures no prior default, so it warns but (like
+        // Reload) cannot auto-revert.
+        assert!(matches!(
+            iface.inverse(),
+            Some(FirewallOperation::RemoveInterface { .. })
+        ));
+        assert!(matches!(
+            src.inverse(),
+            Some(FirewallOperation::RemoveSource { .. })
+        ));
+        assert!(def.inverse().is_none());
     }
 
     #[test]
