@@ -4,7 +4,9 @@
 # deps with `cargo vendor` and drop a .cargo/config.toml) so `cargo build` can
 # fetch crates. Bump Version and %changelog per release.
 Name:           fwdeck
-Version:        0.1.2
+# x-release-please-start-version
+Version:        0.2.0
+# x-release-please-end
 Release:        1%{?dist}
 Summary:        A safety-first terminal UI for firewalld
 
@@ -47,5 +49,7 @@ install -Dm0644 %{name}.1 %{buildroot}%{_mandir}/man1/%{name}.1
 %{_mandir}/man1/%{name}.1*
 
 %changelog
+* Sat Jul 26 2026 Daniel Niazmand <daniel@xcoorp.com> - 0.2.0-1
+- Production hardening: safety fixes, supply-chain, and CI/security tooling.
 * Sat Jul 26 2026 Daniel Niazmand <daniel@xcoorp.com> - 0.1.2-1
 - Initial COPR package.

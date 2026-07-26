@@ -161,7 +161,9 @@ impl Config {
             read_only: file.behavior.read_only,
             read_only_reason: None,
             offline: false,
-            rollback_timeout: Duration::from_secs(file.behavior.rollback_timeout_seconds),
+            // Clamp to a sane ceiling (1 h): a huge value yields a nonsensical
+            // rollback window and can overflow the derived tick math.
+            rollback_timeout: Duration::from_secs(file.behavior.rollback_timeout_seconds.min(3600)),
             log_level: file.logging.level,
             initial_zone: None,
             path: None,

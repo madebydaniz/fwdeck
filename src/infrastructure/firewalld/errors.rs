@@ -43,15 +43,26 @@ pub fn map_failure(output: &CommandOutput) -> FirewallError {
             .unwrap_or("run as root or configure polkit")
             .trim()
             .to_owned();
-        return FirewallError::PermissionDenied { detail };
+        return FirewallError::PermissionDenied {
+            detail: sanitize(&detail),
+        };
     }
     if code == EXIT_NOT_RUNNING || stderr.contains("FirewallD is not running") {
         return FirewallError::DaemonNotRunning;
     }
     FirewallError::CommandFailed {
         code,
-        stderr: truncate(stderr, 300),
+        stderr: truncate(&sanitize(stderr), 300),
     }
+}
+
+/// Replaces ASCII control characters (except newline) with spaces so daemon
+/// stderr cannot inject ANSI escapes or otherwise corrupt the TUI when the
+/// message is surfaced in a toast.
+fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() && c != '\n' { ' ' } else { c })
+        .collect()
 }
 
 fn truncate(text: &str, max: usize) -> String {

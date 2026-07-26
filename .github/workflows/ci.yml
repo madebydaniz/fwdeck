@@ -167,15 +167,42 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # Reported to the run summary, not gated — visibility, not a pass/fail bar.
-      - name: Coverage summary
+      # Gated at a floor well below current (~72%) so a real coverage cliff
+      # reddens CI while normal fluctuation does not; also shown in the summary.
+      - name: Coverage
         run: |
           {
             echo '## Coverage'
             echo '```'
-            cargo llvm-cov --locked --all-features --summary-only
+            cargo llvm-cov --locked --all-features --fail-under-lines 65 --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  packaging-versions:
+    name: Packaging versions in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      # Catch the release-process gap where a bump lands in Cargo.toml but the
+      # distro packaging files (AUR/Copr/Nix) are left on the old version.
+      - name: Packaging files must match the crate version
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "crate version: ${version}"
+          fail=0
+          pkg=$(grep -m1 '^pkgver=' packaging/aur/PKGBUILD | cut -d= -f2)
+          spec=$(grep -m1 '^Version:' packaging/fwdeck.spec | awk '{print $2}')
+          flake=$(grep -m1 'version = "' flake.nix | cut -d'"' -f2)
+          for entry in "PKGBUILD:${pkg}" "fwdeck.spec:${spec}" "flake.nix:${flake}"; do
+            if [ "${entry#*:}" != "${version}" ]; then
+              echo "::error::${entry%%:*} is at ${entry#*:}, expected ${version}"
+              fail=1
+            fi
+          done
+          exit "${fail}"
 
   real-firewalld:
     name: Real firewalld (${{ matrix.distro }})
