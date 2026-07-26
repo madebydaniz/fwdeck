@@ -31,7 +31,7 @@ use crate::config::Config;
 use crate::error::AppError;
 use std::ops::ControlFlow;
 
-use crate::infrastructure::logs::LogEntry;
+use crate::domain::LogEntry;
 
 use action::{Effect, UiAction};
 use state::UiState;

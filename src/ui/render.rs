@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn logs_view_renders_entries() {
-        use crate::infrastructure::logs::{LogAction, LogEntry};
+        use crate::domain::{LogAction, LogEntry};
         let mut s = state();
         update(
             &mut s,
