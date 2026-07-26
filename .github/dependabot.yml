@@ -3,17 +3,22 @@ updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     # Wait a week after a version is published before proposing it, so a
     # compromised release has time to be yanked before Dependabot pulls it in.
     cooldown:
       default-days: 7
+    # One PR for all minor/patch bumps; majors stay separate for review.
     groups:
       minor-and-patch:
         update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
     cooldown:
       default-days: 7
+    # All action bumps in a single PR — keeps the noise to one review.
+    groups:
+      actions:
+        patterns: ["*"]
