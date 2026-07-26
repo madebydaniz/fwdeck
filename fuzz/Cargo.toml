@@ -1,0 +1,38 @@
+[package]
+name = "fwdeck-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.fwdeck]
+path = ".."
+
+[[bin]]
+name = "parse_list_all_zones"
+path = "fuzz_targets/parse_list_all_zones.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_service_info"
+path = "fuzz_targets/parse_service_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_ipset_info"
+path = "fuzz_targets/parse_ipset_info.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent package so cargo-fuzz builds this crate standalone.
+[workspace]
