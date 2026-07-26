@@ -3,6 +3,14 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.2.1](https://github.com/madebydaniz/fwdeck/compare/v0.2.0...v0.2.1) (2026-07-26)
+
+
+### Bug Fixes
+
+* **security:** clamp rollback window, guard nft path, sanitize stderr, bias uid ([2a5f8a9](https://github.com/madebydaniz/fwdeck/commit/2a5f8a9f0a86a6f3690839c8937c8cb2529476d6))
+* warn and arm rollback on re-zoning, and show the offline command preview ([a1c1f93](https://github.com/madebydaniz/fwdeck/commit/a1c1f93e76dd91c6ab02232f309e74c3f1d55323))
+
 ## [0.2.0](https://github.com/madebydaniz/fwdeck/compare/v0.1.2...v0.2.0) (2026-07-26)
 
 
