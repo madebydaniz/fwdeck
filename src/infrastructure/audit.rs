@@ -57,6 +57,13 @@ pub fn record(op_id: u64, outcome: &OperationOutcome) -> Result<(), String> {
     });
     let path = dir.join("audit.jsonl");
     rotate_if_large(&path);
+    append_line(&path, &line.to_string())
+}
+
+/// Appends `line` plus a newline to `path`, creating it `0600` (audit lines
+/// reveal firewall topology). Split out so the append/permission behavior is
+/// unit-testable without a real state directory.
+fn append_line(path: &std::path::Path, line: &str) -> Result<(), String> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
@@ -65,7 +72,7 @@ pub fn record(op_id: u64, outcome: &OperationOutcome) -> Result<(), String> {
         options.mode(0o600);
     }
     let mut file = options
-        .open(&path)
+        .open(path)
         .map_err(|err| format!("audit open: {err}"))?;
     writeln!(file, "{line}").map_err(|err| format!("audit write: {err}"))
 }
@@ -77,5 +84,58 @@ fn rotate_if_large(path: &std::path::Path) {
     };
     if metadata.len() >= ROTATE_BYTES {
         let _ = std::fs::rename(path, path.with_extension("jsonl.1"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::{ROTATE_BYTES, append_line, rotate_if_large};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fwdeck-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn append_is_private_and_accumulates() {
+        let dir = scratch("audit-append");
+        let path = dir.join("audit.jsonl");
+        append_line(&path, r#"{"a":1}"#).unwrap();
+        append_line(&path, r#"{"b":2}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"a\":1}\n{\"b\":2}\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "audit file must be 0600");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotates_once_past_threshold() {
+        let dir = scratch("audit-rotate");
+        let path = dir.join("audit.jsonl");
+        std::fs::write(
+            &path,
+            vec![b'x'; usize::try_from(ROTATE_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        rotate_if_large(&path);
+        assert!(
+            !path.exists(),
+            "oversized log should have been rotated away"
+        );
+        assert!(
+            path.with_extension("jsonl.1").exists(),
+            "rotated file missing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
