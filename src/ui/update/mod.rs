@@ -1980,18 +1980,26 @@ mod tests {
     fn rollback_fires_on_deadline_and_applies_inverse() {
         let mut s = state();
         s.rollback_ticks = 2;
-        // Pre-armed at apply time; the outcome never arrives (operator walks
-        // away), so the deadline fires.
+        let op = FirewallOperation::RemovePort {
+            zone: ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        // Apply arms the rollback (its countdown is not started yet)...
+        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        // ...the applied outcome lands, which starts the countdown from now...
         update(
             &mut s,
-            UiAction::ApplyOperation(FirewallOperation::RemovePort {
-                zone: ZoneName::parse("public").unwrap(),
-                port: "8080/tcp".parse().unwrap(),
-                target: ConfigurationTarget::Runtime,
-            }),
+            UiAction::OperationFinished {
+                op_id: 1,
+                outcome: crate::application::ports::OperationOutcome::Applied {
+                    operation: op,
+                    steps: Vec::new(),
+                },
+            },
         );
-        // Two ticks reach the deadline → the watchdog is disarmed (we handle
-        // the rollback in-process) and the inverse (AddPort) is applied.
+        // ...the operator walks away: two ticks reach the deadline → the
+        // watchdog is disarmed (we revert in-process) and the inverse applies.
         update(&mut s, UiAction::Tick);
         let effects = update(&mut s, UiAction::Tick);
         match &effects[..] {

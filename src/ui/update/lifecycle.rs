@@ -71,9 +71,27 @@ pub(super) fn operation_finished(
             effects.extend(retract_pending_rollback(state, operation));
         }
     }
+    // Start the countdown now that the apply has landed (applied, partial, or
+    // indeterminate — all mean the change may be live). A clean failure applied
+    // nothing and was retracted above, so it is skipped.
+    if !matches!(outcome, OperationOutcome::Failed { .. }) {
+        start_countdown(state, outcome.operation());
+    }
     // The durable JSONL write happens in the shell, not the reducer.
     effects.push(Effect::RecordAudit { op_id, outcome });
     effects
+}
+
+/// Starts the countdown for an armed rollback whose apply has just landed: sets
+/// its deadline relative to *now*, so the window is the operator's confirmation
+/// time and excludes apply round-trip latency. No-op if nothing matches.
+fn start_countdown(state: &mut UiState, operation: &FirewallOperation) {
+    let deadline = state.tick + state.rollback_ticks;
+    for pending in &mut state.pending_rollback {
+        if &pending.forward == operation && pending.deadline_tick == u64::MAX {
+            pending.deadline_tick = deadline;
+        }
+    }
 }
 
 /// Pre-arms the dead-man's switch for a risky, reversible operation **before**
@@ -128,6 +146,11 @@ fn pre_arm_rollback_at(
     // The watchdog restores RUNTIME connectivity: a single command, and exactly
     // the scope that can lock you out. (The in-process `inverse` above also
     // reverts the permanent config; the watchdog deliberately does not.)
+    //
+    // The in-process and out-of-process reverts can both fire in a narrow
+    // window (the design fails toward connectivity). The runtime inverse MUST
+    // therefore stay idempotent — re-applying it after it already ran is a
+    // harmless no-op, never an error — so a double-fire cannot do damage.
     let args = operation.inverse_runtime().and_then(|runtime_inverse| {
         crate::infrastructure::firewalld::command::plan(
             &runtime_inverse,
@@ -147,7 +170,10 @@ fn pre_arm_rollback_at(
         .push(crate::ui::state::PendingRollback {
             forward: operation.clone(),
             inverse,
-            deadline_tick: state.tick + state.rollback_ticks,
+            // Countdown not started yet: `operation_finished` sets the real
+            // deadline once the apply lands, so the window is the operator's
+            // confirmation time and does not include apply round-trip latency.
+            deadline_tick: u64::MAX,
             description: operation.describe(),
             watchdog_unit: effect.is_some().then_some(unit),
         });
