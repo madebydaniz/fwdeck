@@ -45,7 +45,16 @@ exclude = [
     "CLAUDE.md",
     "AGENTS.md",
     "GEMINI.md",
+    "flake.nix",
+    "flake.lock",
 ]
+
+# `cargo binstall fwdeck` fetches the signed release tarball instead of building
+# from source. The URL and in-archive path match release-binaries.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/fwdeck-v{ version }-{ target }.tar.gz"
+bin-dir = "fwdeck-v{ version }-{ target }/{ bin }"
+pkg-fmt = "tgz"
 
 [dependencies]
 anyhow = "1.0"

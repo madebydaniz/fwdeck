@@ -45,13 +45,17 @@ confirmation in front of anything that could lock you out.
 
 ## Install
 
-From **crates.io**:
+Pick your platform's package manager:
 
-```bash
-cargo install fwdeck --locked
-```
+| Method | Command |
+| --- | --- |
+| **crates.io** (compile) | `cargo install fwdeck --locked` |
+| **Prebuilt binary** (no compile) | `cargo binstall fwdeck` |
+| **Arch (AUR)** | `paru -S fwdeck` · `yay -S fwdeck` |
+| **Nix** | `nix profile install github:madebydaniz/fwdeck` |
+| **Fedora/RHEL (Copr)** | `sudo dnf copr enable madebydaniz/fwdeck && sudo dnf install fwdeck` |
 
-Native **`.deb` / `.rpm`** packages (amd64 & arm64) are attached to every
+Or grab a native **`.deb` / `.rpm`** (amd64 & arm64) from every
 [release](https://github.com/madebydaniz/fwdeck/releases) — download the one for
 your architecture, then:
 
