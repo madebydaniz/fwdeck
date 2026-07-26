@@ -97,23 +97,13 @@ async fn event_loop(
                 Some(Err(err)) => return Err(AppError::Terminal(err)),
                 None => Some(UiAction::Quit),
             },
-            event = engine.events.recv(), if engine_alive => match event {
-                Some(EngineEvent::RefreshStarted) => Some(UiAction::RefreshStarted),
-                Some(EngineEvent::RefreshFinished(result)) => {
-                    Some(UiAction::RefreshCompleted(result))
-                }
-                Some(EngineEvent::OperationFinished { op_id, outcome }) => {
-                    Some(UiAction::OperationFinished { op_id, outcome })
-                }
-                Some(EngineEvent::PlanFinished { applied, remaining }) => {
-                    Some(UiAction::PlanFinished { applied, remaining })
-                }
-                None => {
-                    engine_alive = false;
-                    Some(UiAction::RefreshCompleted(Err(FirewallError::Process(
-                        "engine task stopped unexpectedly".to_owned(),
-                    ))))
-                }
+            event = engine.events.recv(), if engine_alive => if let Some(event) = event {
+                Some(engine_event_action(event))
+            } else {
+                engine_alive = false;
+                Some(UiAction::RefreshCompleted(Err(FirewallError::Process(
+                    "engine task stopped unexpectedly".to_owned(),
+                ))))
             },
             received = logs.recv_many(&mut log_batch, 64), if logs_alive => {
                 if received == 0 {
@@ -150,6 +140,50 @@ async fn event_loop(
     }
 }
 
+/// Maps an engine event to the UI action that handles it.
+fn engine_event_action(event: EngineEvent) -> UiAction {
+    match event {
+        EngineEvent::RefreshStarted => UiAction::RefreshStarted,
+        EngineEvent::RefreshFinished(result) => UiAction::RefreshCompleted(result),
+        EngineEvent::OperationFinished { op_id, outcome } => {
+            UiAction::OperationFinished { op_id, outcome }
+        }
+        EngineEvent::PlanFinished { applied, remaining } => {
+            UiAction::PlanFinished { applied, remaining }
+        }
+    }
+}
+
+/// Sends a request to the engine, draining engine events while waiting for a
+/// queue slot. Reserving (instead of a plain blocking send) means a momentarily
+/// full requests queue cannot deadlock against a full events queue — each side
+/// blocked on the other. Returns false if the engine is gone; drained events
+/// run as follow-up actions so no outcome is lost.
+async fn send_request(
+    engine: &mut EngineHandle,
+    pending: &mut std::collections::VecDeque<UiAction>,
+    request: EngineRequest,
+) -> bool {
+    let requests = &mut engine.requests;
+    let events = &mut engine.events;
+    loop {
+        tokio::select! {
+            permit = requests.reserve() => {
+                return match permit {
+                    Ok(permit) => {
+                        permit.send(request);
+                        true
+                    }
+                    Err(_) => false,
+                };
+            }
+            Some(event) = events.recv() => {
+                pending.push_back(engine_event_action(event));
+            }
+        }
+    }
+}
+
 /// Executes one effect. Reads run off the event-loop thread and feed their
 /// result back as a follow-up action on `pending`. Returns `Break` only for
 /// `Effect::Quit`, which the caller turns into a clean shutdown.
@@ -167,24 +201,14 @@ async fn execute_effect(
             let _ = engine.requests.try_send(EngineRequest::Refresh);
         }
         Effect::Apply(operation) => {
-            // Blocking send: mutations (rollbacks especially) must not be
-            // droppable just because the queue is momentarily full.
-            if engine
-                .requests
-                .send(EngineRequest::Apply(operation))
-                .await
-                .is_err()
-            {
+            // Reserving-send drains events while it waits, so a momentarily full
+            // queue can't drop a mutation (rollbacks especially) or deadlock.
+            if !send_request(engine, pending, EngineRequest::Apply(operation)).await {
                 state.toast(state::ToastKind::Error, "engine is gone — operation lost");
             }
         }
         Effect::ApplyPlan(operations) => {
-            if engine
-                .requests
-                .send(EngineRequest::ApplyPlan(operations))
-                .await
-                .is_err()
-            {
+            if !send_request(engine, pending, EngineRequest::ApplyPlan(operations)).await {
                 state.toast(state::ToastKind::Error, "engine is gone — plan not sent");
             }
         }
