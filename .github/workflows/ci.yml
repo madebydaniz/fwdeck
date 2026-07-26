@@ -137,6 +137,46 @@ jobs:
       # Real fuzzing is on demand: `cargo +nightly fuzz run <target>`.
       - run: cargo +nightly fuzz build
 
+  unused-deps:
+    name: Unused dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-shear
+      - run: cargo shear --deny-warnings
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Reported to the run summary, not gated — visibility, not a pass/fail bar.
+      - name: Coverage summary
+        run: |
+          {
+            echo '## Coverage'
+            echo '```'
+            cargo llvm-cov --locked --all-features --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   real-firewalld:
     name: Real firewalld (${{ matrix.distro }})
     runs-on: ubuntu-latest
