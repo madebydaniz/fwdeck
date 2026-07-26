@@ -7,10 +7,10 @@ use ratatui::widgets::TableState;
 
 use crate::application::ports::FirewallError;
 use crate::config::Config;
+use crate::domain::LogEntry;
 use crate::domain::{
     ConfigurationTarget, FirewallOperation, FirewallSnapshot, InterfaceName, ZoneName,
 };
-use crate::infrastructure::logs::LogEntry;
 
 use super::overlays::Overlay;
 use super::palette::PaletteState;

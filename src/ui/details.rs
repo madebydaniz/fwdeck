@@ -10,7 +10,7 @@ use super::views::ViewId;
 /// Read-only rendering of live nftables rule-hit counters, busiest chain first.
 /// An empty list is normal — firewalld only counters some rules.
 #[must_use]
-pub fn counters(counters: &[crate::infrastructure::counters::ChainCounter]) -> DetailsContent {
+pub fn counters(counters: &[crate::domain::ChainCounter]) -> DetailsContent {
     let mut lines: Vec<(String, String)> = if counters.is_empty() {
         vec![(
             String::new(),

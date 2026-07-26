@@ -1414,7 +1414,7 @@ mod tests {
 
     #[test]
     fn logs_receive_counts_denied_and_caps_buffer() {
-        use crate::infrastructure::logs::{LogAction, LogEntry};
+        use crate::domain::{LogAction, LogEntry};
         let mut s = state();
         let entry = |action: LogAction| LogEntry {
             time: "10:00:00".into(),
@@ -1596,7 +1596,7 @@ mod tests {
 
     #[test]
     fn counters_loaded_opens_overlay_and_errors_toast() {
-        use crate::infrastructure::counters::ChainCounter;
+        use crate::domain::ChainCounter;
         let mut s = state();
         update(
             &mut s,

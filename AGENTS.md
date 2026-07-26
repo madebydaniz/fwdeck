@@ -37,8 +37,12 @@ src/main.rs          Wiring + doctor/completions/manpage subcommands.
 - **No `unwrap`/`expect`/`panic!` in production paths** (clippy denies them;
   tests may `#[allow]`).
 - **No shell interpolation, ever.** Commands are argv vectors through
-  `CommandRunner`. All argv construction lives in
-  `src/infrastructure/firewalld/command.rs`.
+  `CommandRunner`. All *firewalld mutation* argv is built in
+  `src/infrastructure/firewalld/command.rs`. A few read-only/auxiliary probes
+  build their own argv deliberately outside it — the systemd-run rollback
+  watchdog (`ui/mod.rs`), `nft` counters (`counters.rs`), and the `ip`/
+  `systemctl` startup probes — because they are not firewalld operations; they
+  still go through `resolve_trusted` + a cleared env, never a shell.
 - **Honest reporting:** a change that applied to runtime but failed for
   permanent is `PartiallyApplied`, never success. Don't silently drop the
   permanent half of an operation.
@@ -49,6 +53,15 @@ src/main.rs          Wiring + doctor/completions/manpage subcommands.
   firewalld CLI/D-Bus APIs; verify against the real daemon first.
 - Every mutation goes through validation → confirmation modal → apply.
   Destructive/risky operations use the rollback (dead-man's switch) flow.
+- **Shared value types the UI reads** (`LogEntry`, `LogAction`, `ChainCounter`)
+  live in `src/domain/observation.rs` so the dependency arrow points inward.
+  `ExportFormat` stays in `command.rs` on purpose — its `render()` generates
+  `firewall-cmd`/Ansible scripts, which is command-building, not a value type.
+- **Leaf I/O helpers** (`audit`, `counters`, `snapshot_store`, `export_write`)
+  return `Result<_, String>`: their error is only ever shown to the operator as
+  a toast, so a typed `thiserror` layer would add ceremony with no behavioral
+  benefit. Use `thiserror` in the library where callers actually *match* on the
+  variant (the firewalld/domain errors do).
 
 ## Development Workflow
 

@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use crate::application::ports::{FirewallError, OperationOutcome};
+use crate::domain::LogEntry;
 use crate::domain::{FirewallOperation, FirewallSnapshot};
-use crate::infrastructure::logs::LogEntry;
 
 use super::overlays::FormKind;
 use super::views::ViewId;
@@ -159,7 +159,7 @@ pub enum UiAction {
     /// `CountersLoaded`.
     ShowCounters,
     /// The counter read finished (result of `Effect::LoadCounters`).
-    CountersLoaded(Result<Vec<crate::infrastructure::counters::ChainCounter>, String>),
+    CountersLoaded(Result<Vec<crate::domain::ChainCounter>, String>),
     /// Request the inverse of the last verified operation (reviewed like any
     /// other mutation).
     UndoLastOperation,

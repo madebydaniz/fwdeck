@@ -5,6 +5,7 @@ pub mod explain;
 pub mod ids;
 #[cfg(test)]
 pub mod mock;
+pub mod observation;
 pub mod operation;
 pub mod policy;
 pub mod port;
@@ -18,6 +19,7 @@ pub use ids::{
     IcmpType, InterfaceName, IpProtocol, IpSetName, PolicyName, ServiceName, ValidationError,
     ZoneName,
 };
+pub use observation::{ChainCounter, LogAction, LogEntry};
 pub use operation::{FirewallOperation, OperationError};
 pub use policy::{PolicyDetails, PolicyTarget};
 pub use port::{ForwardPort, PortNumber, PortRange, PortSelector, PortSpec, Protocol};
