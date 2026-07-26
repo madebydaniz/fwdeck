@@ -813,19 +813,35 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
     if let Some(warning) = reload_ssh_lockout_warning(state, &operation) {
         body.push(warning);
     }
-    // Exact-command preview: the operator sees precisely what will run.
-    for planned in crate::infrastructure::firewalld::command::plan(
-        &operation,
-        crate::infrastructure::process::DEFAULT_TIMEOUT,
-    ) {
-        body.push(format!("$ firewall-cmd {}", planned.request.args.join(" ")));
-    }
+    // Exact-command preview for the active backend (offline drives
+    // `firewall-offline-cmd`, permanent only).
+    body.extend(command_preview(&operation, state.offline));
     state.overlays.push(Overlay::Confirm(Confirmation {
         title: "Confirm".to_owned(),
         body,
         on_confirm: UiAction::ApplyOperation(operation),
     }));
     Vec::new()
+}
+
+/// The exact `$ …` command lines shown in a confirmation, for the active
+/// backend: offline drives `firewall-offline-cmd` (permanent only), so a
+/// `firewall-cmd` line the offline run would never issue is never shown.
+fn command_preview(operation: &FirewallOperation, offline: bool) -> Vec<String> {
+    use crate::infrastructure::firewalld::command::{self, BackendMode};
+    let mode = if offline {
+        BackendMode::Offline
+    } else {
+        BackendMode::Live
+    };
+    command::plan_in(
+        operation,
+        crate::infrastructure::process::DEFAULT_TIMEOUT,
+        mode,
+    )
+    .into_iter()
+    .map(|planned| format!("$ {} {}", mode.program(), planned.request.args.join(" ")))
+    .collect()
 }
 
 fn audit_details(state: &UiState) -> DetailsContent {

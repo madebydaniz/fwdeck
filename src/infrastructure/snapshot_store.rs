@@ -201,7 +201,26 @@ pub fn list() -> Vec<SnapshotEntry> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::reserve_unique_path;
+    use super::{reserve_unique_path, write_private_atomic};
+
+    #[test]
+    fn atomic_write_is_exact_and_private() {
+        let dir = std::env::temp_dir().join(format!("fwdeck-snapw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snapshot-1.json");
+        write_private_atomic(&path, br#"{"schema":1}"#).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"schema":1}"#);
+        // The temp file is renamed into place, never left behind.
+        assert!(!path.with_extension("json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "snapshot must be 0600");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reserved_names_never_collide() {

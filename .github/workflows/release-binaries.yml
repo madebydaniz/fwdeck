@@ -214,6 +214,7 @@ jobs:
             dist/*.rpm
             dist/*.deb
             dist/checksums.txt
+            dist/fwdeck.spdx.json
 
       - name: Upload release assets
         # zizmor: ignore[superfluous-actions] — action-gh-release gives multi-file
@@ -234,8 +235,14 @@ jobs:
 
   publish-crate:
     # Publish the source crate to crates.io. Only on a real published release
-    # (never on workflow_dispatch asset rebuilds, which would hit an
-    # already-published version). Independent of the binary/signing jobs.
+    # (never on workflow_dispatch rebuilds, which would hit an already-published
+    # version). Independent of the binary/signing jobs.
+    #
+    # Uses a stored registry token. OIDC Trusted Publishing is the intended next
+    # step: once a Trusted Publisher is configured on crates.io for this repo
+    # (owner madebydaniz, repo fwdeck, workflow release-binaries.yml), swap the
+    # env below for rust-lang/crates-io-auth-action + `id-token: write` and drop
+    # the token secret.
     if: github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')
     name: publish-crate
     runs-on: ubuntu-latest
@@ -257,6 +264,6 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        # zizmor: ignore[use-trusted-publishing] — crates.io token is managed by the
-        # maintainer; trusted publishing (OIDC) is a deliberate future change.
+        # zizmor: ignore[use-trusted-publishing] — token-managed for now; OIDC
+        # trusted publishing is ready to enable once configured on crates.io.
         run: cargo publish --locked
