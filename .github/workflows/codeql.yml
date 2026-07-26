@@ -31,8 +31,14 @@ jobs:
         with:
           languages: rust
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
+      # Manual build (not autobuild) with the dbus feature, so the D-Bus backend
+      # is included in static analysis rather than excluded.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - name: Build (with the dbus backend)
+        run: cargo build --features dbus --locked
 
       - name: Analyze
         uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1

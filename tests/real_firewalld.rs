@@ -283,6 +283,73 @@ async fn dbus_backend_agrees_with_cli_on_read_path() {
     assert_eq!(cli_snap.all_synced(), dbus_snap.all_synced());
 }
 
+#[cfg(feature = "dbus")]
+#[tokio::test]
+#[ignore = "MUTATES firewalld via D-Bus — dev container only"]
+async fn dbus_backend_add_and_remove_service_runtime() {
+    let _serial = FIREWALL_LOCK.lock().await;
+
+    use fwdeck::application::ports::OperationOutcome;
+    use fwdeck::domain::{ConfigurationTarget, FirewallOperation, ServiceName, ZoneName};
+    use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
+
+    let backend = DbusBackend::connect().await.unwrap();
+    let zone = ZoneName::parse("public").unwrap();
+    let service = ServiceName::parse("pop3").unwrap(); // unused by the seed data
+
+    // The D-Bus backend is runtime-only.
+    let add = FirewallOperation::AddService {
+        zone: zone.clone(),
+        service: service.clone(),
+        target: ConfigurationTarget::Runtime,
+    };
+    let outcome = backend.apply(&add).await;
+    assert!(
+        matches!(outcome, OperationOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+    let snapshot = backend.snapshot().await.unwrap();
+    assert!(snapshot.runtime[&zone].services.contains(&service));
+
+    let remove = FirewallOperation::RemoveService {
+        zone: zone.clone(),
+        service: service.clone(),
+        target: ConfigurationTarget::Runtime,
+    };
+    let outcome = backend.apply(&remove).await;
+    assert!(
+        matches!(outcome, OperationOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+    let snapshot = backend.snapshot().await.unwrap();
+    assert!(!snapshot.runtime[&zone].services.contains(&service));
+}
+
+#[cfg(feature = "dbus")]
+#[tokio::test]
+#[ignore = "requires firewalld + D-Bus — dev container only"]
+async fn dbus_backend_refuses_permanent_scope_honestly() {
+    let _serial = FIREWALL_LOCK.lock().await;
+
+    use fwdeck::application::ports::OperationOutcome;
+    use fwdeck::domain::{ConfigurationTarget, FirewallOperation, ServiceName, ZoneName};
+    use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
+
+    let backend = DbusBackend::connect().await.unwrap();
+    let op = FirewallOperation::AddService {
+        zone: ZoneName::parse("public").unwrap(),
+        service: ServiceName::parse("pop3").unwrap(),
+        target: ConfigurationTarget::RuntimeAndPermanent,
+    };
+    // Anything wider than runtime is refused (Failed) before mutating — never
+    // half-applied-and-claimed-success.
+    let outcome = backend.apply(&op).await;
+    assert!(
+        matches!(outcome, OperationOutcome::Failed { .. }),
+        "{outcome:?}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "MUTATES permanent config offline — dev container only"]
 async fn offline_backend_reads_and_writes_permanent_config() {
