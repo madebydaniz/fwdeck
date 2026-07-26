@@ -81,6 +81,7 @@ pub fn spawn_tailer(tx: mpsc::Sender<LogEntry>) {
 
 /// Streams one source until EOF. Returns whether it produced any output line.
 async fn tail(program: &str, args: &[&str], tx: &mpsc::Sender<LogEntry>) -> std::io::Result<bool> {
+    #[allow(clippy::disallowed_methods)] // resolve_trusted + env_clear: sanctioned log-tail spawn
     let mut child = tokio::process::Command::new(super::process::resolve_trusted(program))
         .args(args)
         .env_clear()

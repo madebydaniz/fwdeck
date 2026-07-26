@@ -101,6 +101,7 @@ pub fn probe_output(program: &str, args: &[&str], timeout: Duration) -> Option<S
     let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        #[allow(clippy::disallowed_methods)] // absolute-checked path + env_clear: sanctioned probe
         let output = std::process::Command::new(path)
             .args(&args)
             .env_clear()
@@ -126,6 +127,8 @@ pub struct TokioRunner;
 impl CommandRunner for TokioRunner {
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, ProcessError> {
         let started = Instant::now();
+        // The CommandRunner itself: the one sanctioned spawn every mutation routes through.
+        #[allow(clippy::disallowed_methods)]
         let child = tokio::process::Command::new(resolve_trusted(request.program))
             .args(&request.args)
             .env_clear()
