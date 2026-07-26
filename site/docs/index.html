@@ -707,11 +707,15 @@ panic mode, runtime-to-permanent) are reported as unsupported instead of
 failing cryptically.</p>
 <h3>Backends</h3>
 <p>FWDeck talks to firewalld through a swappable backend. The default drives
-<code>firewall-cmd</code> with typed, fixture-tested parsing. An optional native
-D-Bus backend (<code>cargo build --features dbus</code>, then
-<code>--backend dbus</code>) implements the same interface; it currently covers
-reads and runtime mutations and <em>refuses loudly</em> anything it can't do
-fully, rather than half-applying.</p>
+<code>firewall-cmd</code> with typed, fixture-tested parsing, and is the
+full-featured reference. An optional native D-Bus backend
+(<code>cargo build --features dbus</code>, then <code>--backend dbus</code>)
+implements the same interface but is <strong>runtime-only</strong>: it covers
+reads and runtime mutations, and <strong>permanent-config changes are not yet
+implemented over D-Bus</strong> — it <em>refuses them loudly</em> (use the
+default <code>firewall-cmd</code> backend for permanent changes) rather than
+half-applying. It also does not yet fetch ipsets, policies, direct rules, or
+service definitions, which show as <em>unknown</em> rather than empty.</p>
 </section>
 
 <section id="automation">
