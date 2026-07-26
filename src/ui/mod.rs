@@ -293,6 +293,31 @@ async fn execute_effect(
     ControlFlow::Continue(())
 }
 
+/// Builds the `systemd-run` argument vector for the rollback watchdog. Pure, so
+/// the exact flags are unit-tested. `firewall_cmd` is the resolved absolute
+/// binary; `inverse_args` is the runtime-inverse invocation to run on timeout.
+fn systemd_run_args(
+    unit: &str,
+    delay_secs: u64,
+    firewall_cmd: &std::path::Path,
+    inverse_args: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "--collect".to_owned(),
+        format!("--unit={unit}"),
+        format!("--on-active={delay_secs}s"),
+        "--timer-property=AccuracySec=1s".to_owned(),
+        firewall_cmd.to_string_lossy().into_owned(),
+    ];
+    args.extend(inverse_args.iter().cloned());
+    args
+}
+
+/// The `systemctl` arguments that cancel a watchdog timer.
+fn disarm_args(unit: &str) -> [String; 2] {
+    ["stop".to_owned(), format!("{unit}.timer")]
+}
+
 /// Pre-arms the out-of-process rollback: a systemd transient timer that runs
 /// the runtime inverse even if this process dies. Needs root and `systemd-run`;
 /// silently degrades to in-process-only protection otherwise (with one toast).
@@ -315,12 +340,7 @@ async fn arm_watchdog(state: &mut state::UiState, unit: &str, delay_secs: u64, a
     }
     let mut command = tokio::process::Command::new(systemd_run);
     command
-        .arg("--collect")
-        .arg(format!("--unit={unit}"))
-        .arg(format!("--on-active={delay_secs}s"))
-        .arg("--timer-property=AccuracySec=1s")
-        .arg(firewall_cmd)
-        .args(args)
+        .args(systemd_run_args(unit, delay_secs, &firewall_cmd, args))
         .env_clear()
         .env("LC_ALL", "C")
         .stdin(std::process::Stdio::null())
@@ -355,8 +375,7 @@ async fn disarm_watchdog(unit: &str) {
         return;
     }
     let _ = tokio::process::Command::new(systemctl)
-        .arg("stop")
-        .arg(format!("{unit}.timer"))
+        .args(disarm_args(unit))
         .env_clear()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -437,7 +456,7 @@ fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::base64_encode;
+    use super::{base64_encode, disarm_args, systemd_run_args};
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -446,5 +465,35 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn watchdog_run_args_have_the_exact_flags_and_inverse() {
+        let args = systemd_run_args(
+            "fwdeck-rollback-42-7-0",
+            45,
+            std::path::Path::new("/usr/bin/firewall-cmd"),
+            &["--zone=public".to_owned(), "--add-service=ssh".to_owned()],
+        );
+        assert_eq!(
+            args.iter().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "--collect",
+                "--unit=fwdeck-rollback-42-7-0",
+                "--on-active=45s",
+                "--timer-property=AccuracySec=1s",
+                "/usr/bin/firewall-cmd",
+                "--zone=public",
+                "--add-service=ssh",
+            ]
+        );
+    }
+
+    #[test]
+    fn disarm_stops_the_unit_timer() {
+        assert_eq!(
+            disarm_args("fwdeck-rollback-42-7-0"),
+            ["stop".to_owned(), "fwdeck-rollback-42-7-0.timer".to_owned()]
+        );
     }
 }

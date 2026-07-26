@@ -2013,6 +2013,82 @@ mod tests {
     }
 
     #[test]
+    fn partial_failure_keeps_the_rollback_armed() {
+        let mut s = state();
+        let op = FirewallOperation::RemovePort {
+            zone: ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        assert!(
+            !s.pending_rollback.is_empty(),
+            "a risky op arms the rollback"
+        );
+        update(
+            &mut s,
+            UiAction::OperationFinished {
+                op_id: 1,
+                outcome: crate::application::ports::OperationOutcome::PartiallyApplied {
+                    operation: op,
+                    steps: Vec::new(),
+                    rollback_hint: None,
+                },
+            },
+        );
+        assert!(
+            !s.pending_rollback.is_empty(),
+            "runtime changed on a partial failure — the rollback must stay armed"
+        );
+    }
+
+    #[test]
+    fn indeterminate_outcome_keeps_the_rollback_armed() {
+        let mut s = state();
+        let op = FirewallOperation::RemovePort {
+            zone: ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        update(
+            &mut s,
+            UiAction::OperationFinished {
+                op_id: 1,
+                outcome: crate::application::ports::OperationOutcome::Indeterminate {
+                    operation: op,
+                    steps: Vec::new(),
+                },
+            },
+        );
+        assert!(
+            !s.pending_rollback.is_empty(),
+            "a timeout may have applied the change — the rollback must stay armed"
+        );
+    }
+
+    #[test]
+    fn arming_emits_a_watchdog_with_the_grace_delay() {
+        let mut s = state();
+        s.rollback_ticks = 40;
+        let effects = update(
+            &mut s,
+            UiAction::ApplyOperation(FirewallOperation::RemovePort {
+                zone: ZoneName::parse("public").unwrap(),
+                port: "8080/tcp".parse().unwrap(),
+                target: ConfigurationTarget::Runtime,
+            }),
+        );
+        let delay = effects.iter().find_map(|effect| match effect {
+            Effect::ArmWatchdog { delay_secs, .. } => Some(*delay_secs),
+            _ => None,
+        });
+        // The out-of-process net fires rollback_ticks/4 + 15s after arming, a
+        // grace margin past the in-process deadline.
+        assert_eq!(delay, Some(40 / 4 + 15), "watchdog grace delay formula");
+    }
+
+    #[test]
     fn non_risky_operation_does_not_arm_rollback() {
         let mut s = state();
         s.rollback_ticks = 120;
