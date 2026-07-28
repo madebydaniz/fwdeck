@@ -2,8 +2,8 @@
 //! (single and bulk), and yank.
 
 use crate::domain::{
-    FirewallOperation, ForwardPort, InterfaceName, IpSetName, PortSpec, RichRule, ServiceName,
-    SourceAddress, ZoneName,
+    DeniedFlow, FirewallOperation, FirewallSnapshot, ForwardPort, InterfaceName, IpSetName,
+    PortSpec, RichRule, ServiceName, SourceAddress, ZoneName,
 };
 use crate::ui::action::{Effect, UiAction};
 use crate::ui::details;
@@ -12,6 +12,68 @@ use crate::ui::state::{ToastKind, UiState};
 use crate::ui::views::ViewId;
 
 use super::{blocked_read_only, request_operation, selected_row, target_for_scope, update};
+
+/// Propose a least-privilege allow rule from the selected denied log row. Bound
+/// to `a` (add entry) in the Logs view: build a source-scoped rich rule for the
+/// blocked flow and route it through the normal confirm -> stage -> apply path.
+/// Nothing is applied automatically; non-denied or portless rows just explain
+/// why they can't become a rule.
+pub(super) fn propose_from_log(state: &mut UiState) -> Vec<Effect> {
+    let Some(cells) = selected_row(state) else {
+        state.toast(ToastKind::Info, "no log line selected");
+        return Vec::new();
+    };
+    // Logs columns: [time, action, src, dst, dport, proto, iface].
+    let (Some(action), Some(src), Some(dport), Some(proto), Some(iface)) = (
+        cells.get(1),
+        cells.get(2),
+        cells.get(4),
+        cells.get(5),
+        cells.get(6),
+    ) else {
+        state.toast(ToastKind::Info, "unexpected log row");
+        return Vec::new();
+    };
+    if action != "DROP" && action != "REJECT" {
+        state.toast(
+            ToastKind::Info,
+            "select a denied (DROP/REJECT) row to propose an allow rule",
+        );
+        return Vec::new();
+    }
+    let flow = match DeniedFlow::parse(src, dport, proto, iface) {
+        Ok(flow) => flow,
+        Err(err) => {
+            state.toast(ToastKind::Info, err.to_string());
+            return Vec::new();
+        }
+    };
+    let Some(snapshot) = state.snapshot.clone() else {
+        state.toast(ToastKind::Warning, "no firewall data yet — refresh first");
+        return Vec::new();
+    };
+    // Resolve the zone by the ingress interface (where the traffic actually
+    // arrives), not the spoofable source; fall back to the default zone.
+    let zone = zone_for_iface(&snapshot, flow.iface.as_deref())
+        .unwrap_or_else(|| snapshot.default_zone.clone());
+    let Some(operation) = flow.propose_allow(zone, state.target) else {
+        state.toast(ToastKind::Warning, "could not build a rule for this flow");
+        return Vec::new();
+    };
+    request_operation(state, operation)
+}
+
+/// The zone whose bound interfaces include `iface`, if any.
+fn zone_for_iface(snapshot: &FirewallSnapshot, iface: Option<&str>) -> Option<ZoneName> {
+    let iface = iface?;
+    snapshot.active.iter().find_map(|(zone, active)| {
+        active
+            .interfaces
+            .iter()
+            .any(|bound| bound.as_str() == iface)
+            .then(|| zone.clone())
+    })
+}
 
 pub(super) fn activate_row(state: &mut UiState) {
     if state.view == ViewId::Zones {
