@@ -10,6 +10,9 @@ services:
       dockerfile: docker/Dockerfile
     # firewalld needs CAP_NET_ADMIN + netfilter; privileged keeps it simple for a dev box
     privileged: true
+    # Pin public resolvers so `make warm` (the one network step) survives the
+    # flaky Docker-Desktop-on-macOS DNS forwarding. `make run` builds offline.
+    dns: ["1.1.1.1", "8.8.8.8"]
     volumes:
       - .:/workspace
       - cargo-registry:/root/.cargo/registry
@@ -36,6 +39,9 @@ services:
         BASE_IMAGE: almalinux:9
     image: fwdeck-dev-el9
     privileged: true
+    # Pin public resolvers so `make warm` (the one network step) survives the
+    # flaky Docker-Desktop-on-macOS DNS forwarding. `make run` builds offline.
+    dns: ["1.1.1.1", "8.8.8.8"]
     volumes:
       - .:/workspace
       - cargo-registry:/root/.cargo/registry
@@ -58,6 +64,9 @@ services:
         BASE_IMAGE: debian:13
     image: fwdeck-dev-debian
     privileged: true
+    # Pin public resolvers so `make warm` (the one network step) survives the
+    # flaky Docker-Desktop-on-macOS DNS forwarding. `make run` builds offline.
+    dns: ["1.1.1.1", "8.8.8.8"]
     volumes:
       - .:/workspace
       - cargo-registry:/root/.cargo/registry

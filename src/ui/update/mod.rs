@@ -19,7 +19,7 @@ use super::views::ViewId;
 use forms::{form_submit, rich_builder_commit};
 use lifecycle::{fire_expired_rollbacks, fire_rollback};
 use plans::{apply_plan_now, apply_staged_plan, export_plan, stage_drift_sync};
-use rows::{activate_row, clone_entry, delete_entry, toggle_mark, yank_row};
+use rows::{activate_row, clone_entry, delete_entry, propose_from_log, toggle_mark, yank_row};
 
 // fixed page size; wire to the rendered table height if it ever matters.
 const PAGE_JUMP: i32 = 10;
@@ -369,9 +369,12 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 };
                 return update(state, UiAction::OpenForm(kind));
             }
-            ViewId::Direct | ViewId::Logs => {
+            ViewId::Direct => {
                 state.toast(ToastKind::Info, "no add action on this view");
             }
+            // In the Logs view, `a` proposes an allow rule from the selected
+            // denied flow (routed through the normal confirm/stage/apply path).
+            ViewId::Logs => return propose_from_log(state),
         },
         UiAction::DeleteEntry => return delete_entry(state),
         UiAction::ToggleMark => toggle_mark(state),
@@ -780,6 +783,12 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
     if permanent_only_note {
         body.push(
             "zone is not active yet — applying to permanent; reload (ctrl-r) to activate"
+                .to_owned(),
+        );
+    }
+    if matches!(operation, FirewallOperation::SetLogDenied { .. }) {
+        body.push(
+            "changing LogDenied triggers a firewalld reload — runtime-only changes are lost"
                 .to_owned(),
         );
     }
@@ -1450,6 +1459,72 @@ mod tests {
         assert_eq!(s.denied_session, 1201);
         update(&mut s, UiAction::SwitchView(ViewId::Logs));
         assert_eq!(s.visible_rows().len(), 1000);
+    }
+
+    #[test]
+    fn propose_allow_from_denied_log_row_stages_a_scoped_rich_rule() {
+        use crate::domain::{LogAction, LogEntry};
+        let mut s = state();
+        // A blocked inbound TCP flow on eth0 (bound to zone `public` in the mock).
+        update(
+            &mut s,
+            UiAction::LogsReceived(vec![LogEntry {
+                time: "12:00:00".into(),
+                action: LogAction::Reject,
+                src: "203.0.113.7".into(),
+                dst: "172.17.0.2".into(),
+                dport: "2222".into(),
+                proto: "TCP".into(),
+                iface: "eth0".into(),
+            }]),
+        );
+        update(&mut s, UiAction::SwitchView(ViewId::Logs));
+        s.view_state_mut().selected = 0;
+        update(&mut s, UiAction::AddEntry);
+
+        let Some(Overlay::Confirm(confirm)) = s.overlays.last() else {
+            panic!("expected a confirmation overlay");
+        };
+        let UiAction::ApplyOperation(FirewallOperation::AddRichRule { zone, rule, .. }) =
+            &confirm.on_confirm
+        else {
+            panic!("expected AddRichRule, got {:?}", confirm.on_confirm);
+        };
+        // Zone resolved from the ingress interface, not the (spoofable) source.
+        assert_eq!(zone.as_str(), "public");
+        let rule = rule.as_str();
+        assert!(
+            rule.contains(r#"source address="203.0.113.7/32""#),
+            "{rule}"
+        );
+        assert!(rule.contains(r#"port port="2222""#), "{rule}");
+        assert!(rule.contains(r#"protocol="tcp""#), "{rule}");
+    }
+
+    #[test]
+    fn propose_from_accepted_log_row_is_declined() {
+        use crate::domain::{LogAction, LogEntry};
+        let mut s = state();
+        update(
+            &mut s,
+            UiAction::LogsReceived(vec![LogEntry {
+                time: "12:00:00".into(),
+                action: LogAction::Accept,
+                src: "203.0.113.7".into(),
+                dst: "172.17.0.2".into(),
+                dport: "2222".into(),
+                proto: "TCP".into(),
+                iface: "eth0".into(),
+            }]),
+        );
+        update(&mut s, UiAction::SwitchView(ViewId::Logs));
+        s.view_state_mut().selected = 0;
+        update(&mut s, UiAction::AddEntry);
+        // An accepted flow has nothing to allow — no confirmation is opened.
+        assert!(
+            !matches!(s.overlays.last(), Some(Overlay::Confirm(_))),
+            "an ACCEPT row must not propose a rule"
+        );
     }
 
     #[test]
