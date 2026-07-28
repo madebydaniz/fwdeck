@@ -443,7 +443,8 @@ fn empty_message(view: ViewId, state: &UiState) -> String {
                 "LogDenied is off — enable it via the palette (`set logdenied`) to see denied packets"
                     .to_owned()
             } else {
-                "waiting for kernel log entries…".to_owned()
+                "waiting for kernel log entries… press `a` on a denied row to propose an allow rule"
+                    .to_owned()
             }
         }
     }
