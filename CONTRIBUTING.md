@@ -32,6 +32,10 @@ cargo test --test real_firewalld -- --ignored   # container only
 
 All four must pass. `cargo test` must never touch the host firewall.
 
+The `make` targets wrap these (`make help` lists them). If Docker's DNS is flaky
+(common on macOS), run `make warm` once — it fetches dependencies into a shared
+cached volume — after which `make run` and the container build fully offline.
+
 ## Commits
 
 Small, focused commits with imperative messages. Document any operation that

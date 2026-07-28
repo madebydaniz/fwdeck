@@ -12,12 +12,16 @@ SERVICE ?= dev
 
 ##@ Run & develop
 
+.PHONY: warm
+warm: ## Fetch deps into the shared cargo-cache volume (run once, and after any Cargo.lock change)
+	$(COMPOSE) run --rm $(SERVICE) $(CARGO) fetch --locked
+
 .PHONY: run
-run: ## Launch the TUI in the dev container (real firewalld). DNS flaky? use run-offline
-	$(COMPOSE) run --rm $(SERVICE) $(CARGO) run
+run: ## Launch the TUI in the dev container, built offline (run `make warm` once first)
+	$(COMPOSE) run --rm $(SERVICE) $(CARGO) run --offline
 
 .PHONY: run-offline
-run-offline: ## Same as run, built offline from your host's cargo cache (skips container DNS)
+run-offline: ## Fallback for a cold cache volume: build offline from your host's cargo cache
 	$(COMPOSE) run --rm -v "$$HOME/.cargo/registry:/root/.cargo/registry" $(SERVICE) $(CARGO) run --offline
 
 .PHONY: shell

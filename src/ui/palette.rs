@@ -663,7 +663,9 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
                 .as_deref()
                 .map_or(LogDenied::Off, |snapshot| snapshot.status.log_denied);
             let next = if current == LogDenied::Off {
-                LogDenied::All
+                // Unicast skips broadcast/multicast noise — the sane default for
+                // surfacing denied inbound flows.
+                LogDenied::Unicast
             } else {
                 LogDenied::Off
             };
