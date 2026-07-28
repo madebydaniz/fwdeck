@@ -159,6 +159,10 @@ docker compose run --rm dev
 cargo run   # inside the container
 ```
 
+> If the build can't reach crates.io (Docker's DNS is flaky on macOS), run
+> `make warm` once to fetch the dependencies into a cached volume, then
+> `make run` builds and launches fully offline — no container network needed.
+
 ## Why did I build it?
 
 Managing firewalld means the same loop every time: `firewall-cmd --list-all`,
