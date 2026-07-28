@@ -3,6 +3,14 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.3.0](https://github.com/madebydaniz/fwdeck/compare/v0.2.1...v0.3.0) (2026-07-28)
+
+
+### Features
+
+* **logs:** propose a scoped allow rule from a denied flow ([c00b6a5](https://github.com/madebydaniz/fwdeck/commit/c00b6a5956f207b59c3b1a5fbf1f5d287ca2d4f4))
+* **logs:** propose an allow rule from a denied flow + offline dev container ([#31](https://github.com/madebydaniz/fwdeck/issues/31)) ([f1509a8](https://github.com/madebydaniz/fwdeck/commit/f1509a84d4d6183e5fca8e5bfff8bd3d908bfab0))
+
 ## [0.2.1](https://github.com/madebydaniz/fwdeck/compare/v0.2.0...v0.2.1) (2026-07-26)
 
 
