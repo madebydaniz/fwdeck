@@ -18,6 +18,8 @@ use super::theme::Theme;
 pub enum Overlay {
     /// Keybinding reference.
     Help,
+    /// About screen: version, description, developer, and links.
+    About,
     /// Fuzzy-searchable command palette.
     Palette(PaletteState),
     /// Global search across every data view.
@@ -186,6 +188,7 @@ pub fn render(f: &mut Frame, state: &mut UiState, theme: &Theme, screen: Rect) {
     let scroll = state.overlay_scroll;
     let clamped = match state.overlays.last() {
         Some(Overlay::Help) => Some(render_help(f, theme, screen, scroll)),
+        Some(Overlay::About) => Some(render_about(f, theme, screen, scroll)),
         Some(Overlay::Palette(palette_state)) => {
             render_palette(f, state, palette_state, theme, screen);
             None
@@ -244,6 +247,43 @@ fn render_help(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
     let area = centered(screen, 58, desired);
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title("Help", scroll, lines.len(), area.height);
+    let block = modal(f, theme, area, &title);
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    scroll
+}
+
+fn render_about(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
+    let field = |label: &str, value: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("   {label:<10}"), theme.accent()),
+            Span::styled(value, theme.text()),
+        ])
+    };
+    let body = |text: &'static str| Line::from(Span::styled(format!(" {text}"), theme.text()));
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" FWDeck v{}", env!("CARGO_PKG_VERSION")),
+            theme.brand(),
+        )),
+        Line::default(),
+        body("A safety-first terminal UI for firewalld — manage zones,"),
+        body("services, ports, and rich rules from the keyboard, with"),
+        body("runtime-vs-permanent scope on every row and a dead-man's"),
+        body("switch that auto-reverts a change that would cut your session."),
+        Line::default(),
+        field("Developer", "Daniel Niazmand"),
+        field("Website", "https://madebydaniz.com"),
+        field("Docs", "https://madebydaniz.github.io/fwdeck/"),
+        field("Source", "https://github.com/madebydaniz/fwdeck"),
+        field("Updates", "https://github.com/madebydaniz/fwdeck/releases"),
+        field("License", "MIT"),
+        Line::default(),
+        body("Run `fwdeck doctor` for your exact upgrade command."),
+    ];
+    let desired = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let area = centered(screen, 62, desired);
+    let scroll = clamp_scroll(scroll, lines.len(), area.height);
+    let title = scroll_title("About", scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
     f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
     scroll
