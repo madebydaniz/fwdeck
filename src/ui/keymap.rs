@@ -47,7 +47,7 @@ pub fn translate(state: &UiState, key: KeyEvent) -> Option<UiAction> {
 /// Overlays are modal: they swallow everything except their own keys.
 fn overlay_key(overlay: &Overlay, code: KeyCode) -> Option<UiAction> {
     match overlay {
-        Overlay::Help | Overlay::Details(_) => match code {
+        Overlay::Help | Overlay::About | Overlay::Details(_) => match code {
             KeyCode::Esc | KeyCode::Char('q' | '?') | KeyCode::Enter => {
                 Some(UiAction::CloseOverlay)
             }

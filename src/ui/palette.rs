@@ -160,6 +160,14 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
             Availability::Enabled,
         ),
         cmd(
+            UiAction::OpenAbout,
+            "About FWDeck",
+            "Version, description, developer, and links",
+            &["about", "version", "info", "credits", "author"],
+            Category::App,
+            Availability::Enabled,
+        ),
+        cmd(
             UiAction::ClearFilter,
             "Clear filter",
             "Remove the active row filter",
