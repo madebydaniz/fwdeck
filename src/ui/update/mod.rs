@@ -143,6 +143,11 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.overlays.push(Overlay::Help);
             }
         }
+        UiAction::OpenAbout => {
+            if state.overlays.is_empty() {
+                state.overlays.push(Overlay::About);
+            }
+        }
         UiAction::CloseOverlay => {
             state.overlays.pop();
             state.overlay_scroll = 0;
@@ -1525,6 +1530,15 @@ mod tests {
             !matches!(s.overlays.last(), Some(Overlay::Confirm(_))),
             "an ACCEPT row must not propose a rule"
         );
+    }
+
+    #[test]
+    fn about_overlay_opens_and_closes() {
+        let mut s = state();
+        update(&mut s, UiAction::OpenAbout);
+        assert!(matches!(s.overlays.last(), Some(Overlay::About)));
+        update(&mut s, UiAction::CloseOverlay);
+        assert!(s.overlays.is_empty());
     }
 
     #[test]

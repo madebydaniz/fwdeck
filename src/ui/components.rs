@@ -144,6 +144,7 @@ fn render_brand_block(f: &mut Frame, area: Rect, state: &UiState, theme: &Theme)
     let lines = vec![
         Line::from(vec![
             Span::styled("FWDECK ", theme.brand()),
+            Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), theme.accent()),
             Span::styled("· firewalld ", theme.muted()),
         ]),
         Line::from(Span::styled(format!("zones: {zones} "), theme.text())),
@@ -157,10 +158,6 @@ fn render_brand_block(f: &mut Frame, area: Rect, state: &UiState, theme: &Theme)
                 || "refresh: — ".to_owned(),
                 |ms| format!("refresh: {ms}ms "),
             ),
-            theme.muted(),
-        )),
-        Line::from(Span::styled(
-            format!("v{} ", env!("CARGO_PKG_VERSION")),
             theme.muted(),
         )),
     ];
