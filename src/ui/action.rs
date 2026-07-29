@@ -63,6 +63,8 @@ pub enum UiAction {
     // Overlays
     /// Open the help overlay.
     OpenHelp,
+    /// Open the About overlay (version, description, developer, links).
+    OpenAbout,
     /// Close the topmost overlay.
     CloseOverlay,
     /// Scroll the topmost scrollable modal (Help / Details) by a signed number
