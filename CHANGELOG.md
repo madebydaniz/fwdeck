@@ -3,6 +3,15 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.4.0](https://github.com/madebydaniz/fwdeck/compare/v0.3.0...v0.4.0) (2026-07-29)
+
+
+### Features
+
+* install-method-aware upgrade guidance ([18b8931](https://github.com/madebydaniz/fwdeck/commit/18b8931dbe417c9e0a033b03771add25ed722db7))
+* **ui:** show version in the header and add an About overlay ([5ee514b](https://github.com/madebydaniz/fwdeck/commit/5ee514b1ad9c433fdfe056f26893298416666948))
+* **ui:** version display, About overlay, and install-aware upgrade guidance ([#33](https://github.com/madebydaniz/fwdeck/issues/33)) ([be9fcb1](https://github.com/madebydaniz/fwdeck/commit/be9fcb1aea48bae48ba276289b7774ccaaa37ab4))
+
 ## [0.3.0](https://github.com/madebydaniz/fwdeck/compare/v0.2.1...v0.3.0) (2026-07-28)
 
 
