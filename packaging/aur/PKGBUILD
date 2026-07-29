@@ -6,7 +6,7 @@
 # (which happens after this file is bumped), and pinning a stale hash would
 # break every release. Run `updpkgsums` locally if you want a pinned checksum.
 pkgname=fwdeck
-pkgver=0.3.0 # x-release-please-version
+pkgver=0.4.0 # x-release-please-version
 pkgrel=1
 pkgdesc="A safety-first terminal UI for firewalld"
 arch=('x86_64' 'aarch64')
