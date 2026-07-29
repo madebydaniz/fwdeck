@@ -176,6 +176,16 @@ async fn spawn_dbus_engine(config: &Config) -> anyhow::Result<EngineHandle> {
 }
 
 /// Read-only environment inspection; never mutates the firewall.
+/// Prints where this binary lives and the correct upgrade command for how it
+/// was installed (zero network — inferred from the executable's path).
+fn print_install_info() {
+    let method = fwdeck::infrastructure::install::InstallMethod::detect();
+    let exe = std::env::current_exe()
+        .map_or_else(|_| "<unknown>".to_owned(), |p| p.display().to_string());
+    println!("installed:     {exe} ({})", method.label());
+    println!("upgrade:       {}", method.upgrade_hint());
+}
+
 async fn run_doctor(config: &Config) {
     println!("fwdeck {} — doctor", env!("CARGO_PKG_VERSION"));
     println!(
@@ -183,6 +193,7 @@ async fn run_doctor(config: &Config) {
         std::env::consts::OS,
         std::env::consts::ARCH
     );
+    print_install_info();
 
     let config_path = config
         .path

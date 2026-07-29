@@ -275,7 +275,10 @@ fn render_about(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 
         field("Website", "https://madebydaniz.com"),
         field("Docs", "https://madebydaniz.github.io/fwdeck/"),
         field("Source", "https://github.com/madebydaniz/fwdeck"),
+        field("Updates", "https://github.com/madebydaniz/fwdeck/releases"),
         field("License", "MIT"),
+        Line::default(),
+        body("Run `fwdeck doctor` for your exact upgrade command."),
     ];
     let desired = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let area = centered(screen, 62, desired);
