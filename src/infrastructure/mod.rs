@@ -4,6 +4,7 @@
 pub mod audit;
 pub mod counters;
 pub mod firewalld;
+pub mod install;
 pub mod logs;
 pub mod process;
 pub mod snapshot_store;
