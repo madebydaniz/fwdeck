@@ -1,18 +1,27 @@
 # Recording the FWDeck demo cast
 
-The README and landing page lead with a static screenshot, but FWDeck's most
+The README and landing page lead with `assets/demo.gif`: FWDeck's most
 compelling, most trust-building behavior — the dead-man's switch reverting a
-change that would lock you out — is *motion*. A ~30 s [asciinema](https://asciinema.org)
-cast of it is the single highest-leverage thing for adoption. Record it against
-the dev container's real firewalld, which is fully isolated from your host.
+change that would lock you out — is *motion*. This guide is how to re-record
+that cast (for a new release or a better take) against the dev container's
+real firewalld, which is fully isolated from your host.
 
 ## Setup
 
+asciinema runs on the **host** and records the terminal; the TUI inside the
+container renders into that same terminal, so nothing needs to be installed in
+the image. `make record-demo` wraps it all (offline build from the host cargo
+cache, plus `scripts/demo-config.toml` for a GIF-friendly 10 s rollback window):
+
 ```bash
-docker compose run --rm dev bash     # real firewalld, seeded, isolated
-# inside the container:
-asciinema rec -c "cargo run" fwdeck-demo.cast
+brew install asciinema agg   # once, on the host
+make record-demo             # play the scenario below, then quit the app
 ```
+
+The cast records at your terminal's natural size (asciinema's `--window-size`
+is deliberately not used — its intermediary terminal layer lags the TUI).
+Aim for roughly 120–140 columns: in most terminals, bump the font size until
+`stty size` reports about `34 130`.
 
 ## The scenario (the story the cast should tell)
 
@@ -33,9 +42,16 @@ recovery — is the whole product in half a minute.
 ## Publish
 
 ```bash
-agg fwdeck-demo.cast assets/demo.gif   # render to a GIF (github.com/asciinema/agg)
+agg --theme dracula fwdeck-demo.cast assets/demo.gif
+ls -lh assets/demo.gif   # keep it under ~2 MB so GitHub autoplays it
+# too big? re-render faster: agg --theme dracula --speed 1.5 ...
 ```
 
-Embed `assets/demo.gif` at the top of `README.md` (in the "Why did I build it?"
-section) and the landing hero (`site/index.html`), above or replacing the static
-`zones.png`.
+`assets/demo.gif` is already embedded as the hero of `README.md` and the
+landing page (`site/index.html`) — committing the regenerated file updates
+both. If the first/last frames carry startup or exit noise, trim them:
+
+```bash
+gifsicle --colors=255 assets/demo.gif -o /tmp/demo-c255.gif
+gifsicle -U /tmp/demo-c255.gif "#5--2" -O2 -o assets/demo.gif
+```

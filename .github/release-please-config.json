@@ -7,7 +7,13 @@
     ".": {
       "package-name": "fwdeck",
       "changelog-path": "CHANGELOG.md",
-      "extra-files": ["flake.nix", "packaging/fwdeck.spec", "packaging/aur/PKGBUILD"]
+      "extra-files": [
+        "flake.nix",
+        "packaging/fwdeck.spec",
+        "packaging/aur/PKGBUILD",
+        "site/index.html",
+        "site/docs/index.html"
+      ]
     }
   },
   "changelog-sections": [

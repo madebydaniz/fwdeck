@@ -31,7 +31,32 @@ const PAGE_JUMP: i32 = 10;
 #[allow(clippy::too_many_lines)] // one arm per action; splitting hurts readability
 pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
     match action {
-        UiAction::Quit => return vec![Effect::Quit],
+        UiAction::Quit => {
+            // Quit is instant in the common case; it asks only when leaving
+            // has a consequence the operator may not expect (matching the
+            // "confirmations only when they carry information" rule).
+            let armed = state.pending_rollback.len();
+            let staged = state.staged.len();
+            if armed == 0 && staged == 0 {
+                return vec![Effect::Quit];
+            }
+            let mut body = Vec::new();
+            if armed > 0 {
+                body.push(format!(
+                    "⚠ quitting fires the armed auto-rollback — {armed} change(s) will revert"
+                ));
+                body.push("to keep them, cancel and press `y` on the countdown first".to_owned());
+            }
+            if staged > 0 {
+                body.push(format!("{staged} staged change(s) will be discarded"));
+            }
+            state.overlays.push(Overlay::Confirm(Confirmation {
+                title: "Quit?".to_owned(),
+                body,
+                on_confirm: UiAction::QuitConfirmed,
+            }));
+        }
+        UiAction::QuitConfirmed => return vec![Effect::Quit],
         UiAction::Tick => {
             state.tick += 1;
             state.prune_toasts();
@@ -1539,6 +1564,62 @@ mod tests {
         assert!(matches!(s.overlays.last(), Some(Overlay::About)));
         update(&mut s, UiAction::CloseOverlay);
         assert!(s.overlays.is_empty());
+    }
+
+    #[test]
+    fn quit_is_immediate_when_nothing_is_pending() {
+        let mut s = state();
+        let effects = update(&mut s, UiAction::Quit);
+        assert!(matches!(effects.as_slice(), [Effect::Quit]));
+        assert!(s.overlays.is_empty(), "no confirmation on a clean quit");
+    }
+
+    #[test]
+    fn quit_asks_before_discarding_staged_changes_and_accept_quits() {
+        let mut s = state();
+        s.staged.push(FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("http").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        });
+        let effects = update(&mut s, UiAction::Quit);
+        assert!(effects.is_empty(), "must not quit before the confirmation");
+        match s.overlays.last() {
+            Some(Overlay::Confirm(confirm)) => {
+                assert!(matches!(confirm.on_confirm, UiAction::QuitConfirmed));
+                assert!(confirm.body.iter().any(|line| line.contains("staged")));
+            }
+            other => panic!("expected a quit confirmation, got {other:?}"),
+        }
+        let effects = update(&mut s, UiAction::ConfirmAccept);
+        assert!(matches!(effects.as_slice(), [Effect::Quit]));
+    }
+
+    #[test]
+    fn quit_asks_while_a_rollback_is_armed_and_cancel_stays() {
+        let mut s = state();
+        let op = FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("ssh").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        s.pending_rollback.push(crate::ui::state::PendingRollback {
+            inverse: op.inverse().unwrap(),
+            description: op.describe(),
+            forward: op,
+            deadline_tick: 40,
+            watchdog_unit: None,
+        });
+        let effects = update(&mut s, UiAction::Quit);
+        assert!(effects.is_empty());
+        match s.overlays.last() {
+            Some(Overlay::Confirm(confirm)) => {
+                assert!(confirm.body.iter().any(|line| line.contains("revert")));
+            }
+            other => panic!("expected a quit confirmation, got {other:?}"),
+        }
+        update(&mut s, UiAction::CloseOverlay);
+        assert!(s.overlays.is_empty(), "cancel keeps the session alive");
     }
 
     #[test]

@@ -49,6 +49,9 @@ install -Dm0644 %{name}.1 %{buildroot}%{_mandir}/man1/%{name}.1
 %{_mandir}/man1/%{name}.1*
 
 %changelog
+* Sun Aug 02 2026 Daniel Niazmand <daniel@xcoorp.com> - 0.4.0-1
+- Version display, About overlay, install-aware upgrade guidance; denied-flow
+  rule proposals and offline dev-container builds (0.3.0).
 * Sat Jul 26 2026 Daniel Niazmand <daniel@xcoorp.com> - 0.2.0-1
 - Production hardening: safety fixes, supply-chain, and CI/security tooling.
 * Sat Jul 26 2026 Daniel Niazmand <daniel@xcoorp.com> - 0.1.2-1
