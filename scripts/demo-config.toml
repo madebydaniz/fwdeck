@@ -1,0 +1,5 @@
+# Config used only when recording the demo cast (`make record-demo`).
+# A 10 s rollback window keeps the dead-man's-switch countdown GIF-friendly;
+# the shipped default stays 30 s.
+[behavior]
+rollback_timeout_seconds = 10

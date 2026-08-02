@@ -8,11 +8,18 @@ the dev container's real firewalld, which is fully isolated from your host.
 
 ## Setup
 
+asciinema runs on the **host** and records the terminal; the TUI inside the
+container renders into that same terminal, so nothing needs to be installed in
+the image. `make record-demo` wraps it all (offline build from the host cargo
+cache, plus `scripts/demo-config.toml` for a GIF-friendly 10 s rollback window):
+
 ```bash
-docker compose run --rm dev bash     # real firewalld, seeded, isolated
-# inside the container:
-asciinema rec -c "cargo run" fwdeck-demo.cast
+brew install asciinema agg   # once, on the host
+make record-demo             # play the scenario below, then quit the app
 ```
+
+The target passes `--window-size 100x30`, so the cast records at exactly
+100×30 regardless of your actual terminal size — no resizing needed.
 
 ## The scenario (the story the cast should tell)
 
@@ -33,7 +40,9 @@ recovery — is the whole product in half a minute.
 ## Publish
 
 ```bash
-agg fwdeck-demo.cast assets/demo.gif   # render to a GIF (github.com/asciinema/agg)
+agg --theme dracula fwdeck-demo.cast assets/demo.gif
+ls -lh assets/demo.gif   # keep it under ~2 MB so GitHub autoplays it
+# too big? re-render faster: agg --theme dracula --speed 1.5 ...
 ```
 
 Embed `assets/demo.gif` at the top of `README.md` (in the "Why did I build it?"
