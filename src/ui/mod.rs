@@ -95,7 +95,8 @@ async fn event_loop(
                 Some(Ok(Event::Resize(width, height))) => Some(UiAction::Resize(width, height)),
                 Some(Ok(_)) => None,
                 Some(Err(err)) => return Err(AppError::Terminal(err)),
-                None => Some(UiAction::Quit),
+                // Input stream gone: no terminal left to ask anything on.
+                None => Some(UiAction::QuitConfirmed),
             },
             event = engine.events.recv(), if engine_alive => if let Some(event) = event {
                 Some(engine_event_action(event))
@@ -114,7 +115,8 @@ async fn event_loop(
                 }
             },
             _ = tick.tick() => Some(UiAction::Tick),
-            _ = &mut ctrl_c => Some(UiAction::Quit),
+            // SIGINT is the emergency exit — never gate it behind a modal.
+            _ = &mut ctrl_c => Some(UiAction::QuitConfirmed),
         };
 
         let Some(action) = action else { continue };

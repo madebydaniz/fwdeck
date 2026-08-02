@@ -89,6 +89,31 @@ mod tests {
     }
 
     #[test]
+    fn arming_rollback_never_shows_a_bogus_countdown() {
+        use crate::domain::{ConfigurationTarget, FirewallOperation, ServiceName, ZoneName};
+        let mut s = state();
+        let op = FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("ssh").unwrap(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+        s.pending_rollback.push(crate::ui::state::PendingRollback {
+            inverse: op.inverse().unwrap(),
+            description: op.describe(),
+            forward: op,
+            // The arming placeholder: apply still in flight, countdown not started.
+            deadline_tick: u64::MAX,
+            watchdog_unit: None,
+        });
+        let content = draw(&mut s, 120, 32);
+        assert!(
+            !content.contains("auto-rollback in"),
+            "placeholder deadline must not render as a countdown"
+        );
+        assert!(content.contains("rollback armed"), "arming line missing");
+    }
+
+    #[test]
     fn narrow_terminal_drops_sidebar_without_panic() {
         let mut s = state();
         let content = draw(&mut s, 50, 20);

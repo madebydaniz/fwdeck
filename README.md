@@ -30,7 +30,7 @@ FWDeck is a safety-first terminal UI for **firewalld** — manage your Linux
 firewall the way k9s manages Kubernetes: fast, keyboard-only, and with a
 confirmation in front of anything that could lock you out.
 
-![FWDeck zones view](assets/zones.png)
+![FWDeck demo — a risky change auto-reverts on the dead-man's-switch countdown](assets/demo.gif)
 
 ## Requirements
 
@@ -51,9 +51,10 @@ Pick your platform's package manager:
 | --- | --- |
 | **crates.io** (compile) | `cargo install fwdeck --locked` |
 | **Prebuilt binary** (no compile) | `cargo binstall fwdeck` |
-| **Arch (AUR)** | `paru -S fwdeck` · `yay -S fwdeck` |
 | **Nix** | `nix profile install github:madebydaniz/fwdeck` |
-| **Fedora/RHEL (Copr)** | `sudo dnf copr enable madebydaniz/fwdeck && sudo dnf install fwdeck` |
+
+AUR and Copr packaging files ship in [`packaging/`](packaging/) — hosted
+AUR/Copr repositories are on the roadmap.
 
 Or grab a native **`.deb` / `.rpm`** (amd64 & arm64) from every
 [release](https://github.com/madebydaniz/fwdeck/releases) — download the one for

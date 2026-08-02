@@ -24,6 +24,13 @@ run: ## Launch the TUI in the dev container, built offline (run `make warm` once
 run-offline: ## Fallback for a cold cache volume: build offline from your host's cargo cache
 	$(COMPOSE) run --rm -v "$$HOME/.cargo/registry:/root/.cargo/registry" $(SERVICE) $(CARGO) run --offline
 
+# Note: asciinema's --window-size is deliberately NOT used — its intermediary
+# terminal layer makes the TUI laggy (keys need double presses). Record at the
+# terminal's natural size and let agg pick the font size for README sharpness.
+.PHONY: record-demo
+record-demo: ## Record the dead-man's-switch demo cast (host asciinema wraps the container TUI)
+	asciinema rec -i 2 --overwrite -c '$(COMPOSE) run --rm -v "$$HOME/.cargo/registry:/root/.cargo/registry" $(SERVICE) $(CARGO) run --offline -- --config scripts/demo-config.toml' fwdeck-demo.cast
+
 .PHONY: shell
 shell: ## Open a shell in the dev container
 	$(COMPOSE) run --rm $(SERVICE) bash
