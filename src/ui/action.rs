@@ -213,8 +213,11 @@ pub enum UiAction {
     RefreshCompleted(Result<Arc<FirewallSnapshot>, FirewallError>),
     /// New kernel/netfilter log entries from the log tailer.
     LogsReceived(Vec<LogEntry>),
-    /// Exit the application.
+    /// Exit the application. Asks first when quitting would fire an armed
+    /// rollback or discard staged changes; otherwise exits immediately.
     Quit,
+    /// Exit unconditionally (the quit confirmation's accept, and ctrl-c).
+    QuitConfirmed,
 }
 
 /// Side effects the reducer asks the event loop to perform.
