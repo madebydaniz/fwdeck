@@ -3,6 +3,25 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.5.0](https://github.com/madebydaniz/fwdeck/compare/v0.4.0...v0.5.0) (2026-08-02)
+
+
+### Features
+
+* **ux:** conditional quit confirm, demo GIF hero, placeholder sweep ([#36](https://github.com/madebydaniz/fwdeck/issues/36)) ([f47d5e8](https://github.com/madebydaniz/fwdeck/commit/f47d5e84a4ad84bb257201019131e00dbd04cfcb))
+* **ux:** confirm quit only when it would revert or discard work ([06c68de](https://github.com/madebydaniz/fwdeck/commit/06c68decd1c5625e7f75e8b152ea024a4799e316))
+
+
+### Bug Fixes
+
+* **ui:** hide the arming rollback placeholder countdown ([478af01](https://github.com/madebydaniz/fwdeck/commit/478af01b7c6f2e1518ad09800987bfbf27784d3f))
+
+
+### Documentation
+
+* drop unpublished install paths and stale placeholder content ([acb767a](https://github.com/madebydaniz/fwdeck/commit/acb767acbebe7b6b849cd99a90b6129034e75d86))
+* lead with the dead-man's-switch demo GIF and recording tooling ([a3f4ac7](https://github.com/madebydaniz/fwdeck/commit/a3f4ac7b1f7d0e0ee4e8eb73ceca3820206ae1c7))
+
 ## [0.4.0](https://github.com/madebydaniz/fwdeck/compare/v0.3.0...v0.4.0) (2026-07-29)
 
 
