@@ -51,9 +51,10 @@ Pick your platform's package manager:
 | --- | --- |
 | **crates.io** (compile) | `cargo install fwdeck --locked` |
 | **Prebuilt binary** (no compile) | `cargo binstall fwdeck` |
-| **Arch (AUR)** | `paru -S fwdeck` · `yay -S fwdeck` |
 | **Nix** | `nix profile install github:madebydaniz/fwdeck` |
-| **Fedora/RHEL (Copr)** | `sudo dnf copr enable madebydaniz/fwdeck && sudo dnf install fwdeck` |
+
+AUR and Copr packaging files ship in [`packaging/`](packaging/) — hosted
+AUR/Copr repositories are on the roadmap.
 
 Or grab a native **`.deb` / `.rpm`** (amd64 & arm64) from every
 [release](https://github.com/madebydaniz/fwdeck/releases) — download the one for

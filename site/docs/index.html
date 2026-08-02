@@ -128,7 +128,7 @@ read-only with a visible explanation, and it never re-executes itself with sudo.
 <p>Downloads the right binary, verifies the SHA-256 checksum, and verifies the
 Cosign release signature before anything is installed:</p>
 <pre><span class="g">$</span> curl -fsSL https://raw.githubusercontent.com/madebydaniz/fwdeck/main/scripts/install.sh | bash</pre>
-<p>Options: <code>--version v0.1.0</code> · <code>--install-dir ~/bin</code> ·
+<p>Options: <code>--version v0.4.0</code><!-- x-release-please-version --> · <code>--install-dir ~/bin</code> ·
 <code>--no-verify-signature</code> (not recommended).</p>
 <h3>Distribution packages (.deb / .rpm)</h3>
 <p>Every <a href="https://github.com/madebydaniz/fwdeck/releases">release</a> also
@@ -158,7 +158,7 @@ contains the binary, bash/zsh/fish completions, the man page, and the license.</
 <p>Releases are signed with <strong>Cosign keyless</strong> (Sigstore): the
 signature certificate is bound to this repository's release workflow identity —
 a signature from anywhere else fails verification.</p>
-<pre>VERSION=v0.1.0
+<pre>VERSION=v0.4.0<!-- x-release-please-version -->
 curl -fsSLO "https://github.com/madebydaniz/fwdeck/releases/download/${VERSION}/checksums.txt"
 curl -fsSLO "https://github.com/madebydaniz/fwdeck/releases/download/${VERSION}/checksums.txt.bundle"
 
@@ -761,10 +761,11 @@ activate.</p>
 <p>You're not root and don't have polkit authorization. The header explains
 this. Run with <code>sudo</code> or configure polkit for your user.</p>
 <h3>The Logs view is empty?</h3>
-<p>Denied-packet logging is off by default in firewalld. Set LogDenied
-(<kbd>:</kbd> → <em>Set log denied</em> → <code>all</code>) and make sure your
-kernel logs reach <code>journald</code>/<code>dmesg</code>. Some container
-kernels can't emit netfilter logs at all.</p>
+<p>Denied-packet logging is off by default in firewalld. Toggle LogDenied on
+from the palette (<kbd>:</kbd> → <em>Set LogDenied to `unicast`</em>), or pick
+another level with <code>firewall-cmd --set-log-denied=all</code>, and make
+sure your kernel logs reach <code>journald</code>/<code>dmesg</code>. Some
+container kernels can't emit netfilter logs at all.</p>
 <h3>An interface binding didn't persist?</h3>
 <p>On NetworkManager-managed systems, NM owns interface-zone assignment
 (<code>connection.zone</code>). FWDeck behaves exactly like

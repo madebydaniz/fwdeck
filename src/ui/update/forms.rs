@@ -14,8 +14,7 @@ use super::plans::restore_snapshot;
 use super::request_operation;
 use super::rows::selected_ipset;
 
-#[allow(clippy::too_many_lines)] // one arm per view
-/// Toggles the selected row's identity in the multi-select set.
+#[allow(clippy::too_many_lines)] // one arm per builder step
 /// Advances the rich-rule builder; on the final step, validates the assembled
 /// rule and routes it into the normal add-rich-rule confirmation flow.
 pub(super) fn rich_builder_commit(state: &mut UiState) -> Vec<Effect> {
