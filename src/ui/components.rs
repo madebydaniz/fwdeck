@@ -460,11 +460,16 @@ pub fn render_command_line(f: &mut Frame, area: Rect, state: &UiState, theme: &T
             "enter keep · esc clear ",
         ),
         InputMode::Normal => {
-            let line = if let Some(pending) = state
+            // Only countdowns that actually started: u64::MAX is the arming
+            // placeholder while the operation is still applying (a real
+            // deadline is set on OperationFinished) — rendering it would show
+            // a nonsense number of seconds.
+            let started = state
                 .pending_rollback
                 .iter()
-                .min_by_key(|pending| pending.deadline_tick)
-            {
+                .filter(|pending| pending.deadline_tick != u64::MAX)
+                .min_by_key(|pending| pending.deadline_tick);
+            let line = if let Some(pending) = started {
                 let remaining = pending.deadline_tick.saturating_sub(state.tick).div_ceil(4);
                 Line::from(vec![
                     Span::styled(
@@ -477,6 +482,12 @@ pub fn render_command_line(f: &mut Frame, area: Rect, state: &UiState, theme: &T
                     Span::styled("u", theme.warn()),
                     Span::styled(" undo now", theme.muted()),
                 ])
+            } else if let Some(pending) = state.pending_rollback.first() {
+                // Armed, still applying — no meaningful ETA yet.
+                Line::from(Span::styled(
+                    format!(" ⏱ rollback armed — applying: {} ", pending.description),
+                    theme.warn(),
+                ))
             } else if let Some(error) = &state.backend_error {
                 Line::from(Span::styled(format!(" {error}"), theme.danger()))
             } else {
