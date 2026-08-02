@@ -23,7 +23,8 @@ pub fn translate(state: &UiState, key: KeyEvent) -> Option<UiAction> {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
-            KeyCode::Char('c') => Some(UiAction::Quit),
+            // Ctrl-c is the emergency exit: always immediate, no questions.
+            KeyCode::Char('c') => Some(UiAction::QuitConfirmed),
             KeyCode::Char('r') => Some(UiAction::ReloadRequested),
             KeyCode::Char('f') => Some(UiAction::OpenGlobalSearch),
             _ => None,
@@ -375,7 +376,9 @@ mod tests {
         let mut s = state();
         s.mode = InputMode::Filter;
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(translate(&s, key), Some(UiAction::Quit));
+        // Unconditional: the emergency exit never routes through the quit
+        // confirmation (that's `q`'s job).
+        assert_eq!(translate(&s, key), Some(UiAction::QuitConfirmed));
     }
 
     #[test]
