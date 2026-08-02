@@ -30,7 +30,7 @@ FWDeck is a safety-first terminal UI for **firewalld** — manage your Linux
 firewall the way k9s manages Kubernetes: fast, keyboard-only, and with a
 confirmation in front of anything that could lock you out.
 
-![FWDeck zones view](assets/zones.png)
+![FWDeck demo — a risky change auto-reverts on the dead-man's-switch countdown](assets/demo.gif)
 
 ## Requirements
 

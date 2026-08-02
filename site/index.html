@@ -54,6 +54,13 @@ nav .gh:hover{border-color:var(--purple)}
 .shot::before{content:"";position:absolute;inset:-40px -60px auto;height:340px;
   background:radial-gradient(600px 220px at 50% 40%,rgba(189,147,249,.16),transparent 70%);
   pointer-events:none;filter:blur(4px)}
+.shot .win{position:relative;border:1px solid var(--line);border-radius:10px;overflow:hidden;
+  background:#14151f;box-shadow:0 24px 60px rgba(0,0,0,.45)}
+.shot .bar{position:relative;display:flex;align-items:center;gap:7px;padding:12px 15px;
+  background:#14151f;border-bottom:1px solid var(--line)}
+.shot .bar i{width:11px;height:11px;border-radius:50%}
+.shot .bar span{position:absolute;left:0;right:0;text-align:center;font-family:var(--mono);
+  font-size:.7rem;color:var(--muted);pointer-events:none}
 .term pre{padding:14px 16px 10px;font-family:var(--mono);font-size:.74rem;line-height:1.5;overflow-x:auto}
 .b{color:var(--blue)}.c{color:#9ecbff}.cy{color:var(--cyan)}.g{color:var(--green)}
 .p{color:var(--purple)}.pk{color:var(--pink)}.o{color:var(--orange)}.r{color:var(--red)}
@@ -134,10 +141,11 @@ footer a:hover{color:var(--fg)}
   </div>
   <div class="alt"><a href="https://github.com/madebydaniz/fwdeck/releases">Prebuilt binaries</a> for x86_64 / aarch64, glibc &amp; static musl</div>
 
-  <div class="shot">
-    <img src="assets/zones.png" alt="FWDeck — zones view with runtime vs permanent drift markers"
+  <div class="shot"><div class="win">
+    <div class="bar"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i><span>sudo fwdeck</span></div>
+    <img src="assets/demo.gif" alt="FWDeck demo — a risky change auto-reverts on the dead-man's-switch countdown"
          style="display:block;width:100%">
-  </div>
+  </div></div>
 </div>
 
 <section id="features">
