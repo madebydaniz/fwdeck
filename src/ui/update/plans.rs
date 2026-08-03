@@ -72,14 +72,11 @@ pub(super) fn apply_staged_plan(state: &mut UiState) -> Vec<Effect> {
     apply_plan_now(state, ops)
 }
 
-/// Applies a validated, confirmed plan: clears the staging area, pre-arms the
-/// dead-man's switch for every connectivity-affecting op, then dispatches the
-/// batch. Reached from the confirmation's `on_confirm`, or directly when
-/// destructive confirmation is disabled.
+/// Applies a validated, confirmed plan: clears the staging area and dispatches
+/// the batch. The engine arms the dead-man's switch immediately before each
+/// individual item, so future fail-fast items can never own a live inverse.
 pub(super) fn apply_plan_now(state: &mut UiState, ops: Vec<FirewallOperation>) -> Vec<Effect> {
     state.staged.clear();
-    // Arm the rollback BEFORE dispatching, mirroring the single-op path.
-    let mut effects = super::lifecycle::pre_arm_plan_rollbacks(state, &ops);
     state.toast(
         ToastKind::Info,
         format!("applying {} operation(s)", ops.len()),
@@ -87,8 +84,7 @@ pub(super) fn apply_plan_now(state: &mut UiState, ops: Vec<FirewallOperation>) -
     // The engine executes sequentially, stops on the first failure (fail-fast),
     // and refreshes once at the end. This is NOT atomic — a mid-plan failure
     // leaves earlier operations applied and re-stages the rest.
-    effects.push(Effect::ApplyPlan(ops));
-    effects
+    vec![Effect::ApplyPlan(ops)]
 }
 
 /// Builds the confirmation body for a staged plan, surfacing per-batch

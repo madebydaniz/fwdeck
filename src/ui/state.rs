@@ -88,6 +88,8 @@ pub struct AuditEntry {
 /// An armed dead-man's switch: unless kept, `inverse` fires at `deadline_tick`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingRollback {
+    /// Unique lifecycle identity; duplicate operations never share a guard.
+    pub id: crate::application::ports::RollbackGuardId,
     /// The risky operation itself — becomes the undo candidate once the
     /// countdown is resolved by "Keep changes".
     pub forward: FirewallOperation,

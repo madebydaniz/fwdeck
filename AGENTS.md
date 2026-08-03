@@ -40,7 +40,7 @@ src/main.rs          Wiring + doctor/completions/manpage subcommands.
   `CommandRunner`. All *firewalld mutation* argv is built in
   `src/infrastructure/firewalld/command.rs`. A few read-only/auxiliary probes
   build their own argv deliberately outside it — the systemd-run rollback
-  watchdog (`ui/mod.rs`), `nft` counters (`counters.rs`), and the `ip`/
+  watchdog (`infrastructure/rollback.rs`), `nft` counters (`counters.rs`), and the `ip`/
   `systemctl` startup probes — because they are not firewalld operations; they
   still go through `resolve_trusted` + a cleared env, never a shell.
 - **Honest reporting:** a change that applied to runtime but failed for

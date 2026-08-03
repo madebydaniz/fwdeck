@@ -12,6 +12,7 @@ use fwdeck::config::Config;
 use fwdeck::infrastructure::firewalld::CliBackend;
 use fwdeck::infrastructure::logs;
 use fwdeck::infrastructure::process::TokioRunner;
+use fwdeck::infrastructure::rollback::SystemdRollbackGuard;
 use fwdeck::{bootstrap, config, ui};
 
 #[tokio::main]
@@ -137,16 +138,20 @@ async fn spawn_engine(args: &Cli, config: &Config) -> anyhow::Result<EngineHandl
         tracing::info!("using the offline backend (firewall-offline-cmd)");
         return Ok(api::spawn(
             CliBackend::offline(TokioRunner),
+            SystemdRollbackGuard::new(TokioRunner),
             config.refresh_interval,
             config.read_only,
+            config.rollback_timeout,
         ));
     }
     match args.backend {
         BackendArg::Dbus => spawn_dbus_engine(config).await,
         BackendArg::Cli => Ok(api::spawn(
             CliBackend::new(TokioRunner),
+            SystemdRollbackGuard::new(TokioRunner),
             config.refresh_interval,
             config.read_only,
+            config.rollback_timeout,
         )),
     }
 }
@@ -158,8 +163,10 @@ async fn spawn_dbus_engine(config: &Config) -> anyhow::Result<EngineHandle> {
     tracing::info!("using the D-Bus backend");
     Ok(api::spawn(
         backend,
+        SystemdRollbackGuard::new(TokioRunner),
         config.refresh_interval,
         config.read_only,
+        config.rollback_timeout,
     ))
 }
 
@@ -170,8 +177,10 @@ async fn spawn_dbus_engine(config: &Config) -> anyhow::Result<EngineHandle> {
     tracing::warn!("dbus backend requested but not compiled in; using CLI backend");
     Ok(api::spawn(
         CliBackend::new(TokioRunner),
+        SystemdRollbackGuard::new(TokioRunner),
         config.refresh_interval,
         config.read_only,
+        config.rollback_timeout,
     ))
 }
 

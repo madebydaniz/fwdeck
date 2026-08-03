@@ -98,6 +98,7 @@ mod tests {
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
         s.pending_rollback.push(crate::ui::state::PendingRollback {
+            id: crate::application::ports::RollbackGuardId::new(1),
             inverse: op.inverse().unwrap(),
             description: op.describe(),
             forward: op,

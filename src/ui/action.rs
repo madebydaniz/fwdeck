@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::application::ports::{FirewallError, OperationOutcome};
+use crate::application::ports::FirewallError;
 use crate::domain::LogEntry;
 use crate::domain::{FirewallOperation, FirewallSnapshot};
 
@@ -125,12 +125,7 @@ pub enum UiAction {
     /// the batch, then hands the whole staged plan to the engine.
     ApplyPlanConfirmed(Vec<FirewallOperation>),
     /// The engine finished an operation; toast, audit, and maybe arm rollback.
-    OperationFinished {
-        /// Correlation id shared with tracing and the audit line.
-        op_id: u64,
-        /// The honest outcome.
-        outcome: OperationOutcome,
-    },
+    OperationFinished(Box<crate::application::api::OperationResult>),
     /// A staged plan finished; `remaining` are unexecuted operations to re-stage.
     PlanFinished {
         /// How many operations applied fully before the plan ended.
@@ -229,6 +224,16 @@ pub enum Effect {
     Refresh,
     /// Hand a single operation to the engine for execution.
     Apply(FirewallOperation),
+    /// Execute an armed inverse. The engine applies first and only then
+    /// attempts the bounded watchdog disarm.
+    ApplyRollback {
+        /// Unique rollback lifecycle id.
+        id: crate::application::ports::RollbackGuardId,
+        /// Connectivity-restoring inverse operation.
+        operation: FirewallOperation,
+        /// External watchdog associated with this inverse.
+        watchdog_unit: Option<String>,
+    },
     /// Copy text to the terminal clipboard via OSC 52 (works over SSH).
     CopyToClipboard(String),
     /// Persist the snapshot to the snapshot store (result toasted by the shell).
@@ -260,18 +265,7 @@ pub enum Effect {
     /// Read live nftables rule-hit counters (off the event-loop thread);
     /// result returns as `UiAction::CountersLoaded`.
     LoadCounters,
-    /// Pre-arm an out-of-process rollback: a systemd transient timer that runs
-    /// the inverse command even if this process dies (crash, SSH loss).
-    ArmWatchdog {
-        /// Transient unit name (`fwdeck-rollback-…`).
-        unit: String,
-        /// Seconds until the watchdog fires on its own.
-        delay_secs: u64,
-        /// `firewall-cmd` argv of the runtime inverse step.
-        args: Vec<String>,
-    },
-    /// Cancel a previously armed watchdog (kept changes, manual rollback, or
-    /// clean exit already handled the situation in-process).
+    /// Cancel a previously armed watchdog after the operator keeps changes.
     DisarmWatchdog {
         /// Transient unit name to stop.
         unit: String,
