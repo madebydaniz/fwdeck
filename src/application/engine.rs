@@ -9,25 +9,30 @@ use tokio::sync::mpsc;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::api::{EngineEvent, EngineRequest};
-use super::ports::{FirewallBackend, FirewallError, OperationOutcome, StepReport};
+use super::api::{EngineEvent, EngineRequest, OperationResult, RollbackRegistration};
+use super::ports::{
+    FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId, StepReport,
+};
 
 /// Process-wide operation counter. The id it mints is logged via tracing and
 /// written to the audit line for the same operation, so `fwdeck.log` and
 /// `audit.jsonl` can be joined on one field even across identical retries.
 static OP_SEQ: AtomicU64 = AtomicU64::new(1);
+static ROLLBACK_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// The next correlation id for an operation.
 pub fn next_op_id() -> u64 {
     OP_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-pub(crate) async fn run<B: FirewallBackend>(
+pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
     backend: B,
+    rollback_guard: G,
     mut requests: mpsc::Receiver<EngineRequest>,
     events: mpsc::Sender<EngineEvent>,
     refresh_interval: Duration,
     read_only: bool,
+    rollback_timeout: Duration,
 ) {
     let mut interval = tokio::time::interval(refresh_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -39,23 +44,19 @@ pub(crate) async fn run<B: FirewallBackend>(
                 Some(EngineRequest::Refresh) => {
                     // Coalesce queued refreshes into one pass. Apply requests
                     // are never coalesced away: try_recv only drops Refresh.
-                    loop {
-                        match requests.try_recv() {
-                            Ok(EngineRequest::Refresh) => {}
-                            Ok(EngineRequest::Apply(operation)) => {
-                                if apply(&backend, &events, operation, read_only).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Ok(EngineRequest::ApplyPlan(operations)) => {
-                                if apply_plan(&backend, &events, operations, read_only)
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Err(_) => break,
+                    while let Ok(queued) = requests.try_recv() {
+                        if execute_request(
+                            &backend,
+                            &rollback_guard,
+                            &events,
+                            queued,
+                            read_only,
+                            rollback_timeout,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
                         }
                     }
                     interval.reset();
@@ -63,21 +64,22 @@ pub(crate) async fn run<B: FirewallBackend>(
                         break;
                     }
                 }
-                Some(EngineRequest::Apply(operation)) => {
-                    if apply(&backend, &events, operation, read_only).await.is_err() {
+                Some(request) => {
+                    if execute_request(
+                        &backend,
+                        &rollback_guard,
+                        &events,
+                        request,
+                        read_only,
+                        rollback_timeout,
+                    )
+                    .await
+                    .is_err()
+                    {
                         break;
                     }
-                    // Post-mutation refresh: even a failure may have changed state.
-                    interval.reset();
-                    if refresh(&backend, &events).await.is_err() {
-                        break;
-                    }
-                }
-                Some(EngineRequest::ApplyPlan(operations)) => {
-                    if apply_plan(&backend, &events, operations, read_only).await.is_err() {
-                        break;
-                    }
-                    // One refresh for the whole plan, not one per operation.
+                    // One post-mutation refresh even for a failure or a whole
+                    // plan: the daemon may have changed before reporting it.
                     interval.reset();
                     if refresh(&backend, &events).await.is_err() {
                         break;
@@ -94,39 +96,93 @@ pub(crate) async fn run<B: FirewallBackend>(
     }
 }
 
+async fn execute_request<B: FirewallBackend, G: RollbackGuard>(
+    backend: &B,
+    rollback_guard: &G,
+    events: &mpsc::Sender<EngineEvent>,
+    request: EngineRequest,
+    read_only: bool,
+    rollback_timeout: Duration,
+) -> Result<(), ()> {
+    match request {
+        EngineRequest::Refresh => Ok(()),
+        EngineRequest::Apply(operation) => {
+            apply(
+                backend,
+                rollback_guard,
+                events,
+                operation,
+                read_only,
+                rollback_timeout,
+            )
+            .await
+        }
+        EngineRequest::Rollback {
+            id,
+            operation,
+            watchdog_unit,
+        } => {
+            apply_rollback(
+                backend,
+                rollback_guard,
+                events,
+                id,
+                operation,
+                watchdog_unit,
+                read_only,
+            )
+            .await
+        }
+        EngineRequest::ApplyPlan(operations) => {
+            apply_plan(
+                backend,
+                rollback_guard,
+                events,
+                operations,
+                read_only,
+                rollback_timeout,
+            )
+            .await
+        }
+    }
+}
+
 /// Executes a staged plan sequentially, halting on the first outcome that is
 /// not fully applied (fail-fast: continuing after a partial failure could
 /// compound damage). Every per-operation outcome still flows to the UI as
 /// `OperationFinished`; unexecuted operations are returned in `PlanFinished`
 /// so nothing is silently lost. Returns `Err(())` when the UI is gone.
-async fn apply_plan<B: FirewallBackend>(
+async fn apply_plan<B: FirewallBackend, G: RollbackGuard>(
     backend: &B,
+    rollback_guard: &G,
     events: &mpsc::Sender<EngineEvent>,
     operations: Vec<crate::domain::FirewallOperation>,
     read_only: bool,
+    rollback_timeout: Duration,
 ) -> Result<(), ()> {
     let total = operations.len();
     let mut iter = operations.into_iter();
     let mut applied = 0usize;
     let mut halted = false;
     for operation in iter.by_ref() {
-        let op_id = next_op_id();
-        let outcome = if read_only {
-            OperationOutcome::Failed {
-                operation: operation.clone(),
-                steps: vec![StepReport {
-                    target: "policy",
-                    invocation: Vec::new(),
-                    result: Err(FirewallError::ReadOnlyMode),
-                }],
-            }
-        } else {
-            tracing::info!(op_id, operation = %operation.describe(), "applying plan operation");
-            backend.apply(&operation).await
-        };
+        let (op_id, outcome, rollback, guard_warning) = execute_operation(
+            backend,
+            rollback_guard,
+            operation,
+            read_only,
+            rollback_timeout,
+            true,
+        )
+        .await;
         let fully_applied = matches!(outcome, OperationOutcome::Applied { .. });
         if events
-            .send(EngineEvent::OperationFinished { op_id, outcome })
+            .send(EngineEvent::OperationFinished(Box::new(OperationResult {
+                op_id,
+                outcome,
+                rollback,
+                guard_warning,
+                completed_rollback: None,
+            })))
             .await
             .is_err()
         {
@@ -148,17 +204,59 @@ async fn apply_plan<B: FirewallBackend>(
 }
 
 /// Returns `Err(())` when the event channel is closed (UI is gone).
-async fn apply<B: FirewallBackend>(
+async fn apply<B: FirewallBackend, G: RollbackGuard>(
     backend: &B,
+    rollback_guard: &G,
     events: &mpsc::Sender<EngineEvent>,
     operation: crate::domain::FirewallOperation,
     read_only: bool,
+    rollback_timeout: Duration,
+) -> Result<(), ()> {
+    let (op_id, outcome, rollback, guard_warning) = execute_operation(
+        backend,
+        rollback_guard,
+        operation,
+        read_only,
+        rollback_timeout,
+        false,
+    )
+    .await;
+    match &outcome {
+        OperationOutcome::Applied { .. } => {
+            tracing::info!(operation = %outcome.operation().describe(), "operation applied");
+        }
+        OperationOutcome::PartiallyApplied { .. }
+        | OperationOutcome::Failed { .. }
+        | OperationOutcome::Indeterminate { .. } => {
+            tracing::warn!(operation = %outcome.operation().describe(), outcome = ?outcome, "operation not fully applied");
+        }
+    }
+    events
+        .send(EngineEvent::OperationFinished(Box::new(OperationResult {
+            op_id,
+            outcome,
+            rollback,
+            guard_warning,
+            completed_rollback: None,
+        })))
+        .await
+        .map_err(|_| ())
+}
+
+async fn apply_rollback<B: FirewallBackend, G: RollbackGuard>(
+    backend: &B,
+    rollback_guard: &G,
+    events: &mpsc::Sender<EngineEvent>,
+    id: RollbackGuardId,
+    operation: crate::domain::FirewallOperation,
+    watchdog_unit: Option<String>,
+    read_only: bool,
 ) -> Result<(), ()> {
     let op_id = next_op_id();
+    tracing::warn!(op_id, rollback_id = id.get(), operation = %operation.describe(), "applying rollback inverse");
     let outcome = if read_only {
-        // Enforced here, not in the UI: no code path can mutate in read-only mode.
         OperationOutcome::Failed {
-            operation: operation.clone(),
+            operation,
             steps: vec![StepReport {
                 target: "policy",
                 invocation: Vec::new(),
@@ -166,23 +264,144 @@ async fn apply<B: FirewallBackend>(
             }],
         }
     } else {
-        tracing::info!(op_id, operation = %operation.describe(), "applying operation");
         backend.apply(&operation).await
     };
-    match &outcome {
-        OperationOutcome::Applied { .. } => {
-            tracing::info!(operation = %operation.describe(), "operation applied");
+
+    let mut guard_warning = None;
+    if matches!(outcome, OperationOutcome::Applied { .. }) {
+        if let Some(unit) = watchdog_unit
+            && let Err(error) = rollback_guard.disarm(&unit).await
+        {
+            guard_warning = Some(format!(
+                "rollback applied but crash watchdog `{unit}` could not be disarmed: {error}"
+            ));
         }
-        OperationOutcome::PartiallyApplied { .. }
-        | OperationOutcome::Failed { .. }
-        | OperationOutcome::Indeterminate { .. } => {
-            tracing::warn!(operation = %operation.describe(), outcome = ?outcome, "operation not fully applied");
-        }
+    } else if watchdog_unit.is_some() {
+        guard_warning = Some(
+            "rollback did not fully apply — crash watchdog remains armed as a safety fallback"
+                .to_owned(),
+        );
     }
     events
-        .send(EngineEvent::OperationFinished { op_id, outcome })
+        .send(EngineEvent::OperationFinished(Box::new(OperationResult {
+            op_id,
+            outcome,
+            rollback: None,
+            guard_warning,
+            completed_rollback: Some(id),
+        })))
         .await
         .map_err(|_| ())
+}
+
+async fn execute_operation<B: FirewallBackend, G: RollbackGuard>(
+    backend: &B,
+    rollback_guard: &G,
+    operation: crate::domain::FirewallOperation,
+    read_only: bool,
+    rollback_timeout: Duration,
+    plan_item: bool,
+) -> (
+    u64,
+    OperationOutcome,
+    Option<RollbackRegistration>,
+    Option<String>,
+) {
+    let op_id = next_op_id();
+    if read_only {
+        return (
+            op_id,
+            OperationOutcome::Failed {
+                operation,
+                steps: vec![StepReport {
+                    target: "policy",
+                    invocation: Vec::new(),
+                    result: Err(FirewallError::ReadOnlyMode),
+                }],
+            },
+            None,
+            None,
+        );
+    }
+
+    let (mut rollback, mut guard_warning) =
+        prepare_rollback(rollback_guard, &operation, rollback_timeout).await;
+    if plan_item {
+        tracing::info!(op_id, operation = %operation.describe(), "applying plan operation");
+    } else {
+        tracing::info!(op_id, operation = %operation.describe(), "applying operation");
+    }
+    let outcome = backend.apply(&operation).await;
+
+    if matches!(outcome, OperationOutcome::Failed { .. }) {
+        if let Some(unit) = rollback
+            .as_ref()
+            .and_then(|registration| registration.watchdog_unit.as_deref())
+            && let Err(error) = rollback_guard.disarm(unit).await
+        {
+            append_warning(
+                &mut guard_warning,
+                format!("failed to disarm rollback guard `{unit}` after a clean failure: {error}"),
+            );
+        }
+        rollback = None;
+    }
+
+    (op_id, outcome, rollback, guard_warning)
+}
+
+async fn prepare_rollback<G: RollbackGuard>(
+    rollback_guard: &G,
+    operation: &crate::domain::FirewallOperation,
+    rollback_timeout: Duration,
+) -> (Option<RollbackRegistration>, Option<String>) {
+    if rollback_timeout.is_zero() || operation.connectivity_warning().is_none() {
+        return (None, None);
+    }
+    let Some(inverse) = operation.inverse() else {
+        return (None, None);
+    };
+    let id = RollbackGuardId::new(ROLLBACK_SEQ.fetch_add(1, Ordering::Relaxed));
+    match rollback_guard.arm(id, operation, rollback_timeout).await {
+        Ok(Some(watchdog_unit)) => (
+            Some(RollbackRegistration {
+                id,
+                inverse,
+                watchdog_unit: Some(watchdog_unit),
+            }),
+            None,
+        ),
+        Ok(None) => (
+            Some(RollbackRegistration {
+                id,
+                inverse,
+                watchdog_unit: None,
+            }),
+            Some(
+                "crash watchdog unavailable for this operation — in-process rollback only"
+                    .to_owned(),
+            ),
+        ),
+        Err(error) => (
+            Some(RollbackRegistration {
+                id,
+                inverse,
+                watchdog_unit: None,
+            }),
+            Some(format!(
+                "could not arm the crash watchdog — in-process rollback only: {error}"
+            )),
+        ),
+    }
+}
+
+fn append_warning(current: &mut Option<String>, warning: String) {
+    if let Some(existing) = current {
+        existing.push_str("; ");
+        existing.push_str(&warning);
+    } else {
+        *current = Some(warning);
+    }
 }
 
 /// Returns `Err(())` when the event channel is closed (UI is gone).
@@ -214,9 +433,92 @@ async fn refresh<B: FirewallBackend>(
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::application::ports::{FirewallBackend, FirewallError};
+    use crate::application::ports::{
+        FirewallBackend, FirewallError, RollbackGuardError, RollbackGuardId,
+    };
     use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus, mock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct TestRollbackGuard;
+
+    impl RollbackGuard for TestRollbackGuard {
+        async fn arm(
+            &self,
+            _id: RollbackGuardId,
+            _operation: &FirewallOperation,
+            _delay: Duration,
+        ) -> Result<Option<String>, RollbackGuardError> {
+            Ok(None)
+        }
+
+        async fn disarm(&self, _unit: &str) -> Result<(), RollbackGuardError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct GuardLog {
+        armed: Vec<(RollbackGuardId, FirewallOperation)>,
+        disarmed: Vec<String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRollbackGuard {
+        log: Arc<Mutex<GuardLog>>,
+    }
+
+    impl RollbackGuard for RecordingRollbackGuard {
+        async fn arm(
+            &self,
+            id: RollbackGuardId,
+            operation: &FirewallOperation,
+            _delay: Duration,
+        ) -> Result<Option<String>, RollbackGuardError> {
+            self.log.lock().unwrap().armed.push((id, operation.clone()));
+            Ok(Some(format!("fwdeck-rollback-test-{}", id.get())))
+        }
+
+        async fn disarm(&self, unit: &str) -> Result<(), RollbackGuardError> {
+            self.log.lock().unwrap().disarmed.push(unit.to_owned());
+            Ok(())
+        }
+    }
+
+    struct FailingArmGuard;
+
+    impl RollbackGuard for FailingArmGuard {
+        async fn arm(
+            &self,
+            _id: RollbackGuardId,
+            _operation: &FirewallOperation,
+            _delay: Duration,
+        ) -> Result<Option<String>, RollbackGuardError> {
+            Err(RollbackGuardError::Process("arm timeout".to_owned()))
+        }
+
+        async fn disarm(&self, _unit: &str) -> Result<(), RollbackGuardError> {
+            Ok(())
+        }
+    }
+
+    struct FailingDisarmGuard;
+
+    impl RollbackGuard for FailingDisarmGuard {
+        async fn arm(
+            &self,
+            id: RollbackGuardId,
+            _operation: &FirewallOperation,
+            _delay: Duration,
+        ) -> Result<Option<String>, RollbackGuardError> {
+            Ok(Some(format!("fwdeck-rollback-test-{}", id.get())))
+        }
+
+        async fn disarm(&self, _unit: &str) -> Result<(), RollbackGuardError> {
+            Err(RollbackGuardError::Process("disarm timeout".to_owned()))
+        }
+    }
 
     struct FakeBackend {
         calls: AtomicUsize,
@@ -259,10 +561,12 @@ mod tests {
         };
         tokio::spawn(run(
             backend,
+            TestRollbackGuard,
             request_rx,
             event_tx,
             Duration::from_secs(3600),
             false,
+            Duration::from_secs(30),
         ));
 
         assert!(matches!(
@@ -287,10 +591,12 @@ mod tests {
         };
         tokio::spawn(run(
             backend,
+            TestRollbackGuard,
             request_rx,
             event_tx,
             Duration::from_secs(3600),
             false,
+            Duration::from_secs(30),
         ));
 
         event_rx.recv().await.unwrap(); // started
@@ -310,10 +616,12 @@ mod tests {
         };
         tokio::spawn(run(
             backend,
+            TestRollbackGuard,
             request_rx,
             event_tx,
             Duration::from_secs(3600),
             false,
+            Duration::from_secs(30),
         ));
         // initial refresh
         event_rx.recv().await.unwrap();
@@ -325,10 +633,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             event_rx.recv().await.unwrap(),
-            EngineEvent::OperationFinished {
-                outcome: OperationOutcome::Applied { .. },
-                ..
-            }
+            EngineEvent::OperationFinished(result)
+                if matches!(result.outcome, OperationOutcome::Applied { .. })
         ));
         // post-mutation refresh follows automatically
         assert!(matches!(
@@ -347,10 +653,12 @@ mod tests {
         };
         tokio::spawn(run(
             backend,
+            TestRollbackGuard,
             request_rx,
             event_tx,
             Duration::from_secs(3600),
             true,
+            Duration::from_secs(30),
         ));
         event_rx.recv().await.unwrap();
         event_rx.recv().await.unwrap();
@@ -360,8 +668,11 @@ mod tests {
             .await
             .unwrap();
         match event_rx.recv().await.unwrap() {
-            EngineEvent::OperationFinished { outcome, .. } => {
-                assert_eq!(outcome.first_error(), Some(&FirewallError::ReadOnlyMode));
+            EngineEvent::OperationFinished(result) => {
+                assert_eq!(
+                    result.outcome.first_error(),
+                    Some(&FirewallError::ReadOnlyMode)
+                );
             }
             other => panic!("expected OperationFinished, got {other:?}"),
         }
@@ -421,10 +732,12 @@ mod tests {
         };
         tokio::spawn(run(
             backend,
+            TestRollbackGuard,
             request_rx,
             event_tx,
             Duration::from_secs(3600),
             false,
+            Duration::from_secs(30),
         ));
         drain_initial_refresh(&mut event_rx).await;
 
@@ -442,17 +755,13 @@ mod tests {
         // op1 applied, op2 failed — then the plan stops.
         assert!(matches!(
             event_rx.recv().await.unwrap(),
-            EngineEvent::OperationFinished {
-                outcome: OperationOutcome::Applied { .. },
-                ..
-            }
+            EngineEvent::OperationFinished(result)
+                if matches!(result.outcome, OperationOutcome::Applied { .. })
         ));
         assert!(matches!(
             event_rx.recv().await.unwrap(),
-            EngineEvent::OperationFinished {
-                outcome: OperationOutcome::Failed { .. },
-                ..
-            }
+            EngineEvent::OperationFinished(result)
+                if matches!(result.outcome, OperationOutcome::Failed { .. })
         ));
         match event_rx.recv().await.unwrap() {
             EngineEvent::PlanFinished { applied, remaining } => {
@@ -468,6 +777,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_arms_only_the_current_item_and_uses_unique_guard_ids() {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let backend = CountingBackend {
+            apply_calls: AtomicUsize::new(0),
+            fail_at: 2,
+        };
+        let guard = RecordingRollbackGuard::default();
+        let guard_log = Arc::clone(&guard.log);
+        tokio::spawn(run(
+            backend,
+            guard,
+            request_rx,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+        drain_initial_refresh(&mut event_rx).await;
+
+        let operation = FirewallOperation::RemovePort {
+            zone: crate::domain::ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: crate::domain::ConfigurationTarget::Runtime,
+        };
+        request_tx
+            .send(EngineRequest::ApplyPlan(vec![
+                operation.clone(),
+                operation.clone(),
+                operation.clone(),
+            ]))
+            .await
+            .unwrap();
+
+        let first_id = match event_rx.recv().await.unwrap() {
+            EngineEvent::OperationFinished(result)
+                if matches!(result.outcome, OperationOutcome::Applied { .. }) =>
+            {
+                result.rollback.unwrap().id
+            }
+            other => panic!("expected first applied item with rollback, got {other:?}"),
+        };
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if matches!(result.outcome, OperationOutcome::Failed { .. })
+                    && result.rollback.is_none()
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::PlanFinished {
+                applied: 1,
+                ref remaining,
+            } if remaining.len() == 1
+        ));
+
+        let log = guard_log.lock().unwrap();
+        assert_eq!(
+            log.armed.len(),
+            2,
+            "the unexecuted third item stays unarmed"
+        );
+        assert_eq!(log.armed[0].1, operation);
+        assert_eq!(log.armed[1].1, operation);
+        assert_eq!(log.armed[0].0, first_id);
+        assert_ne!(
+            log.armed[0].0, log.armed[1].0,
+            "duplicate operations must not share guard identity"
+        );
+        assert_eq!(
+            log.disarmed,
+            [format!("fwdeck-rollback-test-{}", log.armed[1].0.get())],
+            "the cleanly failed current item is disarmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_arm_failure_keeps_in_process_rollback_available() {
+        let backend = CountingBackend {
+            apply_calls: AtomicUsize::new(0),
+            fail_at: 0,
+        };
+        let operation = FirewallOperation::RemovePort {
+            zone: crate::domain::ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: crate::domain::ConfigurationTarget::Runtime,
+        };
+
+        let (_, outcome, rollback, warning) = execute_operation(
+            &backend,
+            &FailingArmGuard,
+            operation.clone(),
+            false,
+            Duration::from_secs(30),
+            false,
+        )
+        .await;
+
+        assert!(matches!(outcome, OperationOutcome::Applied { .. }));
+        let Some(rollback) = rollback else {
+            panic!("in-process rollback must remain registered");
+        };
+        assert_eq!(rollback.inverse, operation.inverse().unwrap());
+        assert!(rollback.watchdog_unit.is_none());
+        assert!(warning.is_some_and(|message| message.contains("arm timeout")));
+    }
+
+    #[tokio::test]
+    async fn clean_failure_reports_disarm_error_without_registering_inverse() {
+        let backend = CountingBackend {
+            apply_calls: AtomicUsize::new(0),
+            fail_at: 1,
+        };
+        let operation = FirewallOperation::RemovePort {
+            zone: crate::domain::ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: crate::domain::ConfigurationTarget::Runtime,
+        };
+
+        let (_, outcome, rollback, warning) = execute_operation(
+            &backend,
+            &FailingDisarmGuard,
+            operation,
+            false,
+            Duration::from_secs(30),
+            false,
+        )
+        .await;
+
+        assert!(matches!(outcome, OperationOutcome::Failed { .. }));
+        assert!(rollback.is_none(), "clean failure never exposes an inverse");
+        assert!(warning.is_some_and(|message| message.contains("disarm timeout")));
+    }
+
+    #[tokio::test]
+    async fn rollback_applies_even_when_watchdog_disarm_fails() {
+        let backend = CountingBackend {
+            apply_calls: AtomicUsize::new(0),
+            fail_at: 0,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let id = RollbackGuardId::new(700);
+        let operation = FirewallOperation::AddPort {
+            zone: crate::domain::ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: crate::domain::ConfigurationTarget::Runtime,
+        };
+
+        apply_rollback(
+            &backend,
+            &FailingDisarmGuard,
+            &event_tx,
+            id,
+            operation,
+            Some("fwdeck-rollback-test-700".to_owned()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        match event_rx.recv().await.unwrap() {
+            EngineEvent::OperationFinished(result) => {
+                assert!(matches!(result.outcome, OperationOutcome::Applied { .. }));
+                assert_eq!(result.completed_rollback, Some(id));
+                assert!(
+                    result
+                        .guard_warning
+                        .is_some_and(|message| message.contains("disarm timeout"))
+                );
+            }
+            other => panic!("expected rollback result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_rollback_leaves_watchdog_armed() {
+        let backend = CountingBackend {
+            apply_calls: AtomicUsize::new(0),
+            fail_at: 1,
+        };
+        let guard = RecordingRollbackGuard::default();
+        let guard_log = Arc::clone(&guard.log);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let id = RollbackGuardId::new(701);
+        let operation = FirewallOperation::AddPort {
+            zone: crate::domain::ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: crate::domain::ConfigurationTarget::Runtime,
+        };
+
+        apply_rollback(
+            &backend,
+            &guard,
+            &event_tx,
+            id,
+            operation,
+            Some("fwdeck-rollback-test-701".to_owned()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        match event_rx.recv().await.unwrap() {
+            EngineEvent::OperationFinished(result) => {
+                assert!(matches!(result.outcome, OperationOutcome::Failed { .. }));
+                assert_eq!(result.completed_rollback, Some(id));
+                assert!(
+                    result
+                        .guard_warning
+                        .is_some_and(|message| message.contains("remains armed"))
+                );
+            }
+            other => panic!("expected rollback result, got {other:?}"),
+        }
+        assert!(
+            guard_log.lock().unwrap().disarmed.is_empty(),
+            "failed inverse must not cancel its external fallback"
+        );
+    }
+
+    #[tokio::test]
     async fn plan_applies_every_step_when_all_succeed() {
         let (request_tx, request_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -477,10 +1007,12 @@ mod tests {
         };
         tokio::spawn(run(
             backend,
+            TestRollbackGuard,
             request_rx,
             event_tx,
             Duration::from_secs(3600),
             false,
+            Duration::from_secs(30),
         ));
         drain_initial_refresh(&mut event_rx).await;
 
@@ -493,10 +1025,8 @@ mod tests {
         for _ in 0..2 {
             assert!(matches!(
                 event_rx.recv().await.unwrap(),
-                EngineEvent::OperationFinished {
-                    outcome: OperationOutcome::Applied { .. },
-                    ..
-                }
+                EngineEvent::OperationFinished(result)
+                    if matches!(result.outcome, OperationOutcome::Applied { .. })
             ));
         }
         match event_rx.recv().await.unwrap() {
@@ -518,10 +1048,12 @@ mod tests {
         };
         tokio::spawn(run(
             backend,
+            TestRollbackGuard,
             request_rx,
             event_tx,
             Duration::from_secs(3600),
             false,
+            Duration::from_secs(30),
         ));
         drain_initial_refresh(&mut event_rx).await;
 
@@ -538,10 +1070,8 @@ mod tests {
         // loop finish without ever seeing the outcome.
         let mut applied = 0;
         for _ in 0..16 {
-            if let EngineEvent::OperationFinished {
-                outcome: OperationOutcome::Applied { .. },
-                ..
-            } = event_rx.recv().await.unwrap()
+            if let EngineEvent::OperationFinished(result) = event_rx.recv().await.unwrap()
+                && matches!(result.outcome, OperationOutcome::Applied { .. })
             {
                 applied += 1;
                 break;
@@ -560,10 +1090,12 @@ mod tests {
         };
         tokio::spawn(run(
             backend,
+            TestRollbackGuard,
             request_rx,
             event_tx,
             Duration::from_secs(3600),
             false,
+            Duration::from_secs(30),
         ));
 
         // initial refresh

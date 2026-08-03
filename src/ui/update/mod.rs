@@ -297,22 +297,8 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.toast(ToastKind::Info, "the last operation has no inverse");
                 return Vec::new();
             };
-            // Defensive: if this op were somehow still armed, disarm it so the
-            // deadline and watchdog can't fire the same inverse a second time.
-            let mut effects: Vec<Effect> = Vec::new();
-            state.pending_rollback.retain(|pending| {
-                if pending.forward == last {
-                    if let Some(unit) = &pending.watchdog_unit {
-                        effects.push(Effect::DisarmWatchdog { unit: unit.clone() });
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
             // Undo is just another reviewed mutation: validation + confirmation.
-            effects.extend(request_operation(state, inverse));
-            return effects;
+            return request_operation(state, inverse);
         }
         UiAction::SaveSnapshot => match state.snapshot.clone() {
             Some(snapshot) => return vec![Effect::SaveSnapshot(snapshot)],
@@ -461,15 +447,17 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 ToastKind::Info,
                 format!("applying: {}", operation.describe()),
             );
-            // Pre-arm the rollback BEFORE the apply, so a crash or SIGKILL
-            // between here and a successful arm still reverts. The ArmWatchdog
-            // effect is ordered ahead of Apply and dispatched first by the shell.
-            let mut effects = lifecycle::pre_arm_rollback(state, &operation);
-            effects.push(Effect::Apply(operation));
-            return effects;
+            return vec![Effect::Apply(operation)];
         }
-        UiAction::OperationFinished { op_id, outcome } => {
-            return lifecycle::operation_finished(state, op_id, outcome);
+        UiAction::OperationFinished(result) => {
+            let result = *result;
+            return lifecycle::operation_finished(
+                state,
+                result.op_id,
+                result.outcome,
+                result.rollback,
+                result.guard_warning,
+            );
         }
         UiAction::PlanFinished { applied, remaining } => {
             if remaining.is_empty() {
@@ -984,6 +972,32 @@ mod tests {
         state
     }
 
+    fn rollback(
+        id: u64,
+        operation: &FirewallOperation,
+        watchdog_unit: Option<&str>,
+    ) -> crate::application::api::RollbackRegistration {
+        crate::application::api::RollbackRegistration {
+            id: crate::application::ports::RollbackGuardId::new(id),
+            inverse: operation.inverse().unwrap(),
+            watchdog_unit: watchdog_unit.map(str::to_owned),
+        }
+    }
+
+    fn finished(
+        op_id: u64,
+        outcome: crate::application::ports::OperationOutcome,
+        rollback: Option<crate::application::api::RollbackRegistration>,
+    ) -> UiAction {
+        UiAction::OperationFinished(Box::new(crate::application::api::OperationResult {
+            op_id,
+            outcome,
+            rollback,
+            guard_warning: None,
+            completed_rollback: None,
+        }))
+    }
+
     fn type_filter(s: &mut UiState, text: &str) {
         update(s, UiAction::EnterFilterMode);
         for c in text.chars() {
@@ -1414,9 +1428,9 @@ mod tests {
         let operation = FirewallOperation::Reload;
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Applied {
+            finished(
+                1,
+                OperationOutcome::Applied {
                     operation,
                     steps: vec![StepReport {
                         target: "global",
@@ -1424,7 +1438,8 @@ mod tests {
                         result: Ok(()),
                     }],
                 },
-            },
+                None,
+            ),
         );
         assert_eq!(s.toasts.back().map(|t| t.kind), Some(ToastKind::Success));
     }
@@ -1456,7 +1471,7 @@ mod tests {
                 },
             ],
         };
-        update(&mut s, UiAction::OperationFinished { op_id: 1, outcome });
+        update(&mut s, finished(1, outcome, None));
         assert_eq!(s.toasts.back().map(|t| t.kind), Some(ToastKind::Error));
         match s.overlays.last() {
             Some(Overlay::Details(content)) => {
@@ -1604,6 +1619,7 @@ mod tests {
             target: ConfigurationTarget::Runtime,
         };
         s.pending_rollback.push(crate::ui::state::PendingRollback {
+            id: crate::application::ports::RollbackGuardId::new(1),
             inverse: op.inverse().unwrap(),
             description: op.describe(),
             forward: op,
@@ -1671,9 +1687,9 @@ mod tests {
         update(&mut s, UiAction::ApplyOperation(op.clone()));
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Applied {
+            finished(
+                1,
+                OperationOutcome::Applied {
                     operation: op.clone(),
                     steps: vec![StepReport {
                         target: "runtime",
@@ -1681,7 +1697,8 @@ mod tests {
                         result: Ok(()),
                     }],
                 },
-            },
+                Some(rollback(1, &op, None)),
+            ),
         );
         assert!(!s.pending_rollback.is_empty(), "risky op arms rollback");
         // A refresh must NOT promote an armed op to undoable.
@@ -1699,6 +1716,7 @@ mod tests {
 
     #[test]
     fn undo_stack_reverts_operations_newest_first() {
+        use crate::application::ports::OperationOutcome;
         let mut s = state();
         s.rollback_ticks = 120;
         // Two risky, reversible ops; keeping resolves both onto the undo stack.
@@ -1714,6 +1732,19 @@ mod tests {
         };
         update(&mut s, UiAction::ApplyOperation(a.clone()));
         update(&mut s, UiAction::ApplyOperation(b.clone()));
+        for (id, operation) in [(1, a.clone()), (2, b.clone())] {
+            update(
+                &mut s,
+                finished(
+                    id,
+                    OperationOutcome::Applied {
+                        operation: operation.clone(),
+                        steps: Vec::new(),
+                    },
+                    Some(rollback(id, &operation, None)),
+                ),
+            );
+        }
         update(&mut s, UiAction::KeepChanges);
 
         // Both undoable, newest (the port) on top.
@@ -2093,26 +2124,28 @@ mod tests {
             service: ServiceName::parse("http").unwrap(),
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
-        // Pre-armed at apply time, before the outcome comes back.
+        // The execution layer owns pre-arming; the reducer registers the
+        // rollback only after it receives the successful outcome.
         update(&mut s, UiAction::ApplyOperation(operation.clone()));
         assert!(
-            !s.pending_rollback.is_empty(),
-            "risky op must pre-arm rollback"
+            s.pending_rollback.is_empty(),
+            "the reducer must not invent an armed guard before execution"
         );
         // The apply succeeds → the rollback stays armed for the countdown.
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Applied {
-                    operation,
+            finished(
+                1,
+                OperationOutcome::Applied {
+                    operation: operation.clone(),
                     steps: vec![StepReport {
                         target: "runtime",
                         invocation: vec!["x".to_owned()],
                         result: Ok(()),
                     }],
                 },
-            },
+                Some(rollback(1, &operation, Some("fwdeck-rollback-test-1"))),
+            ),
         );
         assert!(
             !s.pending_rollback.is_empty(),
@@ -2123,7 +2156,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_failure_retracts_the_pre_armed_rollback() {
+    fn clean_failure_does_not_register_a_rollback() {
         use crate::application::ports::{FirewallError, OperationOutcome, StepReport};
         let mut s = state();
         s.rollback_ticks = 120;
@@ -2133,14 +2166,14 @@ mod tests {
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
         update(&mut s, UiAction::ApplyOperation(operation.clone()));
-        assert!(!s.pending_rollback.is_empty(), "pre-armed before apply");
-        // The apply failed at the first step → nothing changed, so the
-        // pre-armed watchdog must be retracted (else it fires a stale inverse).
+        assert!(s.pending_rollback.is_empty());
+        // The engine retracts the pre-armed guard before emitting a clean
+        // failure, so the UI must not receive or create a rollback entry.
         let effects = update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Failed {
+            finished(
+                1,
+                OperationOutcome::Failed {
                     operation,
                     steps: vec![StepReport {
                         target: "runtime",
@@ -2148,7 +2181,8 @@ mod tests {
                         result: Err(FirewallError::DaemonNotRunning),
                     }],
                 },
-            },
+                None,
+            ),
         );
         assert!(
             s.pending_rollback.is_empty(),
@@ -2157,8 +2191,8 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::DisarmWatchdog { .. })),
-            "the stale watchdog must be disarmed"
+                .all(|effect| !matches!(effect, Effect::Apply(_))),
+            "a clean failure must never apply an inverse"
         );
     }
 
@@ -2176,24 +2210,29 @@ mod tests {
         // ...the applied outcome lands, which starts the countdown from now...
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: crate::application::ports::OperationOutcome::Applied {
-                    operation: op,
+            finished(
+                1,
+                crate::application::ports::OperationOutcome::Applied {
+                    operation: op.clone(),
                     steps: Vec::new(),
                 },
-            },
+                Some(rollback(1, &op, Some("fwdeck-rollback-test-1"))),
+            ),
         );
         // ...the operator walks away: two ticks reach the deadline → the
-        // watchdog is disarmed (we revert in-process) and the inverse applies.
+        // the inverse is sent with its guard id; the engine applies it before
+        // attempting the bounded watchdog disarm.
         update(&mut s, UiAction::Tick);
         let effects = update(&mut s, UiAction::Tick);
         match &effects[..] {
             [
-                Effect::DisarmWatchdog { .. },
-                Effect::Apply(FirewallOperation::AddPort { .. }),
-            ] => {}
-            other => panic!("expected disarm + inverse AddPort, got {other:?}"),
+                Effect::ApplyRollback {
+                    operation: FirewallOperation::AddPort { .. },
+                    watchdog_unit: Some(unit),
+                    ..
+                },
+            ] if unit == "fwdeck-rollback-test-1" => {}
+            other => panic!("expected correlated inverse AddPort, got {other:?}"),
         }
         assert!(s.pending_rollback.is_empty());
     }
@@ -2207,20 +2246,18 @@ mod tests {
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
         update(&mut s, UiAction::ApplyOperation(op.clone()));
-        assert!(
-            !s.pending_rollback.is_empty(),
-            "a risky op arms the rollback"
-        );
+        assert!(s.pending_rollback.is_empty());
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: crate::application::ports::OperationOutcome::PartiallyApplied {
-                    operation: op,
+            finished(
+                1,
+                crate::application::ports::OperationOutcome::PartiallyApplied {
+                    operation: op.clone(),
                     steps: Vec::new(),
                     rollback_hint: None,
                 },
-            },
+                Some(rollback(1, &op, None)),
+            ),
         );
         assert!(
             !s.pending_rollback.is_empty(),
@@ -2239,13 +2276,14 @@ mod tests {
         update(&mut s, UiAction::ApplyOperation(op.clone()));
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: crate::application::ports::OperationOutcome::Indeterminate {
-                    operation: op,
+            finished(
+                1,
+                crate::application::ports::OperationOutcome::Indeterminate {
+                    operation: op.clone(),
                     steps: Vec::new(),
                 },
-            },
+                Some(rollback(1, &op, None)),
+            ),
         );
         assert!(
             !s.pending_rollback.is_empty(),
@@ -2254,7 +2292,7 @@ mod tests {
     }
 
     #[test]
-    fn arming_emits_a_watchdog_with_the_grace_delay() {
+    fn applying_a_risky_operation_only_dispatches_to_the_engine() {
         let mut s = state();
         s.rollback_ticks = 40;
         let effects = update(
@@ -2265,13 +2303,8 @@ mod tests {
                 target: ConfigurationTarget::Runtime,
             }),
         );
-        let delay = effects.iter().find_map(|effect| match effect {
-            Effect::ArmWatchdog { delay_secs, .. } => Some(*delay_secs),
-            _ => None,
-        });
-        // The out-of-process net fires rollback_ticks/4 + 15s after arming, a
-        // grace margin past the in-process deadline.
-        assert_eq!(delay, Some(40 / 4 + 15), "watchdog grace delay formula");
+        assert!(matches!(effects.as_slice(), [Effect::Apply(_)]));
+        assert!(s.pending_rollback.is_empty());
     }
 
     #[test]
@@ -2314,18 +2347,39 @@ mod tests {
         );
         assert_eq!(s.staged.len(), 1, "plan stays staged until confirmed");
 
-        // Confirming arms the dead-man's switch (removing http is risky) and
-        // dispatches the batch, draining the staging area.
+        // Confirming dispatches the batch. The engine arms each risky item at
+        // its execution boundary, never all future items here.
         let effects = update(&mut s, UiAction::ConfirmAccept);
         assert!(
             effects.iter().any(|e| matches!(e, Effect::ApplyPlan(_))),
             "the confirmed plan is dispatched"
         );
-        assert!(
-            !s.pending_rollback.is_empty(),
-            "a risky plan arms the rollback, just like a single risky op"
-        );
+        assert!(s.pending_rollback.is_empty());
         assert!(s.staged.is_empty(), "plan drained after apply");
+    }
+
+    #[test]
+    fn confirmed_plan_does_not_prearm_future_operations() {
+        let mut s = state();
+        s.confirm_destructive = false;
+        let zone = ZoneName::parse("public").unwrap();
+        let plan = ["8080/tcp", "8081/tcp", "8082/tcp"]
+            .into_iter()
+            .map(|port| FirewallOperation::RemovePort {
+                zone: zone.clone(),
+                port: port.parse().unwrap(),
+                target: ConfigurationTarget::Runtime,
+            })
+            .collect::<Vec<_>>();
+        s.staged = plan;
+
+        let effects = apply_staged_plan(&mut s);
+
+        assert!(matches!(effects.as_slice(), [Effect::ApplyPlan(_)]));
+        assert!(
+            s.pending_rollback.is_empty(),
+            "future plan items must not become rollback candidates"
+        );
     }
 
     #[test]
@@ -2340,6 +2394,7 @@ mod tests {
         s.tick = 100;
         // Two independent countdowns: one already due, one still live.
         s.pending_rollback.push(PendingRollback {
+            id: crate::application::ports::RollbackGuardId::new(1),
             forward: remove("http"),
             inverse: remove("http").inverse().unwrap(),
             deadline_tick: 100,
@@ -2347,6 +2402,7 @@ mod tests {
             watchdog_unit: None,
         });
         s.pending_rollback.push(PendingRollback {
+            id: crate::application::ports::RollbackGuardId::new(2),
             forward: remove("https"),
             inverse: remove("https").inverse().unwrap(),
             deadline_tick: 500,
@@ -2357,7 +2413,7 @@ mod tests {
         assert_eq!(
             effects
                 .iter()
-                .filter(|e| matches!(e, Effect::Apply(_)))
+                .filter(|e| matches!(e, Effect::ApplyRollback { .. }))
                 .count(),
             1,
             "only the due countdown fires"
@@ -2433,9 +2489,9 @@ mod tests {
         for svc in ["mdns", "samba-client"] {
             update(
                 &mut s,
-                UiAction::OperationFinished {
-                    op_id: 1,
-                    outcome: OperationOutcome::Applied {
+                finished(
+                    1,
+                    OperationOutcome::Applied {
                         operation: FirewallOperation::AddService {
                             zone: ZoneName::parse("public").unwrap(),
                             service: ServiceName::parse(svc).unwrap(),
@@ -2447,7 +2503,8 @@ mod tests {
                             result: Ok(()),
                         }],
                     },
-                },
+                    None,
+                ),
             );
         }
         assert_eq!(
@@ -2529,9 +2586,9 @@ mod tests {
         let mut s = state();
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Applied {
+            finished(
+                1,
+                OperationOutcome::Applied {
                     operation: FirewallOperation::Reload,
                     steps: vec![StepReport {
                         target: "global",
@@ -2539,7 +2596,8 @@ mod tests {
                         result: Ok(()),
                     }],
                 },
-            },
+                None,
+            ),
         );
         assert_eq!(s.audit.len(), 1);
         assert_eq!(s.audit[0].status, "applied");

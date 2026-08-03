@@ -6,6 +6,59 @@ use std::time::Duration;
 
 use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus};
 
+/// Stable identity for one rollback guard. It is assigned immediately before
+/// the matching operation runs, so duplicate operations never share lifecycle
+/// state or a systemd unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RollbackGuardId(u64);
+
+impl RollbackGuardId {
+    /// Builds an id from the process-local monotonic sequence.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric value used in external guard names.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Failure while arming or disarming the out-of-process rollback guard.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RollbackGuardError {
+    /// The guard command could not be spawned or did not produce a result.
+    #[error("rollback guard process failed: {0}")]
+    Process(String),
+    /// The guard command exited unsuccessfully.
+    #[error("rollback guard command failed (exit {code}): {stderr}")]
+    CommandFailed {
+        /// Exit status, or `-1` when terminated by a signal.
+        code: i32,
+        /// Trimmed diagnostic output.
+        stderr: String,
+    },
+}
+
+/// Out-of-process dead-man's-switch port. The engine invokes `arm` immediately
+/// before each risky operation, including each individual staged-plan item.
+pub trait RollbackGuard: Send + Sync + 'static {
+    /// Arms a runtime inverse after `delay`. `Ok(None)` means this host cannot
+    /// provide an out-of-process guard; the UI still provides its in-process
+    /// countdown.
+    fn arm(
+        &self,
+        id: RollbackGuardId,
+        operation: &FirewallOperation,
+        delay: Duration,
+    ) -> impl Future<Output = Result<Option<String>, RollbackGuardError>> + Send;
+
+    /// Cancels an armed unit. Implementations must enforce a hard timeout.
+    fn disarm(&self, unit: &str) -> impl Future<Output = Result<(), RollbackGuardError>> + Send;
+}
+
 /// Errors crossing the backend boundary, categorized so the UI can react
 /// meaningfully instead of showing "command failed".
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

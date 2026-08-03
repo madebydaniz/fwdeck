@@ -7,6 +7,7 @@ pub mod firewalld;
 pub mod install;
 pub mod logs;
 pub mod process;
+pub mod rollback;
 pub mod snapshot_store;
 
 use std::io::Write;

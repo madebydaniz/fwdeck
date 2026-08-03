@@ -147,9 +147,7 @@ fn engine_event_action(event: EngineEvent) -> UiAction {
     match event {
         EngineEvent::RefreshStarted => UiAction::RefreshStarted,
         EngineEvent::RefreshFinished(result) => UiAction::RefreshCompleted(result),
-        EngineEvent::OperationFinished { op_id, outcome } => {
-            UiAction::OperationFinished { op_id, outcome }
-        }
+        EngineEvent::OperationFinished(result) => UiAction::OperationFinished(result),
         EngineEvent::PlanFinished { applied, remaining } => {
             UiAction::PlanFinished { applied, remaining }
         }
@@ -207,6 +205,28 @@ async fn execute_effect(
             // queue can't drop a mutation (rollbacks especially) or deadlock.
             if !send_request(engine, pending, EngineRequest::Apply(operation)).await {
                 state.toast(state::ToastKind::Error, "engine is gone — operation lost");
+            }
+        }
+        Effect::ApplyRollback {
+            id,
+            operation,
+            watchdog_unit,
+        } => {
+            if !send_request(
+                engine,
+                pending,
+                EngineRequest::Rollback {
+                    id,
+                    operation,
+                    watchdog_unit,
+                },
+            )
+            .await
+            {
+                state.toast(
+                    state::ToastKind::Error,
+                    "engine is gone — rollback not sent",
+                );
             }
         }
         Effect::ApplyPlan(operations) => {
@@ -285,109 +305,17 @@ async fn execute_effect(
                 Err(err) => state.toast(state::ToastKind::Error, format!("export failed: {err}")),
             }
         }
-        Effect::ArmWatchdog {
-            unit,
-            delay_secs,
-            args,
-        } => arm_watchdog(state, &unit, delay_secs, &args).await,
-        Effect::DisarmWatchdog { unit } => disarm_watchdog(&unit).await,
+        Effect::DisarmWatchdog { unit } => {
+            if let Err(error) = crate::infrastructure::rollback::disarm_watchdog(&unit).await {
+                tracing::warn!(unit, error = %error, "failed to disarm rollback watchdog");
+                state.toast(
+                    state::ToastKind::Warning,
+                    format!("could not disarm crash watchdog `{unit}`: {error}"),
+                );
+            }
+        }
     }
     ControlFlow::Continue(())
-}
-
-/// Builds the `systemd-run` argument vector for the rollback watchdog. Pure, so
-/// the exact flags are unit-tested. `firewall_cmd` is the resolved absolute
-/// binary; `inverse_args` is the runtime-inverse invocation to run on timeout.
-fn systemd_run_args(
-    unit: &str,
-    delay_secs: u64,
-    firewall_cmd: &std::path::Path,
-    inverse_args: &[String],
-) -> Vec<String> {
-    let mut args = vec![
-        "--collect".to_owned(),
-        format!("--unit={unit}"),
-        format!("--on-active={delay_secs}s"),
-        "--timer-property=AccuracySec=1s".to_owned(),
-        firewall_cmd.to_string_lossy().into_owned(),
-    ];
-    args.extend(inverse_args.iter().cloned());
-    args
-}
-
-/// The `systemctl` arguments that cancel a watchdog timer.
-fn disarm_args(unit: &str) -> [String; 2] {
-    ["stop".to_owned(), format!("{unit}.timer")]
-}
-
-/// Pre-arms the out-of-process rollback: a systemd transient timer that runs
-/// the runtime inverse even if this process dies. Needs root and `systemd-run`;
-/// silently degrades to in-process-only protection otherwise (with one toast).
-async fn arm_watchdog(state: &mut state::UiState, unit: &str, delay_secs: u64, args: &[String]) {
-    use crate::infrastructure::process::resolve_trusted;
-    let systemd_run = resolve_trusted("systemd-run");
-    let firewall_cmd = resolve_trusted("firewall-cmd");
-    // Both binaries must resolve to an absolute trusted path: the watchdog runs
-    // as root, so a relative name that could be resolved via a poisoned PATH
-    // must never be armed — fall back to in-process rollback instead.
-    if crate::infrastructure::process_uid() != 0
-        || !systemd_run.is_absolute()
-        || !firewall_cmd.is_absolute()
-    {
-        state.toast(
-            state::ToastKind::Info,
-            "watchdog unavailable (needs root + systemd) — in-process rollback only",
-        );
-        return;
-    }
-    // resolve_trusted absolute path + env_clear above: the sanctioned watchdog spawn.
-    #[allow(clippy::disallowed_methods)]
-    let mut command = tokio::process::Command::new(systemd_run);
-    command
-        .args(systemd_run_args(unit, delay_secs, &firewall_cmd, args))
-        .env_clear()
-        .env("LC_ALL", "C")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    match command.status().await {
-        Ok(status) if status.success() => {
-            tracing::info!(unit, delay_secs, "rollback watchdog armed");
-        }
-        Ok(status) => {
-            tracing::warn!(unit, ?status, "systemd-run refused the watchdog");
-            state.toast(
-                state::ToastKind::Warning,
-                "could not arm the crash watchdog — in-process rollback only",
-            );
-        }
-        Err(err) => {
-            tracing::warn!(unit, error = %err, "failed to spawn systemd-run");
-            state.toast(
-                state::ToastKind::Warning,
-                "could not arm the crash watchdog — in-process rollback only",
-            );
-        }
-    }
-}
-
-/// Cancels a previously armed watchdog timer (best-effort).
-async fn disarm_watchdog(unit: &str) {
-    use crate::infrastructure::process::resolve_trusted;
-    let systemctl = resolve_trusted("systemctl");
-    if !systemctl.is_absolute() {
-        return;
-    }
-    // resolve_trusted absolute path + env_clear: the sanctioned disarm spawn.
-    #[allow(clippy::disallowed_methods)]
-    let _ = tokio::process::Command::new(systemctl)
-        .args(disarm_args(unit))
-        .env_clear()
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
 }
 
 /// Fires every armed rollback inverse and waits (max ~5 s) for the engine to
@@ -398,25 +326,47 @@ async fn drain_rollbacks_on_exit(state: &mut state::UiState, engine: &mut Engine
         return;
     }
     let pending: Vec<_> = state.pending_rollback.drain(..).collect();
-    let mut awaiting = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut expected = std::collections::HashSet::new();
+    let mut completed = std::collections::HashSet::new();
     for rollback in pending.into_iter().rev() {
         tracing::warn!(operation = %rollback.description, "quit inside rollback window — reverting");
-        if let Some(unit) = rollback.watchdog_unit {
-            disarm_watchdog(&unit).await;
-        }
-        if engine
-            .requests
-            .send(EngineRequest::Apply(rollback.inverse))
-            .await
-            .is_ok()
-        {
-            awaiting += 1;
+        let id = rollback.id;
+        let mut request = Some(EngineRequest::Rollback {
+            id,
+            operation: rollback.inverse,
+            watchdog_unit: rollback.watchdog_unit,
+        });
+        loop {
+            tokio::select! {
+                permit = engine.requests.reserve() => {
+                    let Ok(permit) = permit else { return };
+                    if let Some(request) = request.take() {
+                        permit.send(request);
+                        expected.insert(id);
+                    }
+                    break;
+                }
+                event = engine.events.recv() => match event {
+                    Some(EngineEvent::OperationFinished(result)) => {
+                        if let Some(id) = result.completed_rollback {
+                            completed.insert(id);
+                        }
+                    }
+                    Some(_) => {}
+                    None => return,
+                },
+                () = tokio::time::sleep_until(deadline) => return,
+            }
         }
     }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while awaiting > 0 {
+    while !expected.is_subset(&completed) {
         match tokio::time::timeout_at(deadline, engine.events.recv()).await {
-            Ok(Some(EngineEvent::OperationFinished { .. })) => awaiting -= 1,
+            Ok(Some(EngineEvent::OperationFinished(result))) => {
+                if let Some(id) = result.completed_rollback {
+                    completed.insert(id);
+                }
+            }
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => break,
         }
@@ -461,8 +411,9 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{base64_encode, disarm_args, systemd_run_args};
+    use super::{base64_encode, drain_rollbacks_on_exit};
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -473,33 +424,73 @@ mod tests {
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
-    #[test]
-    fn watchdog_run_args_have_the_exact_flags_and_inverse() {
-        let args = systemd_run_args(
-            "fwdeck-rollback-42-7-0",
-            45,
-            std::path::Path::new("/usr/bin/firewall-cmd"),
-            &["--zone=public".to_owned(), "--add-service=ssh".to_owned()],
-        );
-        assert_eq!(
-            args.iter().map(String::as_str).collect::<Vec<_>>(),
-            [
-                "--collect",
-                "--unit=fwdeck-rollback-42-7-0",
-                "--on-active=45s",
-                "--timer-property=AccuracySec=1s",
-                "/usr/bin/firewall-cmd",
-                "--zone=public",
-                "--add-service=ssh",
-            ]
-        );
-    }
+    #[tokio::test]
+    async fn clean_exit_waits_for_the_matching_rollback_id() {
+        use crate::application::api::{EngineEvent, EngineHandle, EngineRequest, OperationResult};
+        use crate::application::ports::{OperationOutcome, RollbackGuardId};
+        use crate::config::Config;
+        use crate::domain::{ConfigurationTarget, FirewallOperation, ZoneName};
+        use crate::ui::state::{PendingRollback, UiState};
 
-    #[test]
-    fn disarm_stops_the_unit_timer() {
-        assert_eq!(
-            disarm_args("fwdeck-rollback-42-7-0"),
-            ["stop".to_owned(), "fwdeck-rollback-42-7-0.timer".to_owned()]
-        );
+        let forward = FirewallOperation::RemovePort {
+            zone: ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        let inverse = forward.inverse().unwrap();
+        let rollback_id = RollbackGuardId::new(42);
+        let mut state = UiState::new(&Config::default(), "test".to_owned(), false, None);
+        state.pending_rollback.push(PendingRollback {
+            id: rollback_id,
+            forward,
+            inverse: inverse.clone(),
+            deadline_tick: 100,
+            description: "test rollback".to_owned(),
+            watchdog_unit: None,
+        });
+
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
+        let mut engine = EngineHandle {
+            requests: request_tx,
+            events: event_rx,
+        };
+        let responder = tokio::spawn(async move {
+            let request = request_rx.recv().await.unwrap();
+            assert!(matches!(
+                request,
+                EngineRequest::Rollback { id, .. } if id == rollback_id
+            ));
+            event_tx
+                .send(EngineEvent::OperationFinished(Box::new(OperationResult {
+                    op_id: 1,
+                    outcome: OperationOutcome::Applied {
+                        operation: FirewallOperation::Reload,
+                        steps: Vec::new(),
+                    },
+                    rollback: None,
+                    guard_warning: None,
+                    completed_rollback: None,
+                })))
+                .await
+                .unwrap();
+            event_tx
+                .send(EngineEvent::OperationFinished(Box::new(OperationResult {
+                    op_id: 2,
+                    outcome: OperationOutcome::Applied {
+                        operation: inverse,
+                        steps: Vec::new(),
+                    },
+                    rollback: None,
+                    guard_warning: None,
+                    completed_rollback: Some(rollback_id),
+                })))
+                .await
+                .unwrap();
+        });
+
+        drain_rollbacks_on_exit(&mut state, &mut engine).await;
+        responder.await.unwrap();
+        assert!(state.pending_rollback.is_empty());
     }
 }
