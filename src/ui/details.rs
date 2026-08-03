@@ -5,7 +5,7 @@
 use crate::application::ports::{FirewallError, OperationOutcome};
 use crate::domain::{FirewallOperation, FirewallSnapshot, ZoneName};
 
-use super::views::ViewId;
+use super::views::{RowId, ViewId, ViewRow};
 
 /// Read-only rendering of live nftables rule-hit counters, busiest chain first.
 /// An empty list is normal — firewalld only counters some rules.
@@ -225,20 +225,21 @@ fn drift_services(
     drift_line(lines, "services", runtime, permanent, render);
 }
 
-/// Details for the selected row of the current view. The row's cells are the
-/// lookup keys — the same identity the table itself displays.
+/// Details for the selected typed row of the current view.
 #[must_use]
 pub fn for_row(
     view: ViewId,
     snapshot: &FirewallSnapshot,
     zone: &ZoneName,
-    row: &[String],
+    row: &ViewRow,
 ) -> Option<DetailsContent> {
     let cell = |index: usize| row.get(index).cloned().unwrap_or_default();
     match view {
         ViewId::Zones => {
-            let name = ZoneName::parse(row.first()?).ok()?;
-            for_zone(snapshot, &name)
+            let RowId::Zone(name) = &row.id else {
+                return None;
+            };
+            for_zone(snapshot, name)
         }
         ViewId::Services => Some(DetailsContent {
             title: format!("Service `{}`", cell(0)),
@@ -263,13 +264,9 @@ pub fn for_row(
             ],
         }),
         ViewId::RichRules => {
-            // Column 3 carries the verbatim rule — the row's identity.
-            let raw = row.get(3)?;
-            let details = snapshot
-                .runtime
-                .get(zone)
-                .or_else(|| snapshot.permanent.get(zone))?;
-            let rule = details.rich_rules.iter().find(|r| r.as_str() == raw)?;
+            let RowId::RichRule { rule, .. } = &row.id else {
+                return None;
+            };
             Some(DetailsContent {
                 title: "Rich rule".to_owned(),
                 lines: vec![
@@ -289,7 +286,12 @@ pub fn for_row(
             title: format!("Source {}", cell(0)),
             lines: vec![line("family", cell(1)), line("zone", cell(2))],
         }),
-        ViewId::IpSets => ipset_details(snapshot, row),
+        ViewId::IpSets => {
+            let RowId::IpSet { name } = &row.id else {
+                return None;
+            };
+            ipset_details(snapshot, name, row.scope()?)
+        }
         ViewId::Direct => Some(DetailsContent {
             title: "Direct rule (deprecated)".to_owned(),
             lines: vec![
@@ -319,14 +321,17 @@ pub fn for_row(
     }
 }
 
-fn ipset_details(snapshot: &FirewallSnapshot, row: &[String]) -> Option<DetailsContent> {
-    let name = crate::domain::IpSetName::parse(row.first()?).ok()?;
-    let runtime = snapshot.ipsets.runtime.get(&name);
-    let permanent = snapshot.ipsets.permanent.get(&name);
+fn ipset_details(
+    snapshot: &FirewallSnapshot,
+    name: &crate::domain::IpSetName,
+    scope: crate::ui::views::Scope,
+) -> Option<DetailsContent> {
+    let runtime = snapshot.ipsets.runtime.get(name);
+    let permanent = snapshot.ipsets.permanent.get(name);
     let info = runtime.or(permanent)?;
     let mut lines = vec![
         line("type", info.kind.clone()),
-        line("scope", row.get(3).map_or("", String::as_str)),
+        line("scope", scope.as_str()),
     ];
     if runtime.is_none_or(|value| value.entries.is_empty()) {
         lines.push(line("runtime entries", "none"));
@@ -763,13 +768,17 @@ mod tests {
         let snapshot = mock::sample().unwrap();
         let zone = snapshot.default_zone.clone();
         let raw = snapshot.runtime[&zone].rich_rules[0].as_str().to_owned();
-        let row = vec![
-            "ipv4".to_owned(),
-            "reject".to_owned(),
-            "both".to_owned(),
-            raw.clone(),
-        ];
-        let content = for_row(ViewId::RichRules, &snapshot, &zone, &row).unwrap();
+        let rows = crate::ui::views::rows(
+            ViewId::RichRules,
+            &snapshot,
+            &zone,
+            crate::domain::ConfigurationTarget::Runtime,
+        );
+        let row = rows
+            .iter()
+            .find(|row| matches!(&row.id, RowId::RichRule { rule, .. } if rule.as_str() == raw))
+            .unwrap();
+        let content = for_row(ViewId::RichRules, &snapshot, &zone, row).unwrap();
         let rule_line = content.lines.iter().find(|(k, _)| k == "rule").unwrap();
         assert_eq!(rule_line.1, raw);
     }
@@ -778,14 +787,14 @@ mod tests {
     fn service_row_details_show_ports_and_protocols_not_a_placeholder() {
         let snapshot = mock::sample().unwrap();
         let zone = snapshot.default_zone.clone();
-        // Cells as services_rows builds them: [name, ports, protocols, scope].
-        let row = vec![
-            "https".to_owned(),
-            "443/tcp".to_owned(),
-            "-".to_owned(),
-            "runtime".to_owned(),
-        ];
-        let content = for_row(ViewId::Services, &snapshot, &zone, &row).unwrap();
+        let rows = crate::ui::views::rows(
+            ViewId::Services,
+            &snapshot,
+            &zone,
+            crate::domain::ConfigurationTarget::Runtime,
+        );
+        let row = rows.iter().find(|row| row[0] == "https").unwrap();
+        let content = for_row(ViewId::Services, &snapshot, &zone, row).unwrap();
         let ports = content.lines.iter().find(|(k, _)| k == "ports").unwrap();
         assert_eq!(ports.1, "443/tcp");
         assert!(content.lines.iter().any(|(k, _)| k == "protocols"));

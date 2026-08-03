@@ -1,15 +1,12 @@
 //! Row-scoped actions on the visible table: activate, clone, mark, delete
 //! (single and bulk), and yank.
 
-use crate::domain::{
-    DeniedFlow, FirewallOperation, FirewallSnapshot, ForwardPort, InterfaceName, IpSetName,
-    PortSpec, RichRule, ServiceName, SourceAddress, ZoneName,
-};
+use crate::domain::{DeniedFlow, FirewallOperation, FirewallSnapshot, IpSetName, ZoneName};
 use crate::ui::action::{Effect, UiAction};
 use crate::ui::details;
 use crate::ui::overlays::{FormKind, Overlay};
 use crate::ui::state::{ToastKind, UiState};
-use crate::ui::views::ViewId;
+use crate::ui::views::{RowId, ViewId, ViewRow};
 
 use super::{blocked_read_only, request_operation, selected_row, target_for_scope, update};
 
@@ -19,29 +16,22 @@ use super::{blocked_read_only, request_operation, selected_row, target_for_scope
 /// Nothing is applied automatically; non-denied or portless rows just explain
 /// why they can't become a rule.
 pub(super) fn propose_from_log(state: &mut UiState) -> Vec<Effect> {
-    let Some(cells) = selected_row(state) else {
+    let Some(row) = selected_row(state) else {
         state.toast(ToastKind::Info, "no log line selected");
         return Vec::new();
     };
-    // Logs columns: [time, action, src, dst, dport, proto, iface].
-    let (Some(action), Some(src), Some(dport), Some(proto), Some(iface)) = (
-        cells.get(1),
-        cells.get(2),
-        cells.get(4),
-        cells.get(5),
-        cells.get(6),
-    ) else {
+    let RowId::Log { entry, .. } = &row.id else {
         state.toast(ToastKind::Info, "unexpected log row");
         return Vec::new();
     };
-    if action != "DROP" && action != "REJECT" {
+    if !entry.action.is_denied() {
         state.toast(
             ToastKind::Info,
             "select a denied (DROP/REJECT) row to propose an allow rule",
         );
         return Vec::new();
     }
-    let flow = match DeniedFlow::parse(src, dport, proto, iface) {
+    let flow = match DeniedFlow::parse(&entry.src, &entry.dport, &entry.proto, &entry.iface) {
         Ok(flow) => flow,
         Err(err) => {
             state.toast(ToastKind::Info, err.to_string());
@@ -78,20 +68,16 @@ fn zone_for_iface(snapshot: &FirewallSnapshot, iface: Option<&str>) -> Option<Zo
 pub(super) fn activate_row(state: &mut UiState) {
     if state.view == ViewId::Zones {
         let rows = state.visible_rows();
-        let Some(name) = rows
-            .get(state.view_state().selected)
-            .and_then(|row| row.first())
+        let Some(RowId::Zone(zone)) = rows.get(state.view_state().selected).map(|row| &row.id)
         else {
             return;
         };
-        if let Ok(zone) = ZoneName::parse(name) {
-            state.selected_zone = Some(zone.clone());
-            // Enter selects the zone AND opens its overview.
-            if let Some(snapshot) = state.snapshot.clone()
-                && let Some(content) = details::for_zone(&snapshot, &zone)
-            {
-                state.overlays.push(Overlay::Details(content));
-            }
+        state.selected_zone = Some(zone.clone());
+        // Enter selects the zone AND opens its overview.
+        if let Some(snapshot) = state.snapshot.clone()
+            && let Some(content) = details::for_zone(&snapshot, zone)
+        {
+            state.overlays.push(Overlay::Details(content));
         }
         return;
     }
@@ -112,20 +98,19 @@ pub(super) fn clone_entry(state: &mut UiState) -> Vec<Effect> {
     let Some(row) = selected_row(state) else {
         return Vec::new();
     };
-    let cell = |i: usize| row.get(i).cloned().unwrap_or_default();
-    let (kind, buffer) = match state.view {
-        ViewId::Services => (FormKind::AddService, cell(0)),
-        ViewId::Ports => (FormKind::AddPort, format!("{}/{}", cell(0), cell(1))),
-        ViewId::Forwarding => {
-            let Some(forward) = ForwardPort::from_parts(&cell(0), &cell(1), &cell(2), &cell(3))
-            else {
+    let (kind, buffer) = match &row.id {
+        RowId::Service { service, .. } => (FormKind::AddService, service.to_string()),
+        RowId::Port { port, .. } => (FormKind::AddPort, port.to_string()),
+        RowId::Forwarding { forward, .. } => (FormKind::AddForwardPort, forward.spec_string()),
+        RowId::RichRule { rule, .. } => (FormKind::AddRichRule, rule.to_string()),
+        RowId::Source { source, .. } => (FormKind::AddSource, source.to_string()),
+        RowId::IpSet { name } => {
+            let Some(kind) = row.ipset_kind() else {
+                state.toast(ToastKind::Warning, "selected IP set has no type metadata");
                 return Vec::new();
             };
-            (FormKind::AddForwardPort, forward.spec_string())
+            (FormKind::CreateIpSet, format!("{name} {kind}"))
         }
-        ViewId::RichRules => (FormKind::AddRichRule, cell(3)),
-        ViewId::Sources => (FormKind::AddSource, cell(0)),
-        ViewId::IpSets => (FormKind::CreateIpSet, format!("{} {}", cell(0), cell(1))),
         _ => {
             state.toast(ToastKind::Info, "nothing to clone on this view");
             return Vec::new();
@@ -135,7 +120,7 @@ pub(super) fn clone_entry(state: &mut UiState) -> Vec<Effect> {
 }
 
 pub(super) fn toggle_mark(state: &mut UiState) {
-    let Some(key) = selected_row(state).map(|row| crate::ui::state::row_key(&row)) else {
+    let Some(key) = selected_row(state).map(|row| row.id) else {
         return;
     };
     let marked = &mut state.view_state_mut().marked;
@@ -146,66 +131,33 @@ pub(super) fn toggle_mark(state: &mut UiState) {
 
 /// Builds a remove operation for one row of the current view (the shared body
 /// of single and bulk delete). `None` if the row can't be turned into one.
-fn remove_operation_for_row(state: &UiState, row: &[String]) -> Option<FirewallOperation> {
-    let zone = state.effective_zone()?;
-    let name = row.first().cloned().unwrap_or_default();
-    match state.view {
-        ViewId::Services => {
-            let service = ServiceName::parse(&name).ok()?;
-            let scope = row.get(3).map(String::as_str).unwrap_or_default();
-            Some(FirewallOperation::RemoveService {
-                zone,
-                service,
-                target: target_for_scope(scope, state.target),
-            })
-        }
-        ViewId::Ports => {
-            let spec = format!(
-                "{}/{}",
-                name,
-                row.get(1).map(String::as_str).unwrap_or_default()
-            );
-            let port = spec.parse::<PortSpec>().ok()?;
-            let scope = row.get(2).map(String::as_str).unwrap_or_default();
-            Some(FirewallOperation::RemovePort {
-                zone,
-                port,
-                target: target_for_scope(scope, state.target),
-            })
-        }
-        ViewId::RichRules => {
-            let rule = RichRule::parse(row.get(3).map(String::as_str).unwrap_or_default()).ok()?;
-            let scope = row.get(2).map(String::as_str).unwrap_or_default();
-            Some(FirewallOperation::RemoveRichRule {
-                zone,
-                rule,
-                target: target_for_scope(scope, state.target),
-            })
-        }
-        ViewId::Forwarding => {
-            let forward = ForwardPort::from_parts(
-                &name,
-                row.get(1).map(String::as_str).unwrap_or_default(),
-                row.get(2).map(String::as_str).unwrap_or_default(),
-                row.get(3).map(String::as_str).unwrap_or_default(),
-            )?;
-            let scope = row.get(4).map(String::as_str).unwrap_or_default();
-            Some(FirewallOperation::RemoveForwardPort {
-                zone,
-                forward,
-                target: target_for_scope(scope, state.target),
-            })
-        }
-        ViewId::Sources => {
-            let source = SourceAddress::parse(&name).ok()?;
-            let row_zone =
-                ZoneName::parse(row.get(2).map(String::as_str).unwrap_or_default()).ok()?;
-            Some(FirewallOperation::RemoveSource {
-                zone: row_zone,
-                source,
-                target: state.config_view,
-            })
-        }
+fn remove_operation_for_row(state: &UiState, row: &ViewRow) -> Option<FirewallOperation> {
+    match &row.id {
+        RowId::Service { zone, service } => Some(FirewallOperation::RemoveService {
+            zone: zone.clone(),
+            service: service.clone(),
+            target: target_for_scope(row.scope()?, state.target),
+        }),
+        RowId::Port { zone, port } => Some(FirewallOperation::RemovePort {
+            zone: zone.clone(),
+            port: *port,
+            target: target_for_scope(row.scope()?, state.target),
+        }),
+        RowId::RichRule { zone, rule } => Some(FirewallOperation::RemoveRichRule {
+            zone: zone.clone(),
+            rule: rule.clone(),
+            target: target_for_scope(row.scope()?, state.target),
+        }),
+        RowId::Forwarding { zone, forward } => Some(FirewallOperation::RemoveForwardPort {
+            zone: zone.clone(),
+            forward: forward.clone(),
+            target: target_for_scope(row.scope()?, state.target),
+        }),
+        RowId::Source { zone, source } => Some(FirewallOperation::RemoveSource {
+            zone: zone.clone(),
+            source: source.clone(),
+            target: row.configuration_target()?,
+        }),
         // Zones/IpSets/Interfaces stay single-delete only: bulk-removing zones
         // or interface bindings is riskier than the retyping it saves.
         _ => None,
@@ -221,39 +173,21 @@ pub(super) fn delete_entry(state: &mut UiState) -> Vec<Effect> {
         state.toast(ToastKind::Info, "nothing selected");
         return Vec::new();
     };
-    let name = row.first().cloned().unwrap_or_default();
     // The single-delete-only views (deliberately excluded from bulk delete);
     // everything else shares remove_operation_for_row with the bulk path, so
     // the column layout is interpreted in exactly one place.
-    let operation = match state.view {
-        ViewId::Interfaces => {
-            // Rows are global: the zone comes from the row, not the context.
-            let (Ok(interface), Ok(row_zone)) = (
-                InterfaceName::parse(&name),
-                ZoneName::parse(row.get(1).map(String::as_str).unwrap_or_default()),
-            ) else {
-                return Vec::new();
-            };
-            // The perspective (`t`) decides which binding this row represents.
-            FirewallOperation::RemoveInterface {
-                zone: row_zone,
-                interface,
-                target: state.config_view,
-            }
-        }
-        ViewId::Zones => {
-            let Ok(target_zone) = ZoneName::parse(&name) else {
-                return Vec::new();
-            };
-            FirewallOperation::DeleteZone { zone: target_zone }
-        }
-        ViewId::IpSets => {
-            let Ok(set_name) = IpSetName::parse(&name) else {
-                return Vec::new();
-            };
-            FirewallOperation::DeleteIpSet { name: set_name }
-        }
-        ViewId::Direct | ViewId::Logs => {
+    let operation = match &row.id {
+        RowId::Interface { zone, interface } => FirewallOperation::RemoveInterface {
+            zone: zone.clone(),
+            interface: interface.clone(),
+            target: match row.configuration_target() {
+                Some(target) => target,
+                None => return Vec::new(),
+            },
+        },
+        RowId::Zone(zone) => FirewallOperation::DeleteZone { zone: zone.clone() },
+        RowId::IpSet { name, .. } => FirewallOperation::DeleteIpSet { name: name.clone() },
+        RowId::Direct { .. } | RowId::Log { .. } => {
             state.toast(ToastKind::Info, "no delete action on this view");
             return Vec::new();
         }
@@ -270,8 +204,10 @@ pub(super) fn selected_ipset(state: &UiState) -> Option<IpSetName> {
     if state.view != ViewId::IpSets {
         return None;
     }
-    let name = selected_row(state)?.first()?.clone();
-    IpSetName::parse(&name).ok()
+    match selected_row(state)?.id {
+        RowId::IpSet { name, .. } => Some(name),
+        _ => None,
+    }
 }
 
 fn bulk_delete(state: &mut UiState) -> Vec<Effect> {
@@ -282,7 +218,7 @@ fn bulk_delete(state: &mut UiState) -> Vec<Effect> {
     let rows = state.visible_rows();
     let ops: Vec<FirewallOperation> = rows
         .iter()
-        .filter(|row| marked.contains(&crate::ui::state::row_key(row)))
+        .filter(|row| marked.contains(&row.id))
         .filter_map(|row| remove_operation_for_row(state, row))
         .collect();
     if ops.is_empty() {
@@ -310,4 +246,74 @@ pub(super) fn yank_row(state: &mut UiState) -> Vec<Effect> {
         .unwrap_or_else(|| row.join(" "));
     state.toast(ToastKind::Info, "row copied to clipboard");
     vec![Effect::CopyToClipboard(text)]
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::domain::{ConfigurationTarget, SourceAddress};
+    use crate::ui::views::Scope;
+
+    fn state() -> UiState {
+        UiState::new(&Config::default(), "test".to_owned(), false, None)
+    }
+
+    #[test]
+    fn remove_port_uses_typed_identity_not_rendered_cells() {
+        let zone = ZoneName::parse("public").unwrap();
+        let row = ViewRow::scoped(
+            RowId::Port {
+                zone: zone.clone(),
+                port: "8080/tcp".parse().unwrap(),
+            },
+            Scope::Runtime,
+            vec!["22".to_owned(), "udp".to_owned(), "permanent".to_owned()],
+        );
+        let operation = remove_operation_for_row(&state(), &row).unwrap();
+        match operation {
+            FirewallOperation::RemovePort {
+                zone: actual_zone,
+                port,
+                target,
+            } => {
+                assert_eq!(actual_zone, zone);
+                assert_eq!(port.to_string(), "8080/tcp");
+                assert_eq!(target, ConfigurationTarget::Runtime);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_source_uses_typed_binding_metadata_not_rendered_cells() {
+        let zone = ZoneName::parse("dmz").unwrap();
+        let source = SourceAddress::parse("203.0.113.0/24").unwrap();
+        let row = ViewRow::targeted(
+            RowId::Source {
+                zone: zone.clone(),
+                source: source.clone(),
+            },
+            ConfigurationTarget::Permanent,
+            vec![
+                "198.51.100.0/24".to_owned(),
+                "ipv4".to_owned(),
+                "public".to_owned(),
+            ],
+        );
+        let operation = remove_operation_for_row(&state(), &row).unwrap();
+        match operation {
+            FirewallOperation::RemoveSource {
+                zone: actual_zone,
+                source: actual_source,
+                target,
+            } => {
+                assert_eq!(actual_zone, zone);
+                assert_eq!(actual_source, source);
+                assert_eq!(target, ConfigurationTarget::Permanent);
+            }
+            other => panic!("unexpected operation: {other:?}"),
+        }
+    }
 }

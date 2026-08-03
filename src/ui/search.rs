@@ -6,7 +6,7 @@ use strum::IntoEnumIterator;
 
 use super::fuzzy;
 use super::state::UiState;
-use super::views::ViewId;
+use super::views::{RowId, ViewId};
 
 /// Overlay state for the global-search prompt: the query plus the selected
 /// index into the current hit list.
@@ -23,8 +23,8 @@ pub struct GlobalSearchState {
 pub struct SearchHit {
     /// The view the matching row belongs to.
     pub view: ViewId,
-    /// Row index into `all_rows(view)` — where selection jumps on execute.
-    pub row: usize,
+    /// Stable typed identity resolved again when the hit is executed.
+    pub row_id: RowId,
     /// The row's text, for display in the results list.
     pub label: String,
 }
@@ -42,7 +42,8 @@ pub fn hits(state: &UiState, query: &str) -> Vec<SearchHit> {
     }
     let mut scored: Vec<(i32, SearchHit)> = Vec::new();
     for view in ViewId::iter() {
-        for (row, cells) in state.all_rows(view).iter().enumerate() {
+        for row in state.all_rows(view) {
+            let cells = row.cells();
             let text = cells.join(" ");
             let trimmed = text.trim();
             if trimmed.is_empty() {
@@ -57,7 +58,7 @@ pub fn hits(state: &UiState, query: &str) -> Vec<SearchHit> {
                     score,
                     SearchHit {
                         view,
-                        row,
+                        row_id: row.id,
                         label: trimmed.to_owned(),
                     },
                 ));
