@@ -3,8 +3,8 @@
 
 use crate::domain::{
     ConfigurationTarget, FirewallOperation, ForwardPort, IcmpType, InterfaceName, IpProtocol,
-    IpSetEntry, IpSetName, PolicyName, PortSpec, RichRule, ServiceName, SourceAddress, ZoneName,
-    ZoneTarget,
+    IpSetEntry, IpSetName, PolicyName, PolicySetName, PortSpec, RichRule, ServiceName,
+    SourceAddress, ZoneName, ZoneTarget,
 };
 use crate::ui::action::Effect;
 use crate::ui::overlays::{DetailsContent, FormKind, Overlay};
@@ -169,6 +169,7 @@ pub(super) fn form_submit(state: &mut UiState) -> Vec<Effect> {
                 .map_err(|e| err_string(&e))
         }
         FormKind::AddPolicyService => parse_policy_service_form(&input, target),
+        FormKind::SetPolicySetState => parse_policy_set_state_form(&input, target),
         FormKind::AddServicePort | FormKind::RemoveServicePort => {
             parse_service_port_form(kind, &input)
         }
@@ -186,6 +187,32 @@ pub(super) fn form_submit(state: &mut UiState) -> Vec<Effect> {
     };
     state.overlays.pop(); // the confirmation replaces the form
     request_operation(state, operation)
+}
+
+/// Parses `<policy-set> <enable|disable>` into the documented administrative
+/// state mutation. Version and membership checks remain in domain validation.
+fn parse_policy_set_state_form(
+    input: &str,
+    target: ConfigurationTarget,
+) -> Result<FirewallOperation, String> {
+    let mut parts = input.split_whitespace();
+    let (Some(raw_set), Some(raw_state)) = (parts.next(), parts.next()) else {
+        return Err("expected: <policy-set> <enable|disable>".to_owned());
+    };
+    if parts.next().is_some() {
+        return Err("expected exactly: <policy-set> <enable|disable>".to_owned());
+    }
+    let policy_set = PolicySetName::parse(raw_set).map_err(|err| err.to_string())?;
+    let enabled = match raw_state.to_ascii_lowercase().as_str() {
+        "enable" | "enabled" | "on" => true,
+        "disable" | "disabled" | "off" => false,
+        _ => return Err("state must be `enable` or `disable`".to_owned()),
+    };
+    Ok(FirewallOperation::SetPolicySetEnabled {
+        policy_set,
+        enabled,
+        target,
+    })
 }
 
 /// Parses the ipset-entry form input against the selected ipset row.
@@ -306,4 +333,28 @@ fn explain_traffic(state: &mut UiState, input: &str) -> Vec<Effect> {
         lines,
     }));
     Vec::new()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_set_form_builds_a_scoped_typed_operation() {
+        let operation =
+            parse_policy_set_state_form("gateway enable", ConfigurationTarget::RuntimeAndPermanent)
+                .unwrap();
+        assert!(matches!(
+            operation,
+            FirewallOperation::SetPolicySetEnabled {
+                enabled: true,
+                target: ConfigurationTarget::RuntimeAndPermanent,
+                ..
+            }
+        ));
+        assert!(
+            parse_policy_set_state_form("gateway maybe", ConfigurationTarget::Runtime).is_err()
+        );
+    }
 }

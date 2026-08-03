@@ -1,6 +1,7 @@
 //! Pure domain types for firewalld state. No I/O, no async, no UI dependencies.
 
 pub mod address;
+pub mod capability;
 pub mod dependency;
 pub mod explain;
 pub mod ids;
@@ -9,6 +10,7 @@ pub mod mock;
 pub mod observation;
 pub mod operation;
 pub mod policy;
+pub mod policy_set;
 pub mod port;
 pub mod proposal;
 pub mod restore;
@@ -17,14 +19,16 @@ pub mod snapshot;
 pub mod zone;
 
 pub use address::{AddressFamily, IpSetEntry, SourceAddress};
+pub use capability::{FeatureSupport, FirewalldFeature};
 pub use dependency::{PolicyDependency, PolicyDependencyGraph, PolicyDependencyResource};
 pub use ids::{
-    IcmpType, InterfaceName, IpProtocol, IpSetName, PolicyName, ServiceName, ValidationError,
-    ZoneName,
+    IcmpType, InterfaceName, IpProtocol, IpSetName, PolicyName, PolicySetName, ServiceName,
+    ValidationError, ZoneName,
 };
 pub use observation::{ChainCounter, LogAction, LogEntry};
 pub use operation::{FirewallOperation, OperationError};
 pub use policy::{PolicyDetails, PolicyTarget};
+pub use policy_set::{PolicySetDetails, PolicySetScope, PolicySetState};
 pub use port::{ForwardPort, PortNumber, PortRange, PortSelector, PortSpec, Protocol};
 pub use proposal::{DeniedFlow, ProposalError};
 pub use rich_rule::RichRule;

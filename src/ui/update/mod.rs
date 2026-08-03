@@ -243,6 +243,15 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.toast(ToastKind::Info, "no data yet");
             }
         }
+        UiAction::BrowsePolicySets => {
+            if let Some(snapshot) = state.snapshot.clone() {
+                state
+                    .overlays
+                    .push(Overlay::Details(details::policy_set_browse(&snapshot)));
+            } else {
+                state.toast(ToastKind::Info, "no data yet");
+            }
+        }
         UiAction::ShowPolicyDependencies => {
             if let Some(snapshot) = state.snapshot.clone() {
                 state

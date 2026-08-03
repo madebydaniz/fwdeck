@@ -4,8 +4,8 @@
 
 use crate::application::ports::{FirewallError, OperationOutcome};
 use crate::domain::{
-    ConfigurationTarget, FirewallOperation, FirewallSnapshot, PolicyDependencyGraph,
-    PolicyDependencyResource, SnapshotSection, ZoneName,
+    ConfigurationTarget, FeatureSupport, FirewallOperation, FirewallSnapshot, FirewalldFeature,
+    PolicyDependencyGraph, PolicyDependencyResource, PolicySetDetails, SnapshotSection, ZoneName,
 };
 
 use super::views::{RowId, ViewId, ViewRow};
@@ -571,6 +571,56 @@ pub fn policy_browse(snapshot: &FirewallSnapshot) -> DetailsContent {
     }
 }
 
+/// Predefined policy sets derived from the ordinary policy snapshot because
+/// firewalld exposes set mutations but no separate set-list command.
+#[must_use]
+pub fn policy_set_browse(snapshot: &FirewallSnapshot) -> DetailsContent {
+    let support = FirewalldFeature::PolicySets.support_for(snapshot.status.version.as_deref());
+    let mut lines = vec![line(
+        "capability",
+        match support {
+            FeatureSupport::Supported => "supported (firewalld 2.4+)",
+            FeatureSupport::Unsupported => "unavailable — requires firewalld 2.4+",
+            FeatureSupport::Unknown => "unknown — firewalld version was not reported",
+        },
+    )];
+    if support != FeatureSupport::Supported {
+        return DetailsContent {
+            title: "Policy sets".to_owned(),
+            lines,
+        };
+    }
+    if !snapshot.section_is_complete(
+        SnapshotSection::Policies,
+        ConfigurationTarget::RuntimeAndPermanent,
+    ) {
+        lines.push(line(
+            "state",
+            "unknown — the latest policy snapshot is incomplete",
+        ));
+        return DetailsContent {
+            title: "Policy sets".to_owned(),
+            lines,
+        };
+    }
+    for set in PolicySetDetails::known(snapshot) {
+        lines.push(line(&set.name.to_string(), "predefined upstream set"));
+        lines.push(line("  runtime", set.runtime.state.label()));
+        lines.push(line("  permanent", set.permanent.state.label()));
+        lines.push(line("  runtime members", join(&set.runtime.members)));
+        lines.push(line("  permanent members", join(&set.permanent.members)));
+    }
+    lines.push(line("", ""));
+    lines.push(line(
+        "manage",
+        "palette → Set policy-set state → `gateway enable|disable`",
+    ));
+    DetailsContent {
+        title: "Policy sets".to_owned(),
+        lines,
+    }
+}
+
 /// Scoped policy dependency edges with health derived from the same snapshot.
 #[must_use]
 pub fn policy_dependency_graph(snapshot: &FirewallSnapshot) -> DetailsContent {
@@ -1101,6 +1151,38 @@ mod tests {
                 .lines
                 .iter()
                 .any(|(key, value)| { key == "dependencies" && value.contains("all referenced") })
+        );
+    }
+
+    #[test]
+    fn policy_set_workspace_reports_capability_and_scoped_state() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot.status.version = Some("2.4.2".to_owned());
+        for member in crate::domain::policy_set::GATEWAY_POLICY_MEMBERS {
+            let name = crate::domain::PolicyName::parse(member).unwrap();
+            let mut policy = crate::domain::PolicyDetails::empty(name.clone());
+            policy.disabled = true;
+            snapshot
+                .policies
+                .runtime
+                .insert(name.clone(), policy.clone());
+            snapshot.policies.permanent.insert(name, policy);
+        }
+
+        let content = policy_set_browse(&snapshot);
+        assert_eq!(content.title, "Policy sets");
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| key == "capability" && value.contains("supported"))
+        );
+        assert!(content.lines.iter().any(|(key, _)| key == "gateway"));
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| key == "  runtime" && value == "disabled")
         );
     }
 }

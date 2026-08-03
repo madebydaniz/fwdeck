@@ -385,6 +385,20 @@ pub fn plan_in(
             *target,
             timeout,
         ),
+        FirewallOperation::SetPolicySetEnabled {
+            policy_set,
+            enabled,
+            target,
+        } => policy_set_op(
+            policy_set.as_str(),
+            if *enabled {
+                "--remove-disable"
+            } else {
+                "--add-disable"
+            },
+            *target,
+            timeout,
+        ),
         FirewallOperation::CreateIpSet { name, kind } => permanent_op(
             &[&format!("--new-ipset={name}"), &format!("--type={kind}")],
             timeout,
@@ -757,6 +771,21 @@ fn policy_op(
     scoped_op(&format!("--policy={policy}"), argument, target, timeout)
 }
 
+/// Policy-set operation (`--policy-set=<name> <argument>`).
+fn policy_set_op(
+    policy_set: &str,
+    argument: &str,
+    target: ConfigurationTarget,
+    timeout: Duration,
+) -> Vec<PlannedCommand> {
+    scoped_op(
+        &format!("--policy-set={policy_set}"),
+        argument,
+        target,
+        timeout,
+    )
+}
+
 /// IP-set-scoped operation (`--ipset=<name> <argument>`).
 fn ipset_entry_op(
     name: &str,
@@ -771,7 +800,7 @@ fn ipset_entry_op(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::domain::{ServiceName, ZoneName};
+    use crate::domain::{PolicySetName, ServiceName, ZoneName};
     use crate::infrastructure::process::DEFAULT_TIMEOUT;
 
     fn args_of(planned: &[PlannedCommand]) -> Vec<Vec<String>> {
@@ -814,6 +843,43 @@ mod tests {
             vec![vec![
                 "--zone=dmz".to_owned(),
                 "--remove-port=8080/tcp".to_owned()
+            ]]
+        );
+    }
+
+    #[test]
+    fn policy_set_plans_runtime_then_permanent_with_documented_argv() {
+        let operation = FirewallOperation::SetPolicySetEnabled {
+            policy_set: PolicySetName::parse("gateway").unwrap(),
+            enabled: true,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+        assert_eq!(
+            args_of(&plan(&operation, DEFAULT_TIMEOUT)),
+            vec![
+                vec![
+                    "--policy-set=gateway".to_owned(),
+                    "--remove-disable".to_owned(),
+                ],
+                vec![
+                    "--permanent".to_owned(),
+                    "--policy-set=gateway".to_owned(),
+                    "--remove-disable".to_owned(),
+                ],
+            ]
+        );
+
+        let disable = FirewallOperation::SetPolicySetEnabled {
+            policy_set: PolicySetName::parse("gateway").unwrap(),
+            enabled: false,
+            target: ConfigurationTarget::Permanent,
+        };
+        assert_eq!(
+            args_of(&plan(&disable, DEFAULT_TIMEOUT)),
+            vec![vec![
+                "--permanent".to_owned(),
+                "--policy-set=gateway".to_owned(),
+                "--add-disable".to_owned(),
             ]]
         );
     }
