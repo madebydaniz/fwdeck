@@ -3,6 +3,7 @@
 //! as rollback metadata (ADR-3).
 
 use super::address::{IpSetEntry, SourceAddress};
+use super::dependency::{PolicyDependencyGraph, PolicyDependencyResource};
 use super::ids::IpProtocol;
 use super::ids::{IcmpType, InterfaceName, IpSetName, PolicyName, ServiceName, ZoneName};
 use super::policy::PolicyTarget;
@@ -1838,6 +1839,33 @@ impl FirewallOperation {
                         "`{zone}` is the default zone — set another default first"
                     )));
                 }
+                if !snapshot
+                    .section_is_complete(SnapshotSection::Policies, ConfigurationTarget::Permanent)
+                {
+                    return Err(OperationError::Invalid(
+                        "cannot safely delete a zone while permanent policy dependencies are unknown"
+                            .to_owned(),
+                    ));
+                }
+                let graph =
+                    PolicyDependencyGraph::from_snapshot(snapshot, ConfigurationTarget::Permanent);
+                let references: Vec<_> = graph
+                    .references_zone(zone.as_str())
+                    .map(|dependency| {
+                        let direction = match &dependency.resource {
+                            PolicyDependencyResource::IngressZone(_) => "ingress",
+                            PolicyDependencyResource::EgressZone(_) => "egress",
+                            PolicyDependencyResource::Service(_) => "service",
+                        };
+                        format!("{} ({direction})", dependency.policy)
+                    })
+                    .collect();
+                if !references.is_empty() {
+                    return Err(OperationError::Invalid(format!(
+                        "zone `{zone}` is referenced by permanent policies: {}; remove those policy edges first",
+                        references.join(", ")
+                    )));
+                }
             }
             Self::AddIcmpBlock { zone, icmp, .. } => membership(
                 zone,
@@ -1874,12 +1902,48 @@ impl FirewallOperation {
                     )));
                 }
             }
-            // Service definition details are fetched only for referenced
-            // services, so firewalld gives the final word for service internals.
-            Self::DeleteService { .. }
-            | Self::AddServicePort { .. }
-            | Self::RemoveServicePort { .. }
-            | Self::Reload => {}
+            Self::DeleteService { service } => {
+                let dependencies_known = snapshot
+                    .section_is_complete(SnapshotSection::Zones, ConfigurationTarget::Permanent)
+                    && snapshot.section_is_complete(
+                        SnapshotSection::Policies,
+                        ConfigurationTarget::Permanent,
+                    );
+                if !dependencies_known {
+                    return Err(OperationError::Invalid(
+                        "cannot safely delete a service while permanent zone/policy dependencies are unknown"
+                            .to_owned(),
+                    ));
+                }
+                let zones: Vec<_> = snapshot
+                    .permanent
+                    .iter()
+                    .filter(|(_, details)| details.services.contains(service))
+                    .map(|(zone, _)| zone.to_string())
+                    .collect();
+                let graph =
+                    PolicyDependencyGraph::from_snapshot(snapshot, ConfigurationTarget::Permanent);
+                let policies: Vec<_> = graph
+                    .references_service(service)
+                    .map(|dependency| dependency.policy.to_string())
+                    .collect();
+                if !zones.is_empty() || !policies.is_empty() {
+                    let mut references = Vec::new();
+                    if !zones.is_empty() {
+                        references.push(format!("zones: {}", zones.join(", ")));
+                    }
+                    if !policies.is_empty() {
+                        references.push(format!("policies: {}", policies.join(", ")));
+                    }
+                    return Err(OperationError::Invalid(format!(
+                        "service `{service}` is still referenced by {}; remove those references first",
+                        references.join("; ")
+                    )));
+                }
+            }
+            // Service definition internals are fetched only for referenced
+            // services, so firewalld gives the final word for port edits.
+            Self::AddServicePort { .. } | Self::RemoveServicePort { .. } | Self::Reload => {}
         }
         Ok(())
     }
@@ -2430,6 +2494,87 @@ mod tests {
             FirewallOperation::DeleteZone { zone: zone("home") }
                 .validate(&snapshot)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn zone_deletion_is_blocked_by_permanent_policy_dependencies() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot
+            .policies
+            .permanent
+            .values_mut()
+            .next()
+            .unwrap()
+            .ingress_zones
+            .push("home".to_owned());
+
+        let error = FirewallOperation::DeleteZone { zone: zone("home") }
+            .validate(&snapshot)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("mypolicy (ingress)"));
+        assert!(
+            error
+                .to_string()
+                .contains("remove those policy edges first")
+        );
+    }
+
+    #[test]
+    fn service_deletion_reports_zone_and_policy_dependencies() {
+        let snapshot = mock::sample().unwrap();
+
+        let policy_error = FirewallOperation::DeleteService {
+            service: service("http"),
+        }
+        .validate(&snapshot)
+        .unwrap_err();
+        assert!(policy_error.to_string().contains("policies: mypolicy"));
+
+        let zone_error = FirewallOperation::DeleteService {
+            service: service("ssh"),
+        }
+        .validate(&snapshot)
+        .unwrap_err();
+        assert!(zone_error.to_string().contains("zones:"));
+        assert!(zone_error.to_string().contains("public"));
+
+        assert!(
+            FirewallOperation::DeleteService {
+                service: service("mysql")
+            }
+            .validate(&snapshot)
+            .is_ok(),
+            "an unreferenced service must remain deletable"
+        );
+    }
+
+    #[test]
+    fn destructive_dependency_checks_fail_closed_on_degraded_data() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot
+            .degraded
+            .push(super::super::snapshot::DegradedSection::new(
+                SnapshotSection::Policies,
+                Some(ConfigurationTarget::Permanent),
+                "permission denied",
+            ));
+
+        let zone_error = FirewallOperation::DeleteZone { zone: zone("home") }
+            .validate(&snapshot)
+            .unwrap_err();
+        assert!(zone_error.to_string().contains("dependencies are unknown"));
+
+        let service_error = FirewallOperation::DeleteService {
+            service: service("mysql"),
+        }
+        .validate(&snapshot)
+        .unwrap_err();
+        assert!(
+            service_error
+                .to_string()
+                .contains("zone/policy dependencies are unknown")
         );
     }
 

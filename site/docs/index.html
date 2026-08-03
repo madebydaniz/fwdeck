@@ -461,6 +461,11 @@ masquerade, rich rules, and dependency health). Press <kbd>a</kbd> to add a
 service to the selected policy, or to create the first policy when the view is
 empty. Press <kbd>d</kbd> to review deletion of the selected permanent policy.
 All changes still use the normal validation and confirmation flow.</p>
+<p><strong>Dependency safety</strong> — open <kbd>:</kbd> → <em>Policy
+dependency graph</em> to inspect runtime and permanent ingress, egress, and
+service edges, including missing or unknown references. FWDeck blocks permanent
+zone or service deletion while a policy still references it, and fails closed
+when the relevant dependency data could not be read.</p>
 <p>Policies are stateful and unidirectional: an ingress → egress policy does
 not automatically govern the reverse direction. See the
 <a href="https://firewalld.org/documentation/man-pages/firewalld.policies">official firewalld policy model</a>.</p>

@@ -326,6 +326,18 @@ mod tests {
     }
 
     #[test]
+    fn policy_dependency_graph_overlay_renders() {
+        let mut s = state();
+        update(&mut s, UiAction::ShowPolicyDependencies);
+        let content = draw(&mut s, 120, 36);
+        assert!(content.contains("Policy dependency graph"));
+        assert!(content.contains("public"));
+        assert!(content.contains("mypolicy"));
+        assert!(content.contains("http"));
+        assert!(content.contains("pseudo-zone"));
+    }
+
+    #[test]
     fn direct_view_shows_deprecation_warning() {
         let mut s = state();
         update(
