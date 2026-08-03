@@ -4,10 +4,183 @@
 use ratatui::layout::Constraint;
 use strum::{EnumIter, FromRepr};
 
-use crate::domain::{ConfigurationTarget, FirewallSnapshot, ZoneName};
+use crate::domain::{
+    ConfigurationTarget, FirewallSnapshot, ForwardPort, InterfaceName, IpSetName, LogEntry,
+    PortSpec, RichRule, ServiceName, SourceAddress, ZoneName,
+};
 
 /// Number of views; sizes the per-view state array in `UiState`.
 pub const VIEW_COUNT: usize = 10;
+
+/// Stable, typed identity and mutation payload for one table row.
+///
+/// Zone-scoped variants carry their owning zone so a mark created in one zone
+/// can never target a same-looking row in another zone. Mutable presence and
+/// configuration metadata live on [`ViewRow`], keeping identity stable across
+/// refreshes. No mutation path needs to parse rendered cells back into domain
+/// values.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RowId {
+    /// A firewalld zone.
+    Zone(ZoneName),
+    /// A zone service.
+    Service {
+        /// Owning zone.
+        zone: ZoneName,
+        /// Service name.
+        service: ServiceName,
+    },
+    /// A zone port.
+    Port {
+        /// Owning zone.
+        zone: ZoneName,
+        /// Typed port specification.
+        port: PortSpec,
+    },
+    /// A zone forwarding rule.
+    Forwarding {
+        /// Owning zone.
+        zone: ZoneName,
+        /// Typed forwarding rule.
+        forward: ForwardPort,
+    },
+    /// A verbatim rich rule.
+    RichRule {
+        /// Owning zone.
+        zone: ZoneName,
+        /// Validated verbatim rule.
+        rule: RichRule,
+    },
+    /// An interface binding.
+    Interface {
+        /// Bound zone.
+        zone: ZoneName,
+        /// Interface name.
+        interface: InterfaceName,
+    },
+    /// A source binding.
+    Source {
+        /// Bound zone.
+        zone: ZoneName,
+        /// Typed source binding.
+        source: SourceAddress,
+    },
+    /// A named IP set.
+    IpSet {
+        /// IP set name.
+        name: IpSetName,
+    },
+    /// A read-only direct rule. The ordinal distinguishes duplicate text.
+    Direct {
+        /// Position in the snapshot's direct-rule list.
+        ordinal: usize,
+        /// Original rule text.
+        rule: String,
+    },
+    /// A parsed log entry with a session-unique sequence.
+    Log {
+        /// Monotonic sequence assigned when the UI receives the entry.
+        sequence: u64,
+        /// Typed observation used by proposal actions.
+        entry: LogEntry,
+    },
+}
+
+/// One typed table row: stable identity plus presentation-only cells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewRow {
+    /// Typed identity used by selection, marking, and actions.
+    pub id: RowId,
+    metadata: RowMetadata,
+    cells: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowMetadata {
+    None,
+    Scope(Scope),
+    ConfigurationTarget(ConfigurationTarget),
+    IpSet { scope: Scope, kind: String },
+}
+
+impl ViewRow {
+    pub(super) fn new(id: RowId, cells: Vec<String>) -> Self {
+        Self {
+            id,
+            metadata: RowMetadata::None,
+            cells,
+        }
+    }
+
+    pub(super) fn scoped(id: RowId, scope: Scope, cells: Vec<String>) -> Self {
+        Self {
+            id,
+            metadata: RowMetadata::Scope(scope),
+            cells,
+        }
+    }
+
+    pub(super) fn targeted(
+        id: RowId,
+        configuration_target: ConfigurationTarget,
+        cells: Vec<String>,
+    ) -> Self {
+        Self {
+            id,
+            metadata: RowMetadata::ConfigurationTarget(configuration_target),
+            cells,
+        }
+    }
+
+    fn ipset(id: RowId, scope: Scope, kind: String, cells: Vec<String>) -> Self {
+        Self {
+            id,
+            metadata: RowMetadata::IpSet { scope, kind },
+            cells,
+        }
+    }
+
+    /// Presentation cells rendered and searched by the UI.
+    #[must_use]
+    pub fn cells(&self) -> &[String] {
+        &self.cells
+    }
+
+    /// Runtime/permanent presence metadata for scoped resource rows.
+    #[must_use]
+    pub const fn scope(&self) -> Option<Scope> {
+        match &self.metadata {
+            RowMetadata::Scope(scope) | RowMetadata::IpSet { scope, .. } => Some(*scope),
+            RowMetadata::None | RowMetadata::ConfigurationTarget(_) => None,
+        }
+    }
+
+    /// Configuration perspective represented by a binding row.
+    #[must_use]
+    pub const fn configuration_target(&self) -> Option<ConfigurationTarget> {
+        match &self.metadata {
+            RowMetadata::ConfigurationTarget(target) => Some(*target),
+            RowMetadata::None | RowMetadata::Scope(_) | RowMetadata::IpSet { .. } => None,
+        }
+    }
+
+    /// IP set type used when cloning the selected definition.
+    #[must_use]
+    pub fn ipset_kind(&self) -> Option<&str> {
+        match &self.metadata {
+            RowMetadata::IpSet { kind, .. } => Some(kind),
+            RowMetadata::None | RowMetadata::Scope(_) | RowMetadata::ConfigurationTarget(_) => None,
+        }
+    }
+}
+
+impl std::ops::Deref for ViewRow {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.cells
+    }
+}
 
 /// The main table's views, in sidebar/digit-key order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, FromRepr)]
@@ -189,10 +362,9 @@ fn zone_slices<'a, T>(
     )
 }
 
-/// Which configuration(s) a row's item lives in. The typed form of the SCOPE
-/// column: rows stringify via [`Scope::as_str`], and mutation code parses the
-/// cell back with [`Scope::parse`] instead of string-matching ad hoc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which configuration(s) a row's item lives in. The typed form is carried in
+/// [`ViewRow`]; [`Scope::as_str`] is presentation-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
     /// Present in runtime and permanent.
     Both,
@@ -219,18 +391,6 @@ impl Scope {
         }
     }
 
-    /// Parses a SCOPE cell back; unknown text maps to [`Scope::None`].
-    #[must_use]
-    pub fn parse(cell: &str) -> Self {
-        match cell {
-            "both" => Self::Both,
-            "runtime" => Self::Runtime,
-            "permanent" => Self::Permanent,
-            "drift" => Self::Drift,
-            _ => Self::None,
-        }
-    }
-
     /// The mutation target this scope narrows to, or `default` when the item
     /// exists in both configurations (or the scope is unknown).
     #[must_use]
@@ -244,14 +404,13 @@ impl Scope {
 }
 
 /// SCOPE cell text for an item based on which configurations contain it.
-fn scope<T: PartialEq>(item: &T, runtime: &[T], permanent: &[T]) -> &'static str {
+fn scope<T: PartialEq>(item: &T, runtime: &[T], permanent: &[T]) -> Scope {
     match (runtime.contains(item), permanent.contains(item)) {
         (true, true) => Scope::Both,
         (true, false) => Scope::Runtime,
         (false, true) => Scope::Permanent,
         (false, false) => Scope::None,
     }
-    .as_str()
 }
 
 /// Sorted, deduplicated union of two slices.
@@ -279,7 +438,7 @@ pub fn rows(
     snap: &FirewallSnapshot,
     zone: &ZoneName,
     config: ConfigurationTarget,
-) -> Vec<Vec<String>> {
+) -> Vec<ViewRow> {
     match view {
         ViewId::Zones => zones_rows(snap, config),
         ViewId::Services => services_rows(snap, zone),
@@ -295,7 +454,7 @@ pub fn rows(
     }
 }
 
-fn ipsets_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<Vec<String>> {
+fn ipsets_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewRow> {
     let mut names: Vec<_> = snap
         .ipsets
         .runtime
@@ -321,20 +480,26 @@ fn ipsets_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<Vec<
                 (None, Some(_)) => Scope::Permanent,
                 (None, None) => Scope::None,
             };
-            Some(vec![
-                name.to_string(),
+            Some(ViewRow::ipset(
+                RowId::IpSet { name: name.clone() },
+                scope,
                 info.kind.clone(),
-                info.entries.len().to_string(),
-                scope.as_str().to_owned(),
-            ])
+                vec![
+                    name.to_string(),
+                    info.kind.clone(),
+                    info.entries.len().to_string(),
+                    scope.as_str().to_owned(),
+                ],
+            ))
         })
         .collect()
 }
 
-fn direct_rows(snap: &FirewallSnapshot) -> Vec<Vec<String>> {
+fn direct_rows(snap: &FirewallSnapshot) -> Vec<ViewRow> {
     snap.direct_rules
         .iter()
-        .map(|rule| {
+        .enumerate()
+        .map(|(ordinal, rule)| {
             let mut tokens = rule.split_whitespace();
             let mut cell = |_: usize| tokens.next().unwrap_or("").to_owned();
             let family = cell(0);
@@ -342,12 +507,18 @@ fn direct_rows(snap: &FirewallSnapshot) -> Vec<Vec<String>> {
             let chain = cell(2);
             let priority = cell(3);
             let args = tokens.collect::<Vec<_>>().join(" ");
-            vec![family, table, chain, priority, args]
+            ViewRow::new(
+                RowId::Direct {
+                    ordinal,
+                    rule: rule.clone(),
+                },
+                vec![family, table, chain, priority, args],
+            )
         })
         .collect()
 }
 
-fn zones_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<Vec<String>> {
+fn zones_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewRow> {
     snap.zone_names()
         .into_iter()
         .map(|name| {
@@ -368,31 +539,35 @@ fn zones_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<Vec<S
                     )
                 },
             );
-            vec![
-                name.to_string(),
-                if snap.is_zone_synced(name) { "" } else { "≠" }.to_owned(),
-                if snap.is_active(name) { "yes" } else { "" }.to_owned(),
-                if *name == snap.default_zone {
-                    "yes"
-                } else {
-                    ""
-                }
-                .to_owned(),
-                target,
-                interfaces,
-                sources,
-                services.to_string(),
-                if masquerade { "yes" } else { "" }.to_owned(),
-            ]
+            ViewRow::new(
+                RowId::Zone(name.clone()),
+                vec![
+                    name.to_string(),
+                    if snap.is_zone_synced(name) { "" } else { "≠" }.to_owned(),
+                    if snap.is_active(name) { "yes" } else { "" }.to_owned(),
+                    if *name == snap.default_zone {
+                        "yes"
+                    } else {
+                        ""
+                    }
+                    .to_owned(),
+                    target,
+                    interfaces,
+                    sources,
+                    services.to_string(),
+                    if masquerade { "yes" } else { "" }.to_owned(),
+                ],
+            )
         })
         .collect()
 }
 
-fn services_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<Vec<String>> {
+fn services_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
     let (runtime, permanent) = zone_slices(snap, zone, |z| z.services.as_slice());
     union(runtime, permanent)
         .into_iter()
         .map(|service| {
+            let scope = scope(service, runtime, permanent);
             let definition = snap.service_definitions.get(service);
             let ports = definition
                 .map(|d| join(&d.ports))
@@ -402,100 +577,148 @@ fn services_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<Vec<String>> {
                 .map(|d| d.protocols.join(","))
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| "-".to_owned());
-            vec![
-                service.to_string(),
-                ports,
-                protocols,
-                scope(service, runtime, permanent).to_owned(),
-            ]
+            ViewRow::scoped(
+                RowId::Service {
+                    zone: zone.clone(),
+                    service: service.clone(),
+                },
+                scope,
+                vec![
+                    service.to_string(),
+                    ports,
+                    protocols,
+                    scope.as_str().to_owned(),
+                ],
+            )
         })
         .collect()
 }
 
-fn ports_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<Vec<String>> {
+fn ports_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
     let (runtime, permanent) = zone_slices(snap, zone, |z| z.ports.as_slice());
     union(runtime, permanent)
         .into_iter()
         .map(|port| {
-            vec![
-                port.port.to_string(),
-                port.protocol.to_string(),
-                scope(port, runtime, permanent).to_owned(),
-            ]
+            let scope = scope(port, runtime, permanent);
+            ViewRow::scoped(
+                RowId::Port {
+                    zone: zone.clone(),
+                    port: *port,
+                },
+                scope,
+                vec![
+                    port.port.to_string(),
+                    port.protocol.to_string(),
+                    scope.as_str().to_owned(),
+                ],
+            )
         })
         .collect()
 }
 
-fn forwarding_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<Vec<String>> {
+fn forwarding_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
     let (runtime, permanent) = zone_slices(snap, zone, |z| z.forward_ports.as_slice());
-    let mut all: Vec<&crate::domain::ForwardPort> =
-        runtime.iter().chain(permanent.iter()).collect();
-    all.dedup_by(|a, b| a == b);
-    all.into_iter()
+    union(runtime, permanent)
+        .into_iter()
         .map(|fwd| {
-            vec![
-                fwd.port.to_string(),
-                fwd.protocol.to_string(),
-                fwd.to_port.map(|p| p.to_string()).unwrap_or_default(),
-                fwd.to_addr.map(|a| a.to_string()).unwrap_or_default(),
-                scope(fwd, runtime, permanent).to_owned(),
-            ]
+            let scope = scope(fwd, runtime, permanent);
+            ViewRow::scoped(
+                RowId::Forwarding {
+                    zone: zone.clone(),
+                    forward: fwd.clone(),
+                },
+                scope,
+                vec![
+                    fwd.port.to_string(),
+                    fwd.protocol.to_string(),
+                    fwd.to_port.map(|p| p.to_string()).unwrap_or_default(),
+                    fwd.to_addr.map(|a| a.to_string()).unwrap_or_default(),
+                    scope.as_str().to_owned(),
+                ],
+            )
         })
         .collect()
 }
 
-fn rich_rules_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<Vec<String>> {
+fn rich_rules_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
     let (runtime, permanent) = zone_slices(snap, zone, |z| z.rich_rules.as_slice());
     union(runtime, permanent)
         .into_iter()
         .map(|rule| {
-            vec![
-                rule.family().unwrap_or("-").to_owned(),
-                rule.action().unwrap_or("-").to_owned(),
-                scope(rule, runtime, permanent).to_owned(),
-                rule.to_string(),
-            ]
+            let scope = scope(rule, runtime, permanent);
+            ViewRow::scoped(
+                RowId::RichRule {
+                    zone: zone.clone(),
+                    rule: rule.clone(),
+                },
+                scope,
+                vec![
+                    rule.family().unwrap_or("-").to_owned(),
+                    rule.action().unwrap_or("-").to_owned(),
+                    scope.as_str().to_owned(),
+                    rule.to_string(),
+                ],
+            )
         })
         .collect()
 }
 
-fn interfaces_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<Vec<String>> {
+fn interfaces_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewRow> {
     if config == ConfigurationTarget::Permanent {
         // Permanent bindings live in the zone definitions, not the active map.
         return snap
             .permanent
             .iter()
             .flat_map(|(zone, details)| {
-                details
-                    .interfaces
-                    .iter()
-                    .map(move |iface| vec![iface.to_string(), zone.to_string(), String::new()])
+                details.interfaces.iter().map(move |iface| {
+                    ViewRow::targeted(
+                        RowId::Interface {
+                            zone: zone.clone(),
+                            interface: iface.clone(),
+                        },
+                        ConfigurationTarget::Permanent,
+                        vec![iface.to_string(), zone.to_string(), String::new()],
+                    )
+                })
             })
             .collect();
     }
     snap.active
         .iter()
         .flat_map(|(zone, active)| {
-            active
-                .interfaces
-                .iter()
-                .map(move |iface| vec![iface.to_string(), zone.to_string(), "yes".to_owned()])
+            active.interfaces.iter().map(move |iface| {
+                ViewRow::targeted(
+                    RowId::Interface {
+                        zone: zone.clone(),
+                        interface: iface.clone(),
+                    },
+                    ConfigurationTarget::Runtime,
+                    vec![iface.to_string(), zone.to_string(), "yes".to_owned()],
+                )
+            })
         })
         .collect()
 }
 
-fn sources_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<Vec<String>> {
+fn sources_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewRow> {
     if config == ConfigurationTarget::Permanent {
         return snap
             .permanent
             .iter()
             .flat_map(|(zone, details)| {
                 details.sources.iter().map(move |source| {
-                    vec![
-                        source.to_string(),
-                        source.family().map_or("-", |f| f.as_str()).to_owned(),
-                        zone.to_string(),
-                    ]
+                    ViewRow::targeted(
+                        RowId::Source {
+                            zone: zone.clone(),
+                            source: source.clone(),
+                        },
+                        ConfigurationTarget::Permanent,
+                        vec![
+                            source.to_string(),
+                            source.family().map_or("-", |f| f.as_str()).to_owned(),
+                            zone.to_string(),
+                        ],
+                    )
                 })
             })
             .collect();
@@ -504,11 +727,18 @@ fn sources_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<Vec
         .iter()
         .flat_map(|(zone, active)| {
             active.sources.iter().map(move |source| {
-                vec![
-                    source.to_string(),
-                    source.family().map_or("-", |f| f.as_str()).to_owned(),
-                    zone.to_string(),
-                ]
+                ViewRow::targeted(
+                    RowId::Source {
+                        zone: zone.clone(),
+                        source: source.clone(),
+                    },
+                    ConfigurationTarget::Runtime,
+                    vec![
+                        source.to_string(),
+                        source.family().map_or("-", |f| f.as_str()).to_owned(),
+                        zone.to_string(),
+                    ],
+                )
             })
         })
         .collect()
@@ -595,5 +825,74 @@ mod tests {
         );
         assert_eq!(direct[0][0], "ipv4");
         assert!(direct[0][4].contains("--dport 12345"));
+    }
+
+    #[test]
+    fn every_mutable_view_carries_typed_identity() {
+        let snap = mock::sample().unwrap();
+        let zone = snap.default_zone.clone();
+
+        let zones = rows(ViewId::Zones, &snap, &zone, ConfigurationTarget::Runtime);
+        assert!(zones.iter().all(|row| matches!(&row.id, RowId::Zone(_))));
+
+        let services = rows(ViewId::Services, &snap, &zone, ConfigurationTarget::Runtime);
+        assert!(services.iter().all(|row| matches!(
+            &row.id,
+            RowId::Service { zone: owner, .. } if owner == &zone
+        )));
+
+        let ports = rows(ViewId::Ports, &snap, &zone, ConfigurationTarget::Runtime);
+        assert!(ports.iter().all(|row| matches!(
+            &row.id,
+            RowId::Port { zone: owner, .. } if owner == &zone
+        )));
+
+        let rich_rules = rows(
+            ViewId::RichRules,
+            &snap,
+            &zone,
+            ConfigurationTarget::Runtime,
+        );
+        assert!(rich_rules.iter().all(|row| matches!(
+            &row.id,
+            RowId::RichRule { zone: owner, .. } if owner == &zone
+        )));
+
+        let interfaces = rows(
+            ViewId::Interfaces,
+            &snap,
+            &zone,
+            ConfigurationTarget::Runtime,
+        );
+        assert!(interfaces.iter().all(|row| {
+            matches!(&row.id, RowId::Interface { .. })
+                && row.configuration_target() == Some(ConfigurationTarget::Runtime)
+        }));
+
+        let sources = rows(ViewId::Sources, &snap, &zone, ConfigurationTarget::Runtime);
+        assert!(sources.iter().all(|row| {
+            matches!(&row.id, RowId::Source { .. })
+                && row.configuration_target() == Some(ConfigurationTarget::Runtime)
+        }));
+
+        let ipsets = rows(ViewId::IpSets, &snap, &zone, ConfigurationTarget::Runtime);
+        assert!(
+            ipsets
+                .iter()
+                .all(|row| matches!(&row.id, RowId::IpSet { .. }) && row.scope().is_some())
+        );
+    }
+
+    #[test]
+    fn row_identity_stays_stable_when_scope_changes() {
+        let id = RowId::Port {
+            zone: ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+        };
+        let runtime = ViewRow::scoped(id.clone(), Scope::Runtime, Vec::new());
+        let both = ViewRow::scoped(id, Scope::Both, Vec::new());
+
+        assert_eq!(runtime.id, both.id);
+        assert_ne!(runtime.scope(), both.scope());
     }
 }

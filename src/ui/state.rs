@@ -14,7 +14,7 @@ use crate::domain::{
 
 use super::overlays::Overlay;
 use super::palette::PaletteState;
-use super::views::{self, VIEW_COUNT, ViewId};
+use super::views::{self, RowId, VIEW_COUNT, ViewId, ViewRow};
 
 /// How long a toast stays visible, in ticks (250 ms each).
 const TOAST_TTL_TICKS: u64 = 16;
@@ -25,13 +25,6 @@ const MAX_LOG_ENTRIES: usize = 1000;
 /// Bounded session audit history.
 const MAX_AUDIT_ENTRIES: usize = 200;
 
-/// Stable identity of a table row: every cell joined on a separator that
-/// cannot appear in cell text. Used as the multi-select key.
-#[must_use]
-pub fn row_key(row: &[String]) -> String {
-    row.join("\u{1f}")
-}
-
 /// Per-view UI state: selection, filter, marks, and scroll offset.
 #[derive(Debug, Default)]
 pub struct ViewState {
@@ -39,10 +32,8 @@ pub struct ViewState {
     pub selected: usize,
     /// Live substring filter (`/`); empty = no filtering.
     pub filter: String,
-    /// Multi-select set, keyed by the full row (`row_key`) — first cells are
-    /// not unique (e.g. 8080/tcp vs 8080/udp share "8080"; rich rules share a
-    /// family), so marking by first cell would select unrelated rows.
-    pub marked: std::collections::BTreeSet<String>,
+    /// Multi-select set keyed by typed, zone-aware row identity.
+    pub marked: std::collections::BTreeSet<RowId>,
     /// Scroll offset persistence for ratatui's stateful table render.
     pub table: TableState,
 }
@@ -148,7 +139,11 @@ pub struct UiState {
     /// Denied packets seen this session (from the log tailer).
     pub denied_session: u64,
     /// Bounded ring buffer of kernel/netfilter log entries, newest last.
-    pub log_buffer: std::collections::VecDeque<LogEntry>,
+    log_buffer: std::collections::VecDeque<LogEntry>,
+    /// Session-unique sequence aligned one-to-one with [`Self::log_buffer`].
+    log_sequences: std::collections::VecDeque<u64>,
+    /// Next sequence assigned to an incoming log entry.
+    next_log_sequence: u64,
     /// SSH session detected at startup (`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY`).
     pub ssh_session: bool,
     /// The interface carrying the SSH session, if resolved — enables a precise
@@ -232,6 +227,8 @@ impl UiState {
             backend_error: None,
             denied_session: 0,
             log_buffer: std::collections::VecDeque::new(),
+            log_sequences: std::collections::VecDeque::new(),
+            next_log_sequence: 1,
             ssh_session,
             ssh_interface,
             toasts: std::collections::VecDeque::new(),
@@ -281,23 +278,30 @@ impl UiState {
     // rows are recomputed per keystroke/frame; snapshot scale (dozens of
     // zones) makes this free — add caching only if profiling ever disagrees.
     #[must_use]
-    pub fn all_rows(&self, view: ViewId) -> Vec<Vec<String>> {
+    pub fn all_rows(&self, view: ViewId) -> Vec<ViewRow> {
         if view == ViewId::Logs {
             // Newest first: tailing UX without chasing the scroll position.
             return self
-                .log_buffer
+                .log_sequences
                 .iter()
                 .rev()
-                .map(|entry| {
-                    vec![
-                        entry.time.clone(),
-                        entry.action.as_str().to_owned(),
-                        entry.src.clone(),
-                        entry.dst.clone(),
-                        entry.dport.clone(),
-                        entry.proto.clone(),
-                        entry.iface.clone(),
-                    ]
+                .zip(self.log_buffer.iter().rev())
+                .map(|(&sequence, entry)| {
+                    ViewRow::new(
+                        RowId::Log {
+                            sequence,
+                            entry: entry.clone(),
+                        },
+                        vec![
+                            entry.time.clone(),
+                            entry.action.as_str().to_owned(),
+                            entry.src.clone(),
+                            entry.dst.clone(),
+                            entry.dport.clone(),
+                            entry.proto.clone(),
+                            entry.iface.clone(),
+                        ],
+                    )
                 })
                 .collect();
         }
@@ -312,7 +316,7 @@ impl UiState {
 
     /// Rows of the current view with the live filter applied.
     #[must_use]
-    pub fn visible_rows(&self) -> Vec<Vec<String>> {
+    pub fn visible_rows(&self) -> Vec<ViewRow> {
         let rows = self.all_rows(self.view);
         let filter = &self.views[self.view.index()].filter;
         if filter.is_empty() {
@@ -356,8 +360,12 @@ impl UiState {
             }
             if self.log_buffer.len() >= MAX_LOG_ENTRIES {
                 self.log_buffer.pop_front();
+                self.log_sequences.pop_front();
             }
+            let sequence = self.next_log_sequence;
+            self.next_log_sequence = self.next_log_sequence.saturating_add(1);
             self.log_buffer.push_back(entry);
+            self.log_sequences.push_back(sequence);
         }
     }
 

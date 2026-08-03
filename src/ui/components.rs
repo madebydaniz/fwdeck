@@ -340,7 +340,7 @@ pub fn render_table(f: &mut Frame, area: Rect, state: &mut UiState, theme: &Them
     let rows: Vec<Row> = rows_data
         .iter()
         .map(|row| {
-            let is_marked = marked.contains(&crate::ui::state::row_key(row));
+            let is_marked = marked.contains(&row.id);
             if is_dim(row) {
                 return Row::new(
                     row.iter()

@@ -14,7 +14,7 @@ use super::overlays::{Confirmation, DetailsContent, FormKind, FormState, Overlay
 use super::palette::{self, Availability};
 use super::search;
 use super::state::{InputMode, ToastKind, UiState};
-use super::views::ViewId;
+use super::views::{RowId, Scope, ViewId, ViewRow};
 
 use forms::{form_submit, rich_builder_commit};
 use lifecycle::{fire_expired_rollbacks, fire_rollback};
@@ -158,9 +158,10 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::InputCancel => {
             if state.mode == InputMode::Filter {
+                let selected = selected_row_id(state);
                 state.view_state_mut().filter.clear();
                 state.mode = InputMode::Normal;
-                clamp_selection(state);
+                reconcile_selection(state, selected);
             }
         }
         UiAction::OpenHelp => {
@@ -352,20 +353,22 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }
         }
         UiAction::ClearFilter => {
+            let selected = selected_row_id(state);
             state.view_state_mut().filter.clear();
-            clamp_selection(state);
+            reconcile_selection(state, selected);
         }
         UiAction::RefreshRequested => return vec![Effect::Refresh],
         UiAction::ReloadRequested => {
             return request_operation(state, FirewallOperation::Reload);
         }
         UiAction::ToggleConfigView => {
+            let selected = selected_row_id(state);
             state.config_view = if state.config_view == ConfigurationTarget::Permanent {
                 ConfigurationTarget::Runtime
             } else {
                 ConfigurationTarget::Permanent
             };
-            clamp_selection(state);
+            reconcile_selection(state, selected);
         }
         UiAction::AddEntry => match state.view {
             ViewId::Services => return update(state, UiAction::OpenForm(FormKind::AddService)),
@@ -479,9 +482,12 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }
         }
         UiAction::LogsReceived(entries) => {
+            let selected = (state.view == ViewId::Logs)
+                .then(|| selected_row_id(state))
+                .flatten();
             state.push_log_entries(entries);
             if state.view == ViewId::Logs {
-                clamp_selection(state);
+                reconcile_selection(state, selected);
             }
         }
         UiAction::RefreshStarted => {
@@ -489,6 +495,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             state.refresh_started_tick = Some(state.tick);
         }
         UiAction::RefreshCompleted(result) => {
+            let selected = selected_row_id(state);
             state.refreshing = false;
             // 250 ms tick granularity is plenty for a health metric.
             if let Some(started) = state.refresh_started_tick.take() {
@@ -531,7 +538,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                         state.session_baseline = Some(std::sync::Arc::clone(&snapshot));
                     }
                     state.snapshot = Some(snapshot);
-                    clamp_selection(state);
+                    reconcile_selection(state, selected);
                 }
                 // Keep the stale snapshot: outdated data plus a visible error
                 // beats an empty screen.
@@ -554,13 +561,17 @@ fn execute_global_search(state: &mut UiState) -> Vec<Effect> {
         state.toast(ToastKind::Info, "no matches");
         return Vec::new();
     };
-    let (view, row) = (hit.view, hit.row);
+    let (view, row_id) = (hit.view, hit.row_id.clone());
     state.overlays.pop();
     state.view = view;
     state.mode = InputMode::Normal;
     state.views[view.index()].filter.clear();
     state.views[view.index()].marked.clear();
-    state.view_state_mut().selected = row;
+    state.view_state_mut().selected = state
+        .all_rows(view)
+        .iter()
+        .position(|row| row.id == row_id)
+        .unwrap_or(0);
     clamp_selection(state);
     Vec::new()
 }
@@ -605,12 +616,8 @@ fn inspect_zone(state: &mut UiState) {
 fn zone_for_action(state: &UiState) -> Option<ZoneName> {
     if state.view == ViewId::Zones {
         let rows = state.visible_rows();
-        if let Some(Ok(zone)) = rows
-            .get(state.view_state().selected)
-            .and_then(|row| row.first())
-            .map(|name| ZoneName::parse(name))
-        {
-            return Some(zone);
+        if let Some(RowId::Zone(zone)) = rows.get(state.view_state().selected).map(|row| &row.id) {
+            return Some(zone.clone());
         }
     }
     state.effective_zone()
@@ -618,8 +625,8 @@ fn zone_for_action(state: &UiState) -> Option<ZoneName> {
 
 /// Narrows the configured target to where the entry actually exists, so
 /// removing a runtime-only entry never issues a doomed `--permanent` call.
-fn target_for_scope(scope: &str, default: ConfigurationTarget) -> ConfigurationTarget {
-    super::views::Scope::parse(scope).target_or(default)
+fn target_for_scope(scope: Scope, default: ConfigurationTarget) -> ConfigurationTarget {
+    scope.target_or(default)
 }
 
 /// The single read-only gate for mutation entry points: toasts and reports
@@ -651,10 +658,14 @@ fn blocked_stale(state: &mut UiState) -> bool {
 }
 
 /// The currently selected row of the visible (filtered) table, cloned out.
-fn selected_row(state: &UiState) -> Option<Vec<String>> {
+fn selected_row(state: &UiState) -> Option<ViewRow> {
     let mut rows = state.visible_rows();
     let index = state.view_state().selected;
     (index < rows.len()).then(|| rows.swap_remove(index))
+}
+
+fn selected_row_id(state: &UiState) -> Option<RowId> {
+    selected_row(state).map(|row| row.id)
 }
 
 fn toggle_masquerade(state: &mut UiState) -> Vec<Effect> {
@@ -937,8 +948,31 @@ fn move_selection(state: &mut UiState, delta: i32) {
 }
 
 fn clamp_selection(state: &mut UiState) {
-    let len = state.visible_rows().len();
+    reconcile_selection(state, None);
+}
+
+/// Reconciles marks and selection after the row model changes. When the
+/// previously selected identity still exists, its new position wins over the
+/// stale numeric index.
+fn reconcile_selection(state: &mut UiState, preferred: Option<RowId>) {
+    let valid_ids: std::collections::BTreeSet<RowId> = state
+        .all_rows(state.view)
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    state
+        .view_state_mut()
+        .marked
+        .retain(|row_id| valid_ids.contains(row_id));
+    let visible = state.visible_rows();
+    let len = visible.len();
     let view_state = state.view_state_mut();
+    if let Some(selected) = preferred
+        && let Some(index) = visible.iter().position(|row| row.id == selected)
+    {
+        view_state.selected = index;
+        return;
+    }
     if len == 0 {
         view_state.selected = 0;
     } else if view_state.selected >= len {
@@ -952,11 +986,11 @@ fn edit_filter(state: &mut UiState, edit: impl FnOnce(&mut String)) {
     let before = state.visible_rows();
     let selected_key = before
         .get(state.view_state().selected)
-        .and_then(|row| row.first().cloned());
+        .map(|row| row.id.clone());
     edit(&mut state.view_state_mut().filter);
     let after = state.visible_rows();
     let selected = selected_key
-        .and_then(|key| after.iter().position(|row| row.first() == Some(&key)))
+        .and_then(|key| after.iter().position(|row| row.id == key))
         .unwrap_or(0);
     state.view_state_mut().selected = selected;
 }
@@ -1290,14 +1324,63 @@ mod tests {
     }
 
     #[test]
-    fn mark_key_distinguishes_rows_sharing_a_first_cell() {
-        // 8080/tcp and 8080/udp must not share a mark key.
-        let tcp = vec!["8080".to_owned(), "tcp".to_owned(), "runtime".to_owned()];
-        let udp = vec!["8080".to_owned(), "udp".to_owned(), "runtime".to_owned()];
-        assert_ne!(
-            crate::ui::state::row_key(&tcp),
-            crate::ui::state::row_key(&udp)
+    fn typed_row_identity_distinguishes_protocol_and_zone() {
+        let public = ZoneName::parse("public").unwrap();
+        let dmz = ZoneName::parse("dmz").unwrap();
+        let tcp = RowId::Port {
+            zone: public.clone(),
+            port: "8080/tcp".parse().unwrap(),
+        };
+        let udp = RowId::Port {
+            zone: public,
+            port: "8080/udp".parse().unwrap(),
+        };
+        let other_zone = RowId::Port {
+            zone: dmz,
+            port: "8080/tcp".parse().unwrap(),
+        };
+        assert_ne!(tcp, udp);
+        assert_ne!(tcp, other_zone);
+    }
+
+    #[test]
+    fn refresh_reconciliation_drops_stale_typed_marks() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Services));
+        s.view_state_mut().marked.insert(RowId::Service {
+            zone: ZoneName::parse("ghost").unwrap(),
+            service: ServiceName::parse("ssh").unwrap(),
+        });
+        clamp_selection(&mut s);
+        assert!(s.view_state().marked.is_empty());
+    }
+
+    #[test]
+    fn refresh_keeps_selection_on_the_same_typed_row_after_reordering() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Services));
+        let ssh_index = s
+            .visible_rows()
+            .iter()
+            .position(|row| row[0] == "ssh")
+            .unwrap();
+        s.view_state_mut().selected = ssh_index;
+        let selected = selected_row_id(&s).unwrap();
+
+        let mut refreshed = mock::sample().unwrap();
+        refreshed
+            .runtime
+            .get_mut(&ZoneName::parse("public").unwrap())
+            .unwrap()
+            .services
+            .push(ServiceName::parse("aardvark").unwrap());
+        update(
+            &mut s,
+            UiAction::RefreshCompleted(Ok(std::sync::Arc::new(refreshed))),
         );
+
+        assert_eq!(selected_row_id(&s), Some(selected));
+        assert!(s.view_state().selected > ssh_index);
     }
 
     #[test]
@@ -1505,10 +1588,62 @@ mod tests {
             batch.push(entry(LogAction::Drop));
         }
         update(&mut s, UiAction::LogsReceived(batch));
-        assert_eq!(s.log_buffer.len(), 1000, "ring buffer is bounded");
+        assert_eq!(
+            s.all_rows(ViewId::Logs).len(),
+            1000,
+            "ring buffer is bounded"
+        );
         assert_eq!(s.denied_session, 1201);
         update(&mut s, UiAction::SwitchView(ViewId::Logs));
         assert_eq!(s.visible_rows().len(), 1000);
+    }
+
+    #[test]
+    fn duplicate_log_lines_receive_distinct_row_identities() {
+        use crate::domain::{LogAction, LogEntry};
+
+        let mut s = state();
+        let entry = LogEntry {
+            time: "10:00:00".into(),
+            action: LogAction::Drop,
+            src: "1.2.3.4".into(),
+            dst: "5.6.7.8".into(),
+            dport: "22".into(),
+            proto: "TCP".into(),
+            iface: "eth0".into(),
+        };
+        update(&mut s, UiAction::LogsReceived(vec![entry.clone(), entry]));
+        let rows = s.all_rows(ViewId::Logs);
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].id, rows[1].id);
+    }
+
+    #[test]
+    fn incoming_logs_keep_selection_on_the_same_entry() {
+        use crate::domain::{LogAction, LogEntry};
+
+        let entry = |time: &str| LogEntry {
+            time: time.into(),
+            action: LogAction::Drop,
+            src: "1.2.3.4".into(),
+            dst: "5.6.7.8".into(),
+            dport: "22".into(),
+            proto: "TCP".into(),
+            iface: "eth0".into(),
+        };
+        let mut s = state();
+        update(
+            &mut s,
+            UiAction::LogsReceived(vec![entry("10:00:00"), entry("10:00:01")]),
+        );
+        update(&mut s, UiAction::SwitchView(ViewId::Logs));
+        s.view_state_mut().selected = 1;
+        let selected = selected_row_id(&s).unwrap();
+
+        update(&mut s, UiAction::LogsReceived(vec![entry("10:00:02")]));
+
+        assert_eq!(selected_row_id(&s), Some(selected));
+        assert_eq!(s.view_state().selected, 2);
     }
 
     #[test]

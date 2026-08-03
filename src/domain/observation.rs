@@ -3,7 +3,7 @@
 //! produces them lives in the infrastructure adapters (`logs`, `counters`).
 
 /// Netfilter verdict extracted from a kernel log line's rule-name prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LogAction {
     /// Packet was accepted (`ACCEPT` / `ALLOW` in the prefix).
     Accept,
@@ -36,7 +36,7 @@ impl LogAction {
 
 /// One parsed netfilter log line, ready for the Logs view. Fields keep the
 /// kernel's string form; missing fields are empty strings, not errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LogEntry {
     /// `HH:MM:SS` slice of the source timestamp (full token if not ISO-shaped).
     pub time: String,
