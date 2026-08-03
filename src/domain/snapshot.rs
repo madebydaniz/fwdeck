@@ -427,6 +427,19 @@ impl FirewallSnapshot {
         self.runtime.get(zone) == self.permanent.get(zone)
     }
 
+    /// Whether runtime and permanent policy configuration match. Runtime-only
+    /// observation such as the policy's active marker does not count as drift.
+    #[must_use]
+    pub fn policies_synced(&self) -> bool {
+        self.policies.runtime.len() == self.policies.permanent.len()
+            && self.policies.runtime.iter().all(|(name, runtime)| {
+                self.policies
+                    .permanent
+                    .get(name)
+                    .is_some_and(|permanent| runtime.configuration_eq(permanent))
+            })
+    }
+
     /// Whether the entire runtime config matches permanent (no drift).
     #[must_use]
     pub fn all_synced(&self) -> bool {
@@ -441,7 +454,7 @@ impl FirewallSnapshot {
             ConfigurationTarget::RuntimeAndPermanent,
         ) && self.runtime == self.permanent
             && self.ipsets.runtime == self.ipsets.permanent
-            && self.policies.runtime == self.policies.permanent
+            && self.policies_synced()
     }
 }
 
@@ -496,5 +509,20 @@ mod tests {
             !decoded.all_synced(),
             "unknown state cannot be called synced"
         );
+    }
+
+    #[test]
+    fn policy_active_marker_does_not_create_snapshot_drift() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot.permanent = snapshot.runtime.clone();
+        snapshot.ipsets.permanent = snapshot.ipsets.runtime.clone();
+        snapshot
+            .policies
+            .permanent
+            .values_mut()
+            .for_each(|policy| policy.active = false);
+
+        assert!(snapshot.policies_synced());
+        assert!(snapshot.all_synced());
     }
 }

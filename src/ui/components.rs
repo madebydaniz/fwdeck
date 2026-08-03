@@ -239,7 +239,7 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, state: &UiState, theme: &Theme)
             let marker = if is_current { "▸" } else { " " };
             let spans = vec![
                 Span::styled(format!("{marker} "), theme.accent()),
-                Span::styled(format!("<{}> ", view.index()), theme.hotkey()),
+                Span::styled(format!("<{}> ", view.shortcut()), theme.hotkey()),
                 Span::styled(
                     format!("{title:<name_width$}", title = view.title()),
                     if is_current {
@@ -265,8 +265,10 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, state: &UiState, theme: &Theme)
 fn value_cell<'a>(text: String, theme: &Theme) -> Cell<'a> {
     let style = match text.as_str() {
         "yes" | "both" | "accept" | "ACCEPT" => theme.ok(),
-        "DROP" | "%%REJECT%%" | "REJECT" | "DENIED" | "reject" | "drop" => theme.danger(),
-        "runtime" | "permanent" | "?" => theme.warn(),
+        "DROP" | "%%REJECT%%" | "REJECT" | "DENIED" | "reject" | "drop" | "broken" => {
+            theme.danger()
+        }
+        "runtime" | "permanent" | "disabled" | "inactive" | "?" => theme.warn(),
         _ => theme.text(),
     };
     Cell::from(Span::styled(text, style))
@@ -412,6 +414,7 @@ const fn add_hint(view: ViewId) -> Option<&'static str> {
         ViewId::Interfaces => Some("+ bind interface (a)"),
         ViewId::Sources => Some("+ bind source (a)"),
         ViewId::IpSets => Some("+ add entry / create ipset (a)"),
+        ViewId::Policies => Some("+ add service / create policy (a)"),
         ViewId::Direct | ViewId::Logs => None,
     }
 }
@@ -430,6 +433,9 @@ fn empty_message(view: ViewId, state: &UiState) -> String {
         ViewId::Interfaces => "no active interfaces".to_owned(),
         ViewId::Sources => "no sources bound to any zone".to_owned(),
         ViewId::IpSets => "no ipsets defined — `a` creates one (permanent, then reload)".to_owned(),
+        ViewId::Policies => {
+            "no policies defined — `a` creates one (permanent, then reload)".to_owned()
+        }
         ViewId::Direct => "no direct rules (deprecated feature — prefer rich rules)".to_owned(),
         ViewId::Logs => {
             let log_denied_off = state

@@ -19,7 +19,10 @@ use super::views::{RowId, Scope, ViewId, ViewRow};
 use forms::{form_submit, rich_builder_commit};
 use lifecycle::{fire_expired_rollbacks, fire_rollback};
 use plans::{apply_plan_now, apply_staged_plan, export_plan, stage_drift_sync};
-use rows::{activate_row, clone_entry, delete_entry, propose_from_log, toggle_mark, yank_row};
+use rows::{
+    activate_row, clone_entry, delete_entry, propose_from_log, selected_policy, toggle_mark,
+    yank_row,
+};
 
 // fixed page size; wire to the rendered table height if it ever matters.
 const PAGE_JUMP: i32 = 10;
@@ -390,6 +393,18 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                     FormKind::AddIpSetEntry
                 };
                 return update(state, UiAction::OpenForm(kind));
+            }
+            ViewId::Policies => {
+                if let Some(policy) = selected_policy(state) {
+                    return update(
+                        state,
+                        UiAction::OpenFormPrefilled(
+                            FormKind::AddPolicyService,
+                            format!("{policy} "),
+                        ),
+                    );
+                }
+                return update(state, UiAction::OpenForm(FormKind::CreatePolicy));
             }
             ViewId::Direct => {
                 state.toast(ToastKind::Info, "no add action on this view");
@@ -2041,6 +2056,50 @@ mod tests {
         match s.overlays.last() {
             Some(Overlay::Form(form)) => assert_eq!(form.kind, FormKind::AddRichRule),
             other => panic!("expected form, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_workspace_opens_typed_details() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Policies));
+        update(&mut s, UiAction::ActivateRow);
+
+        match s.overlays.last() {
+            Some(Overlay::Details(content)) => assert_eq!(content.title, "Policy `mypolicy`"),
+            other => panic!("expected policy details, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_on_policy_prefills_the_selected_policy() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Policies));
+        update(&mut s, UiAction::AddEntry);
+
+        match s.overlays.last() {
+            Some(Overlay::Form(form)) => {
+                assert_eq!(form.kind, FormKind::AddPolicyService);
+                assert_eq!(form.buffer, "mypolicy ");
+            }
+            other => panic!("expected prefilled policy form, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_on_policy_uses_typed_identity() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Policies));
+        update(&mut s, UiAction::DeleteEntry);
+
+        match s.overlays.last() {
+            Some(Overlay::Confirm(confirmation)) => assert_eq!(
+                confirmation.on_confirm,
+                UiAction::ApplyOperation(FirewallOperation::DeletePolicy {
+                    policy: crate::domain::PolicyName::parse("mypolicy").unwrap(),
+                })
+            ),
+            other => panic!("expected policy delete confirmation, got {other:?}"),
         }
     }
 

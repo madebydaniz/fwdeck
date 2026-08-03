@@ -174,17 +174,13 @@ pub fn sample() -> Result<FirewallSnapshot, ValidationError> {
         policies: {
             let mut policies = BTreeMap::new();
             let name = crate::domain::PolicyName::parse("mypolicy")?;
-            policies.insert(
-                name.clone(),
-                crate::domain::PolicyDetails {
-                    name,
-                    target: crate::domain::PolicyTarget::Drop,
-                    ingress_zones: vec!["public".to_owned()],
-                    egress_zones: vec!["ANY".to_owned()],
-                    services: services(&["http"])?,
-                    ports: Vec::new(),
-                },
-            );
+            let mut policy = crate::domain::PolicyDetails::empty(name.clone());
+            policy.active = true;
+            policy.target = crate::domain::PolicyTarget::Drop;
+            policy.ingress_zones = vec!["public".to_owned()];
+            policy.egress_zones = vec!["ANY".to_owned()];
+            policy.services = services(&["http"])?;
+            policies.insert(name, policy);
             Scoped {
                 runtime: policies.clone(),
                 permanent: policies,

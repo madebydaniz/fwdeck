@@ -292,6 +292,12 @@ pub fn for_row(
             };
             ipset_details(snapshot, name, row.scope()?)
         }
+        ViewId::Policies => {
+            let RowId::Policy { name } = &row.id else {
+                return None;
+            };
+            policy_details(snapshot, name)
+        }
         ViewId::Direct => Some(DetailsContent {
             title: "Direct rule (deprecated)".to_owned(),
             lines: vec![
@@ -318,6 +324,112 @@ pub fn for_row(
                 line("interface", cell(6)),
             ],
         }),
+    }
+}
+
+fn policy_details(
+    snapshot: &FirewallSnapshot,
+    name: &crate::domain::PolicyName,
+) -> Option<DetailsContent> {
+    let runtime = snapshot.policies.runtime.get(name);
+    let permanent = snapshot.policies.permanent.get(name);
+    if runtime.is_none() && permanent.is_none() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    match (runtime, permanent) {
+        (Some(runtime), Some(permanent)) if runtime.configuration_eq(permanent) => {
+            append_policy_configuration(&mut lines, "both", runtime);
+        }
+        (Some(runtime), Some(permanent)) => {
+            append_policy_configuration(&mut lines, "runtime (drift)", runtime);
+            append_policy_configuration(&mut lines, "permanent (drift)", permanent);
+        }
+        (Some(runtime), None) => append_policy_configuration(&mut lines, "runtime", runtime),
+        (None, Some(permanent)) => {
+            append_policy_configuration(&mut lines, "permanent", permanent);
+        }
+        (None, None) => {}
+    }
+
+    let missing = match (runtime, permanent) {
+        (Some(runtime), Some(permanent)) if runtime.configuration_eq(permanent) => {
+            super::views::policy_dependency_issues(snapshot, runtime)
+        }
+        (Some(runtime), Some(permanent)) => {
+            super::views::policy_dependency_issues(snapshot, runtime)
+                .into_iter()
+                .map(|issue| format!("runtime {issue}"))
+                .chain(
+                    super::views::policy_dependency_issues(snapshot, permanent)
+                        .into_iter()
+                        .map(|issue| format!("permanent {issue}")),
+                )
+                .collect()
+        }
+        (Some(runtime), None) => super::views::policy_dependency_issues(snapshot, runtime),
+        (None, Some(permanent)) => super::views::policy_dependency_issues(snapshot, permanent),
+        (None, None) => Vec::new(),
+    };
+    lines.push(line(
+        "dependencies",
+        if missing.is_empty() {
+            "all referenced zones/services are known".to_owned()
+        } else {
+            format!("missing: {}", missing.join(", "))
+        },
+    ));
+
+    Some(DetailsContent {
+        title: format!("Policy `{name}`"),
+        lines,
+    })
+}
+
+fn append_policy_configuration(
+    lines: &mut Vec<(String, String)>,
+    scope: &str,
+    policy: &crate::domain::PolicyDetails,
+) {
+    lines.push(line("configuration", scope));
+    lines.push(line(
+        "state",
+        if policy.disabled {
+            "disabled"
+        } else if policy.active {
+            "active"
+        } else {
+            "inactive"
+        },
+    ));
+    lines.push(line("priority", policy.priority.to_string()));
+    lines.push(line("target", policy.target.as_str()));
+    lines.push(line(
+        "flow",
+        format!(
+            "{} → {}",
+            join(&policy.ingress_zones),
+            join(&policy.egress_zones)
+        ),
+    ));
+    lines.push(line("services", join(&policy.services)));
+    lines.push(line("ports", join(&policy.ports)));
+    lines.push(line("protocols", join(&policy.protocols)));
+    lines.push(line("source ports", join(&policy.source_ports)));
+    let forward_ports: Vec<_> = policy
+        .forward_ports
+        .iter()
+        .map(crate::domain::ForwardPort::spec_string)
+        .collect();
+    lines.push(line("forward ports", join(&forward_ports)));
+    lines.push(line("icmp blocks", join(&policy.icmp_blocks)));
+    lines.push(line(
+        "masquerade",
+        if policy.masquerade { "yes" } else { "no" },
+    ));
+    for rule in &policy.rich_rules {
+        lines.push(line("rich rule", rule.as_str()));
     }
 }
 
@@ -438,7 +550,7 @@ pub fn policy_browse(snapshot: &FirewallSnapshot) -> DetailsContent {
         let runtime = snapshot.policies.runtime.get(*name);
         let permanent = snapshot.policies.permanent.get(*name);
         match (runtime, permanent) {
-            (Some(runtime), Some(permanent)) if runtime == permanent => {
+            (Some(runtime), Some(permanent)) if runtime.configuration_eq(permanent) => {
                 add_policy(name, "both", runtime);
             }
             (Some(runtime), Some(permanent)) => {
@@ -566,16 +678,18 @@ fn scoped_object_drift_lines(snapshot: &FirewallSnapshot) -> Vec<(String, String
             snapshot.policies.runtime.get(name),
             snapshot.policies.permanent.get(name),
         ) {
-            (Some(runtime), Some(permanent)) if runtime != permanent => lines.push(line(
-                "policy",
-                format!(
-                    "{name} — runtime {} ({} services) / permanent {} ({} services)",
-                    runtime.target.as_str(),
-                    runtime.services.len(),
-                    permanent.target.as_str(),
-                    permanent.services.len()
-                ),
-            )),
+            (Some(runtime), Some(permanent)) if !runtime.configuration_eq(permanent) => {
+                lines.push(line(
+                    "policy",
+                    format!(
+                        "{name} — runtime {} ({} services) / permanent {} ({} services)",
+                        runtime.target.as_str(),
+                        runtime.services.len(),
+                        permanent.target.as_str(),
+                        permanent.services.len()
+                    ),
+                ));
+            }
             (Some(_), None) => lines.push(line("policy", format!("{name} — runtime only"))),
             (None, Some(_)) => lines.push(line("policy", format!("{name} — permanent only"))),
             _ => {}
@@ -868,5 +982,33 @@ mod tests {
             .find(|(k, _)| k == "suggested")
             .unwrap();
         assert!(hint.1.contains("systemctl start firewalld"));
+    }
+
+    #[test]
+    fn policy_row_details_show_flow_state_and_dependencies() {
+        let snapshot = mock::sample().unwrap();
+        let zone = snapshot.default_zone.clone();
+        let rows = crate::ui::views::rows(
+            ViewId::Policies,
+            &snapshot,
+            &zone,
+            crate::domain::ConfigurationTarget::Runtime,
+        );
+        let row = rows.first().unwrap();
+        let content = for_row(ViewId::Policies, &snapshot, &zone, row).unwrap();
+
+        assert_eq!(content.title, "Policy `mypolicy`");
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| { key == "flow" && value == "public → ANY" })
+        );
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| { key == "dependencies" && value.contains("all referenced") })
+        );
     }
 }

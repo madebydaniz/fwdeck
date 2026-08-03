@@ -1,7 +1,9 @@
 //! Row-scoped actions on the visible table: activate, clone, mark, delete
 //! (single and bulk), and yank.
 
-use crate::domain::{DeniedFlow, FirewallOperation, FirewallSnapshot, IpSetName, ZoneName};
+use crate::domain::{
+    DeniedFlow, FirewallOperation, FirewallSnapshot, IpSetName, PolicyName, ZoneName,
+};
 use crate::ui::action::{Effect, UiAction};
 use crate::ui::details;
 use crate::ui::overlays::{FormKind, Overlay};
@@ -187,6 +189,9 @@ pub(super) fn delete_entry(state: &mut UiState) -> Vec<Effect> {
         },
         RowId::Zone(zone) => FirewallOperation::DeleteZone { zone: zone.clone() },
         RowId::IpSet { name, .. } => FirewallOperation::DeleteIpSet { name: name.clone() },
+        RowId::Policy { name } => FirewallOperation::DeletePolicy {
+            policy: name.clone(),
+        },
         RowId::Direct { .. } | RowId::Log { .. } => {
             state.toast(ToastKind::Info, "no delete action on this view");
             return Vec::new();
@@ -197,6 +202,17 @@ pub(super) fn delete_entry(state: &mut UiState) -> Vec<Effect> {
         },
     };
     request_operation(state, operation)
+}
+
+/// The policy selected in the `Policies` view, for policy-scoped forms.
+pub(super) fn selected_policy(state: &UiState) -> Option<PolicyName> {
+    if state.view != ViewId::Policies {
+        return None;
+    }
+    match selected_row(state)?.id {
+        RowId::Policy { name } => Some(name),
+        _ => None,
+    }
 }
 
 /// The ipset selected in the `IPSets` view, for entry-scoped forms.

@@ -193,9 +193,18 @@ fn policy_info_parses() {
     let raw = include_str!("fixtures/firewall_cmd/info_policy.txt");
     let policy = parse::parse_policy_info(raw).unwrap();
     assert_eq!(policy.name.as_str(), "fwdeck-fixture");
+    assert!(policy.active);
+    assert!(!policy.disabled);
+    assert_eq!(policy.priority, -1);
     assert_eq!(policy.target, fwdeck::domain::PolicyTarget::Drop);
     assert_eq!(policy.ingress_zones, vec!["public".to_owned()]);
     assert_eq!(policy.egress_zones, vec!["ANY".to_owned()]);
     assert_eq!(policy.services.len(), 1);
     assert_eq!(policy.ports[0].to_string(), "8080/tcp");
+    assert!(policy.protocols.is_empty());
+    assert!(!policy.masquerade);
+    assert!(policy.forward_ports.is_empty());
+    assert!(policy.source_ports.is_empty());
+    assert!(policy.icmp_blocks.is_empty());
+    assert!(policy.rich_rules.is_empty());
 }

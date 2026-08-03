@@ -186,6 +186,12 @@ pub const HELP: &[(&str, &[HelpEntry])] = &[
                 codes: &[],
                 action: None,
             },
+            HelpEntry {
+                keys: "p",
+                desc: "open policy workspace",
+                codes: &[KeyCode::Char('p')],
+                action: Some(UiAction::SwitchView(ViewId::Policies)),
+            },
         ],
     ),
     (
@@ -359,6 +365,15 @@ mod tests {
         assert_eq!(
             translate(&s, press(KeyCode::Char('9'))),
             Some(UiAction::SwitchView(ViewId::Logs))
+        );
+    }
+
+    #[test]
+    fn p_opens_policy_workspace() {
+        let s = state();
+        assert_eq!(
+            translate(&s, press(KeyCode::Char('p'))),
+            Some(UiAction::SwitchView(ViewId::Policies))
         );
     }
 
