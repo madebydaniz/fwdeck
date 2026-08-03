@@ -326,6 +326,31 @@ mod tests {
     }
 
     #[test]
+    fn policy_set_workspace_renders_capability_and_members() {
+        let mut s = state();
+        let mut snapshot = mock::sample().unwrap();
+        snapshot.status.version = Some("2.4.2".to_owned());
+        for member in crate::domain::policy_set::GATEWAY_POLICY_MEMBERS {
+            let name = crate::domain::PolicyName::parse(member).unwrap();
+            let mut policy = crate::domain::PolicyDetails::empty(name.clone());
+            policy.disabled = true;
+            snapshot
+                .policies
+                .runtime
+                .insert(name.clone(), policy.clone());
+            snapshot.policies.permanent.insert(name, policy);
+        }
+        s.snapshot = Some(std::sync::Arc::new(snapshot));
+
+        update(&mut s, UiAction::BrowsePolicySets);
+        let content = draw(&mut s, 120, 36);
+        assert!(content.contains("Policy sets"));
+        assert!(content.contains("supported"));
+        assert!(content.contains("gateway-lan-to-world"));
+        assert!(content.contains("disabled"));
+    }
+
+    #[test]
     fn policy_dependency_graph_overlay_renders() {
         let mut s = state();
         update(&mut s, UiAction::ShowPolicyDependencies);

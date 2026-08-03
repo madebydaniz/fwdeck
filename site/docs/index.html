@@ -466,6 +466,13 @@ dependency graph</em> to inspect runtime and permanent ingress, egress, and
 service edges, including missing or unknown references. FWDeck blocks permanent
 zone or service deletion while a policy still references it, and fails closed
 when the relevant dependency data could not be read.</p>
+<p><strong>Policy sets</strong> — on firewalld 2.4 or newer, open
+<kbd>:</kbd> → <em>Browse policy sets</em> to inspect the shipped
+<code>gateway</code> set, its member policies, and separate runtime/permanent
+administrative state. Use <em>Set policy-set state</em> with
+<code>gateway enable</code> or <code>gateway disable</code>. The change uses the
+normal confirmation, exact command preview, staged-plan, verification, and
+rollback flow. Older or unknown firewalld versions are blocked explicitly.</p>
 <p>Policies are stateful and unidirectional: an ingress → egress policy does
 not automatically govern the reverse direction. See the
 <a href="https://firewalld.org/documentation/man-pages/firewalld.policies">official firewalld policy model</a>.</p>

@@ -3,10 +3,14 @@
 //! as rollback metadata (ADR-3).
 
 use super::address::{IpSetEntry, SourceAddress};
+use super::capability::{FeatureSupport, FirewalldFeature};
 use super::dependency::{PolicyDependencyGraph, PolicyDependencyResource};
 use super::ids::IpProtocol;
-use super::ids::{IcmpType, InterfaceName, IpSetName, PolicyName, ServiceName, ZoneName};
+use super::ids::{
+    IcmpType, InterfaceName, IpSetName, PolicyName, PolicySetName, ServiceName, ZoneName,
+};
 use super::policy::PolicyTarget;
+use super::policy_set::PolicySetDetails;
 use super::port::{ForwardPort, PortSpec};
 use super::rich_rule::RichRule;
 use super::snapshot::{ConfigurationTarget, FirewallSnapshot, LogDenied, SnapshotSection};
@@ -306,6 +310,15 @@ pub enum FirewallOperation {
         /// Configuration scope the change applies to.
         target: ConfigurationTarget,
     },
+    /// Enable or disable every member of a predefined policy set.
+    SetPolicySetEnabled {
+        /// Predefined set name, currently `gateway`.
+        policy_set: PolicySetName,
+        /// `true` removes the administrative disable; `false` adds it.
+        enabled: bool,
+        /// Runtime, permanent, or both configurations.
+        target: ConfigurationTarget,
+    },
     /// Permanent-only, like zones; reload activates.
     CreateIpSet {
         /// Name for the new ipset.
@@ -550,6 +563,14 @@ impl FirewallOperation {
             } => {
                 format!("remove service `{service}` from policy `{policy}`")
             }
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => format!(
+                "{} policy set `{policy_set}`",
+                if *enabled { "enable" } else { "disable" }
+            ),
             Self::CreateService { service } => {
                 format!("create service `{service}` (permanent)")
             }
@@ -772,6 +793,17 @@ impl FirewallOperation {
                 format!("service `{service}` removed from policy `{policy}`"),
                 *target,
             ),
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                target,
+            } => scoped(
+                format!(
+                    "policy set `{policy_set}` {}",
+                    if *enabled { "enabled" } else { "disabled" }
+                ),
+                *target,
+            ),
             Self::CreateService { service } => {
                 format!("service `{service}` created (permanent) — reload (ctrl-r) to activate")
             }
@@ -887,7 +919,8 @@ impl FirewallOperation {
             | Self::SetForward { target: t, .. }
             | Self::SetIcmpBlockInversion { target: t, .. }
             | Self::AddPolicyService { target: t, .. }
-            | Self::RemovePolicyService { target: t, .. } => {
+            | Self::RemovePolicyService { target: t, .. }
+            | Self::SetPolicySetEnabled { target: t, .. } => {
                 *t = target;
                 Some(retargeted)
             }
@@ -1040,6 +1073,21 @@ impl FirewallOperation {
                     permanent(policy).map(&desired),
                 ));
             }
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => {
+                if !complete {
+                    return PostconditionProbe::Unknown;
+                }
+                let set = PolicySetDetails::from_snapshot(snapshot, policy_set.clone());
+                return PostconditionProbe::from_option(scoped_postcondition(
+                    target,
+                    set.runtime.state.matches(*enabled),
+                    set.permanent.state.matches(*enabled),
+                ));
+            }
             _ => return PostconditionProbe::NotApplicable,
         };
         PostconditionProbe::from_option(result)
@@ -1098,9 +1146,9 @@ impl FirewallOperation {
             Self::AddIpSetEntry { .. } | Self::RemoveIpSetEntry { .. } => {
                 Some(SnapshotSection::IpSets)
             }
-            Self::AddPolicyService { .. } | Self::RemovePolicyService { .. } => {
-                Some(SnapshotSection::Policies)
-            }
+            Self::AddPolicyService { .. }
+            | Self::RemovePolicyService { .. }
+            | Self::SetPolicySetEnabled { .. } => Some(SnapshotSection::Policies),
             _ if self.zone_probe().is_some() => Some(SnapshotSection::Zones),
             _ => None,
         };
@@ -1135,6 +1183,20 @@ impl FirewallOperation {
                     snapshot.policies.runtime.get(policy).is_some_and(&needs),
                     snapshot.policies.permanent.get(policy).is_some_and(&needs),
                 ))
+            }
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => {
+                let set = PolicySetDetails::from_snapshot(snapshot, policy_set.clone());
+                let Some(runtime_matches) = set.runtime.state.matches(*enabled) else {
+                    return self.clone();
+                };
+                let Some(permanent_matches) = set.permanent.state.matches(*enabled) else {
+                    return self.clone();
+                };
+                Some((!runtime_matches, !permanent_matches))
             }
             _ => None,
         };
@@ -1202,7 +1264,8 @@ impl FirewallOperation {
             | Self::SetForward { target, .. }
             | Self::SetIcmpBlockInversion { target, .. }
             | Self::AddPolicyService { target, .. }
-            | Self::RemovePolicyService { target, .. } => *target,
+            | Self::RemovePolicyService { target, .. }
+            | Self::SetPolicySetEnabled { target, .. } => *target,
             // Panic mode and timed rules are inherently runtime-only.
             Self::SetPanicMode { .. } | Self::AddTemporaryService { .. } => {
                 ConfigurationTarget::Runtime
@@ -1269,6 +1332,12 @@ impl FirewallOperation {
             Self::DeletePolicy { .. } => {
                 Some("traffic governed by this policy falls back to zone rules")
             }
+            Self::SetPolicySetEnabled { enabled: true, .. } => Some(
+                "enabling a policy set may allow forwarding, NAT, and host services across multiple zones",
+            ),
+            Self::SetPolicySetEnabled { enabled: false, .. } => {
+                Some("disabling a policy set may interrupt routed traffic and gateway services")
+            }
             Self::DeleteIpSet { .. } => {
                 Some("zones referencing this ipset lose those sources after the next reload")
             }
@@ -1307,7 +1376,8 @@ impl FirewallOperation {
             | Self::AddPolicyIngressZone { .. }
             | Self::AddPolicyEgressZone { .. }
             | Self::AddPolicyService { .. }
-            | Self::RemovePolicyService { .. } => Some(SnapshotSection::Policies),
+            | Self::RemovePolicyService { .. }
+            | Self::SetPolicySetEnabled { .. } => Some(SnapshotSection::Policies),
             Self::CreateService { .. }
             | Self::DeleteService { .. }
             | Self::AddServicePort { .. }
@@ -1731,6 +1801,63 @@ impl FirewallOperation {
                     )));
                 }
             }
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => {
+                match FirewalldFeature::PolicySets.support_for(snapshot.status.version.as_deref()) {
+                    FeatureSupport::Supported => {}
+                    FeatureSupport::Unsupported => {
+                        return Err(OperationError::Invalid(format!(
+                            "policy sets require firewalld {} or newer (current: {})",
+                            FirewalldFeature::PolicySets.minimum_version(),
+                            snapshot.status.version.as_deref().unwrap_or("unknown")
+                        )));
+                    }
+                    FeatureSupport::Unknown => {
+                        return Err(OperationError::Invalid(
+                            "cannot safely use policy sets because the firewalld version is unknown"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                if !PolicySetDetails::is_known(policy_set) {
+                    return Err(OperationError::Invalid(format!(
+                        "policy set `{policy_set}` is not in FWDeck's verified upstream manifest"
+                    )));
+                }
+                let set = PolicySetDetails::from_snapshot(snapshot, policy_set.clone());
+                let runtime = set.runtime.state.matches(*enabled);
+                let permanent = set.permanent.state.matches(*enabled);
+                let exists = match target {
+                    ConfigurationTarget::Runtime => runtime.is_some(),
+                    ConfigurationTarget::Permanent => permanent.is_some(),
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some() && permanent.is_some()
+                    }
+                };
+                if !exists {
+                    return Err(OperationError::Invalid(format!(
+                        "policy set `{policy_set}` has no observed members in {} configuration",
+                        target.label()
+                    )));
+                }
+                let already_set = match target {
+                    ConfigurationTarget::Runtime => runtime == Some(true),
+                    ConfigurationTarget::Permanent => permanent == Some(true),
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime == Some(true) && permanent == Some(true)
+                    }
+                };
+                if already_set {
+                    return Err(OperationError::NothingToDo(format!(
+                        "policy set `{policy_set}` is already {} in {} configuration",
+                        if *enabled { "enabled" } else { "disabled" },
+                        target.label()
+                    )));
+                }
+            }
 
             Self::CreateIpSet { name, kind } => {
                 if !IPSET_TYPES.contains(&kind.as_str()) {
@@ -2113,6 +2240,15 @@ impl FirewallOperation {
                 service: service.clone(),
                 target: runtime,
             }),
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => Some(Self::SetPolicySetEnabled {
+                policy_set: policy_set.clone(),
+                enabled: !enabled,
+                target: runtime,
+            }),
             Self::RemoveServicePort { service, port } => Some(Self::AddServicePort {
                 service: service.clone(),
                 port: *port,
@@ -2151,6 +2287,25 @@ mod tests {
 
     fn service(name: &str) -> ServiceName {
         ServiceName::parse(name).unwrap()
+    }
+
+    fn gateway_snapshot(
+        version: &str,
+        runtime_disabled: bool,
+        permanent_disabled: bool,
+    ) -> FirewallSnapshot {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot.status.version = Some(version.to_owned());
+        for name in super::super::policy_set::GATEWAY_POLICY_MEMBERS {
+            let name = PolicyName::parse(name).unwrap();
+            let mut runtime = super::super::policy::PolicyDetails::empty(name.clone());
+            runtime.disabled = runtime_disabled;
+            let mut permanent = runtime.clone();
+            permanent.disabled = permanent_disabled;
+            snapshot.policies.runtime.insert(name.clone(), runtime);
+            snapshot.policies.permanent.insert(name, permanent);
+        }
+        snapshot
     }
 
     #[test]
@@ -2430,6 +2585,64 @@ mod tests {
         assert!(matches!(
             add.inverse().unwrap(),
             FirewallOperation::RemovePolicyService { .. }
+        ));
+    }
+
+    #[test]
+    fn policy_set_validation_is_capability_gated_and_reversible() {
+        let supported = gateway_snapshot("2.4.0", true, true);
+        let enable = FirewallOperation::SetPolicySetEnabled {
+            policy_set: PolicySetName::parse("gateway").unwrap(),
+            enabled: true,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+        assert!(enable.validate(&supported).is_ok());
+        assert_eq!(enable.postcondition_holds(&supported), Some(false));
+        assert!(enable.connectivity_warning().is_some());
+        assert!(matches!(
+            enable.inverse(),
+            Some(FirewallOperation::SetPolicySetEnabled { enabled: false, .. })
+        ));
+
+        let unsupported = gateway_snapshot("2.3.1", true, true);
+        let error = enable.validate(&unsupported).unwrap_err();
+        assert!(error.to_string().contains("require firewalld 2.4.0"));
+    }
+
+    #[test]
+    fn policy_set_narrowing_repairs_only_the_drifted_scope() {
+        let snapshot = gateway_snapshot("2.4.2", false, true);
+        let enable = FirewallOperation::SetPolicySetEnabled {
+            policy_set: PolicySetName::parse("gateway").unwrap(),
+            enabled: true,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+
+        assert_eq!(
+            enable.narrowed_for(&snapshot).target(),
+            ConfigurationTarget::Permanent
+        );
+        assert!(enable.validate(&snapshot).is_ok());
+
+        let already_enabled = gateway_snapshot("2.4.2", false, false);
+        assert_eq!(enable.postcondition_holds(&already_enabled), Some(true));
+        assert!(matches!(
+            enable.validate(&already_enabled),
+            Err(OperationError::NothingToDo(_))
+        ));
+
+        let mut partial = gateway_snapshot("2.4.2", true, true);
+        let missing =
+            PolicyName::parse(super::super::policy_set::GATEWAY_POLICY_MEMBERS[0]).unwrap();
+        partial.policies.runtime.remove(&missing);
+        assert_eq!(
+            enable.narrowed_for(&partial).target(),
+            ConfigurationTarget::RuntimeAndPermanent,
+            "an unknown scope must never be narrowed away"
+        );
+        assert!(matches!(
+            enable.validate(&partial),
+            Err(OperationError::Invalid(_))
         ));
     }
 

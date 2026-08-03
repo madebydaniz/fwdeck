@@ -245,6 +245,70 @@ async fn policy_round_trip() {
     );
 }
 
+#[tokio::test]
+#[ignore = "MUTATES firewalld policy sets — dev container only"]
+async fn policy_set_gateway_enable_disable_round_trip() {
+    let _serial = FIREWALL_LOCK.lock().await;
+
+    use fwdeck::application::ports::OperationOutcome;
+    use fwdeck::domain::{
+        FeatureSupport, FirewallOperation, FirewalldFeature, PolicySetDetails, PolicySetName,
+        PolicySetState,
+    };
+
+    let backend = CliBackend::new(TokioRunner);
+    let status = backend.probe().await.unwrap();
+    if matches!(
+        FirewalldFeature::PolicySets.support_for(status.version.as_deref()),
+        FeatureSupport::Unsupported
+    ) {
+        return;
+    }
+    assert_eq!(
+        FirewalldFeature::PolicySets.support_for(status.version.as_deref()),
+        FeatureSupport::Supported,
+        "policy-set support must be known before mutating the real daemon"
+    );
+
+    let policy_set = PolicySetName::parse("gateway").unwrap();
+    let initial =
+        PolicySetDetails::from_snapshot(&backend.snapshot().await.unwrap(), policy_set.clone());
+    assert_eq!(initial.runtime.state, PolicySetState::Disabled);
+    assert_eq!(initial.permanent.state, PolicySetState::Disabled);
+
+    let enable = FirewallOperation::SetPolicySetEnabled {
+        policy_set: policy_set.clone(),
+        enabled: true,
+        target: ConfigurationTarget::RuntimeAndPermanent,
+    };
+    let enable_outcome = backend.apply(&enable).await;
+    let enabled_snapshot = backend.snapshot().await;
+
+    let disable = FirewallOperation::SetPolicySetEnabled {
+        policy_set: policy_set.clone(),
+        enabled: false,
+        target: ConfigurationTarget::RuntimeAndPermanent,
+    };
+    let disable_outcome = backend.apply(&disable).await;
+    let restored_snapshot = backend.snapshot().await;
+
+    assert!(
+        matches!(enable_outcome, OperationOutcome::Applied { .. }),
+        "{enable_outcome:?}"
+    );
+    let enabled = PolicySetDetails::from_snapshot(&enabled_snapshot.unwrap(), policy_set.clone());
+    assert_eq!(enabled.runtime.state, PolicySetState::Enabled);
+    assert_eq!(enabled.permanent.state, PolicySetState::Enabled);
+
+    assert!(
+        matches!(disable_outcome, OperationOutcome::Applied { .. }),
+        "{disable_outcome:?}"
+    );
+    let restored = PolicySetDetails::from_snapshot(&restored_snapshot.unwrap(), policy_set);
+    assert_eq!(restored.runtime.state, PolicySetState::Disabled);
+    assert_eq!(restored.permanent.state, PolicySetState::Disabled);
+}
+
 #[cfg(feature = "dbus")]
 #[tokio::test]
 #[ignore = "requires a running firewalld + D-Bus (dev container)"]

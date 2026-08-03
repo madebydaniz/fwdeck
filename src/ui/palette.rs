@@ -4,7 +4,10 @@
 
 use strum::IntoEnumIterator;
 
-use crate::domain::{FirewallOperation, LogDenied};
+use crate::domain::{
+    ConfigurationTarget, FeatureSupport, FirewallOperation, FirewalldFeature, LogDenied,
+    SnapshotSection,
+};
 use crate::infrastructure::firewalld::command::ExportFormat;
 
 use super::action::UiAction;
@@ -127,6 +130,27 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
         Availability::Disabled("read-only mode")
     } else {
         staged
+    };
+    let policy_sets_mutable = match mutable {
+        Availability::Enabled => match state.snapshot.as_deref() {
+            Some(snapshot)
+                if !snapshot.section_is_complete(
+                    SnapshotSection::Policies,
+                    ConfigurationTarget::RuntimeAndPermanent,
+                ) =>
+            {
+                Availability::Disabled("policy data incomplete")
+            }
+            Some(snapshot) => match FirewalldFeature::PolicySets
+                .support_for(snapshot.status.version.as_deref())
+            {
+                FeatureSupport::Supported => Availability::Enabled,
+                FeatureSupport::Unsupported => Availability::Disabled("requires firewalld 2.4+"),
+                FeatureSupport::Unknown => Availability::Disabled("firewalld version unknown"),
+            },
+            None => Availability::Disabled("no data yet"),
+        },
+        disabled @ Availability::Disabled(_) => disabled,
     };
     let row_bound = |required_view: ViewId, reason: &'static str| match mutable {
         Availability::Enabled if state.view == required_view && has_rows => Availability::Enabled,
@@ -576,6 +600,22 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
             with_data,
         ),
         cmd(
+            UiAction::BrowsePolicySets,
+            "Browse policy sets",
+            "Show capability, member policies, and scoped administrative state",
+            &["policy", "set", "gateway", "router", "members"],
+            Category::App,
+            with_data,
+        ),
+        cmd(
+            UiAction::OpenForm(FormKind::SetPolicySetState),
+            "Set policy-set state",
+            "Enable or disable a verified predefined set (firewalld 2.4+)",
+            &["policy", "set", "gateway", "enable", "disable", "router"],
+            Category::Firewall,
+            policy_sets_mutable,
+        ),
+        cmd(
             UiAction::ShowPolicyDependencies,
             "Policy dependency graph",
             "Show scoped zone/service edges and dangling references",
@@ -784,6 +824,31 @@ mod tests {
                 .iter()
                 .any(|command| command.action == UiAction::ShowPolicyDependencies)
         );
+    }
+
+    #[test]
+    fn policy_set_mutation_is_version_gated() {
+        let mut state = state_with_palette("policy set state");
+        let mut snapshot = crate::domain::mock::sample().expect("mock");
+        snapshot.status.version = Some("2.3.1".to_owned());
+        state.snapshot = Some(std::sync::Arc::new(snapshot));
+        let command = catalog(&state)
+            .into_iter()
+            .find(|command| command.action == UiAction::OpenForm(FormKind::SetPolicySetState))
+            .expect("policy-set command");
+        assert_eq!(
+            command.availability,
+            Availability::Disabled("requires firewalld 2.4+")
+        );
+
+        let mut snapshot = crate::domain::mock::sample().expect("mock");
+        snapshot.status.version = Some("2.4.0".to_owned());
+        state.snapshot = Some(std::sync::Arc::new(snapshot));
+        let command = catalog(&state)
+            .into_iter()
+            .find(|command| command.action == UiAction::OpenForm(FormKind::SetPolicySetState))
+            .expect("policy-set command");
+        assert_eq!(command.availability, Availability::Enabled);
     }
 
     #[test]

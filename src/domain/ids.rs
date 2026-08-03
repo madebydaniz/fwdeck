@@ -172,9 +172,17 @@ identifier!(
     &['_', '-']
 );
 identifier!(
-    /// A firewalld policy name.
+    /// A firewalld policy name. Shipped policy-set members exceed the zone
+    /// name limit (for example `gateway-lan-to-world`).
     PolicyName,
     "policy name",
+    64,
+    &['_', '-']
+);
+identifier!(
+    /// A predefined firewalld policy-set name used by `--policy-set`.
+    PolicySetName,
+    "policy-set name",
     17,
     &['_', '-']
 );
@@ -203,6 +211,10 @@ mod tests {
         assert_eq!(
             InterfaceName::parse("eth0.100").unwrap().as_str(),
             "eth0.100"
+        );
+        assert_eq!(
+            PolicyName::parse("gateway-lan-to-world").unwrap().as_str(),
+            "gateway-lan-to-world"
         );
     }
 
