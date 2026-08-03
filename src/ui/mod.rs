@@ -126,7 +126,15 @@ async fn event_loop(
             std::collections::VecDeque::from([action]);
         while let Some(action) = pending.pop_front() {
             for effect in update::update(&mut state, action) {
-                match execute_effect(effect, &mut state, &mut engine, &mut pending).await {
+                match execute_effect(
+                    effect,
+                    &mut state,
+                    &mut engine,
+                    &mut pending,
+                    config.retention,
+                )
+                .await
+                {
                     ControlFlow::Continue(()) => {}
                     ControlFlow::Break(()) => {
                         // A clean quit must not abandon armed rollbacks: fire
@@ -193,6 +201,7 @@ async fn execute_effect(
     state: &mut state::UiState,
     engine: &mut EngineHandle,
     pending: &mut std::collections::VecDeque<UiAction>,
+    retention: crate::config::RetentionConfig,
 ) -> ControlFlow<()> {
     match effect {
         Effect::Quit => return ControlFlow::Break(()),
@@ -244,6 +253,15 @@ async fn execute_effect(
             .unwrap_or_else(|join| Err(format!("snapshot task failed: {join}")));
             match result {
                 Ok(path) => {
+                    let prune = tokio::task::spawn_blocking(move || {
+                        crate::infrastructure::retention::prune(
+                            &retention,
+                            crate::infrastructure::retention::RetentionScope::Snapshots,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|join| Err(format!("snapshot retention task failed: {join}")));
+                    surface_prune_result(state, "snapshot", prune);
                     state.toast(
                         state::ToastKind::Success,
                         format!("snapshot saved to {path}"),
@@ -291,17 +309,49 @@ async fn execute_effect(
             pending.push_back(UiAction::CountersLoaded(result));
         }
         Effect::RecordAudit { op_id, outcome } => {
-            if let Err(err) = crate::infrastructure::audit::record(op_id, &outcome) {
+            let audit_retention = retention.audit;
+            let result = tokio::task::spawn_blocking(move || {
+                crate::infrastructure::audit::record(op_id, &outcome, audit_retention)
+            })
+            .await
+            .unwrap_or_else(|join| Err(format!("audit task failed: {join}")));
+            if let Err(err) = result {
                 // An unrecorded mutation is an incident, not a debug line.
                 state.toast(
                     state::ToastKind::Error,
                     format!("AUDIT WRITE FAILED: {err}"),
                 );
+            } else {
+                let prune = tokio::task::spawn_blocking(move || {
+                    crate::infrastructure::retention::prune(
+                        &retention,
+                        crate::infrastructure::retention::RetentionScope::Audit,
+                    )
+                })
+                .await
+                .unwrap_or_else(|join| Err(format!("audit retention task failed: {join}")));
+                surface_prune_result(state, "audit", prune);
             }
         }
         Effect::ExportPlan(format, rendered) => {
-            match crate::infrastructure::export_write(format, &rendered) {
-                Ok(path) => state.toast(state::ToastKind::Success, format!("exported to {path}")),
+            let result = tokio::task::spawn_blocking(move || {
+                crate::infrastructure::export_write(format, &rendered)
+            })
+            .await
+            .unwrap_or_else(|join| Err(format!("export task failed: {join}")));
+            match result {
+                Ok(path) => {
+                    let prune = tokio::task::spawn_blocking(move || {
+                        crate::infrastructure::retention::prune(
+                            &retention,
+                            crate::infrastructure::retention::RetentionScope::Exports,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|join| Err(format!("export retention task failed: {join}")));
+                    surface_prune_result(state, "export", prune);
+                    state.toast(state::ToastKind::Success, format!("exported to {path}"));
+                }
                 Err(err) => state.toast(state::ToastKind::Error, format!("export failed: {err}")),
             }
         }
@@ -316,6 +366,38 @@ async fn execute_effect(
         }
     }
     ControlFlow::Continue(())
+}
+
+fn surface_prune_result(
+    state: &mut state::UiState,
+    collection: &str,
+    result: Result<crate::infrastructure::retention::PruneReport, String>,
+) {
+    match result {
+        Ok(report) => {
+            if !report.removed.is_empty() {
+                tracing::info!(
+                    collection,
+                    removed = report.removed.len(),
+                    reclaimed_bytes = report.reclaimed_bytes,
+                    "retention pruned local state"
+                );
+            }
+            if !report.failures.is_empty() {
+                state.toast(
+                    state::ToastKind::Warning,
+                    format!(
+                        "{collection} retention had {} cleanup failure(s)",
+                        report.failures.len()
+                    ),
+                );
+            }
+        }
+        Err(err) => state.toast(
+            state::ToastKind::Warning,
+            format!("{collection} retention check failed: {err}"),
+        ),
+    }
 }
 
 /// Fires every armed rollback inverse and waits (max ~5 s) for the engine to

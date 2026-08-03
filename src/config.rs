@@ -16,6 +16,7 @@ struct FileConfig {
     ui: UiSection,
     behavior: BehaviorSection,
     logging: LoggingSection,
+    retention: RetentionSection,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -74,6 +75,64 @@ impl Default for LoggingSection {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RetentionSection {
+    snapshots: SnapshotRetentionSection,
+    exports: ExportRetentionSection,
+    audit: AuditRetentionSection,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SnapshotRetentionSection {
+    max_count: usize,
+    max_age_days: u64,
+    min_keep: usize,
+}
+
+impl Default for SnapshotRetentionSection {
+    fn default() -> Self {
+        Self {
+            max_count: 100,
+            max_age_days: 90,
+            min_keep: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ExportRetentionSection {
+    max_count: usize,
+    max_age_days: u64,
+}
+
+impl Default for ExportRetentionSection {
+    fn default() -> Self {
+        Self {
+            max_count: 20,
+            max_age_days: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AuditRetentionSection {
+    max_files: usize,
+    max_file_size_mb: u64,
+}
+
+impl Default for AuditRetentionSection {
+    fn default() -> Self {
+        Self {
+            max_files: 10,
+            max_file_size_mb: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum TargetSetting {
@@ -123,10 +182,43 @@ pub struct Config {
     pub rollback_timeout: Duration,
     /// Tracing filter level (trace/debug/info/warn/error).
     pub log_level: String,
+    /// Bounded local-state retention policies.
+    pub retention: RetentionConfig,
     /// Zone to select at startup, if any.
     pub initial_zone: Option<String>,
     /// The config file this was loaded from, if one existed.
     pub path: Option<PathBuf>,
+}
+
+/// Retention policy for timestamped snapshot or export files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileRetentionConfig {
+    /// Maximum number of unpinned files retained.
+    pub max_count: usize,
+    /// Maximum file age.
+    pub max_age: Duration,
+    /// Newest unpinned files protected from automatic pruning.
+    pub min_keep: usize,
+}
+
+/// Rotation and retention policy for the local advisory audit trail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditRetentionConfig {
+    /// Maximum number of local audit files, including the active file.
+    pub max_files: usize,
+    /// Size at which the active audit file rotates.
+    pub max_file_size: u64,
+}
+
+/// Local-state retention policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionConfig {
+    /// Snapshot retention; pinned snapshots are excluded from automatic pruning.
+    pub snapshots: FileRetentionConfig,
+    /// Versioned staged-plan export retention.
+    pub exports: FileRetentionConfig,
+    /// Advisory audit-file rotation and retention.
+    pub audit: AuditRetentionConfig,
 }
 
 impl Default for Config {
@@ -141,6 +233,8 @@ impl Default for Config {
 const MIN_REFRESH: Duration = Duration::from_millis(200);
 /// And to this ceiling, so a fat-fingered value can't freeze the UI for hours.
 const MAX_REFRESH: Duration = Duration::from_secs(3600);
+const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 /// Clamps a millisecond count to the sane refresh window, never producing a
 /// zero (panic) or absurd duration.
@@ -165,10 +259,82 @@ impl Config {
             // rollback window and can overflow the derived tick math.
             rollback_timeout: Duration::from_secs(file.behavior.rollback_timeout_seconds.min(3600)),
             log_level: file.logging.level,
+            retention: RetentionConfig {
+                snapshots: FileRetentionConfig {
+                    max_count: file.retention.snapshots.max_count,
+                    max_age: Duration::from_secs(
+                        file.retention
+                            .snapshots
+                            .max_age_days
+                            .saturating_mul(SECONDS_PER_DAY),
+                    ),
+                    min_keep: file.retention.snapshots.min_keep,
+                },
+                exports: FileRetentionConfig {
+                    max_count: file.retention.exports.max_count,
+                    max_age: Duration::from_secs(
+                        file.retention
+                            .exports
+                            .max_age_days
+                            .saturating_mul(SECONDS_PER_DAY),
+                    ),
+                    min_keep: 0,
+                },
+                audit: AuditRetentionConfig {
+                    max_files: file.retention.audit.max_files,
+                    max_file_size: file
+                        .retention
+                        .audit
+                        .max_file_size_mb
+                        .saturating_mul(BYTES_PER_MIB),
+                },
+            },
             initial_zone: None,
             path: None,
         }
     }
+}
+
+fn validate_retention(retention: &RetentionSection) -> Result<(), String> {
+    if retention.snapshots.max_count == 0 {
+        return Err("retention.snapshots.max_count must be positive".to_owned());
+    }
+    if retention.snapshots.max_age_days == 0 {
+        return Err("retention.snapshots.max_age_days must be positive".to_owned());
+    }
+    if retention.snapshots.min_keep > retention.snapshots.max_count {
+        return Err(
+            "retention.snapshots.min_keep cannot exceed retention.snapshots.max_count".to_owned(),
+        );
+    }
+    if retention.exports.max_count == 0 {
+        return Err("retention.exports.max_count must be positive".to_owned());
+    }
+    if retention.exports.max_age_days == 0 {
+        return Err("retention.exports.max_age_days must be positive".to_owned());
+    }
+    if retention.audit.max_files < 2 {
+        return Err("retention.audit.max_files must be at least 2".to_owned());
+    }
+    if retention.audit.max_file_size_mb == 0 {
+        return Err("retention.audit.max_file_size_mb must be positive".to_owned());
+    }
+    retention
+        .snapshots
+        .max_age_days
+        .checked_mul(SECONDS_PER_DAY)
+        .ok_or_else(|| "retention.snapshots.max_age_days is too large".to_owned())?;
+    retention
+        .exports
+        .max_age_days
+        .checked_mul(SECONDS_PER_DAY)
+        .ok_or_else(|| "retention.exports.max_age_days is too large".to_owned())?;
+    retention
+        .audit
+        .max_file_size_mb
+        .checked_mul(BYTES_PER_MIB)
+        .ok_or_else(|| "retention.audit.max_file_size_mb is too large".to_owned())?;
+    Ok(())
 }
 
 /// The XDG default config path (`~/.config/fwdeck/config.toml` on Linux).
@@ -201,6 +367,13 @@ pub fn load(cli: &Cli) -> Result<Config, AppError> {
         }
         _ => FileConfig::default(),
     };
+
+    validate_retention(&file.retention).map_err(|message| AppError::Config {
+        path: path
+            .as_ref()
+            .map_or_else(|| "<defaults>".to_owned(), |p| p.display().to_string()),
+        message,
+    })?;
 
     let mut config = Config::from_file(file);
     config.path = path;
@@ -277,6 +450,15 @@ mod tests {
         assert!(config.confirm_destructive);
         assert!(!config.read_only);
         assert_eq!(config.rollback_timeout, Duration::from_secs(30));
+        assert_eq!(config.retention.snapshots.max_count, 100);
+        assert_eq!(
+            config.retention.snapshots.max_age,
+            Duration::from_secs(90 * SECONDS_PER_DAY)
+        );
+        assert_eq!(config.retention.snapshots.min_keep, 10);
+        assert_eq!(config.retention.exports.max_count, 20);
+        assert_eq!(config.retention.audit.max_files, 10);
+        assert_eq!(config.retention.audit.max_file_size, 5 * BYTES_PER_MIB);
     }
 
     #[test]
@@ -299,6 +481,47 @@ mod tests {
     fn rejects_unknown_fields_with_context() {
         let result = toml::from_str::<FileConfig>("[ui]\nsidebar_widht = 30\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_enterprise_retention_policy() {
+        let file: FileConfig = toml::from_str(
+            r"
+            [retention.snapshots]
+            max_count = 40
+            max_age_days = 60
+            min_keep = 5
+
+            [retention.exports]
+            max_count = 12
+            max_age_days = 14
+
+            [retention.audit]
+            max_files = 20
+            max_file_size_mb = 8
+            ",
+        )
+        .unwrap();
+        validate_retention(&file.retention).unwrap();
+        let config = Config::from_file(file);
+        assert_eq!(config.retention.snapshots.max_count, 40);
+        assert_eq!(config.retention.snapshots.min_keep, 5);
+        assert_eq!(
+            config.retention.exports.max_age,
+            Duration::from_secs(14 * SECONDS_PER_DAY)
+        );
+        assert_eq!(config.retention.audit.max_files, 20);
+        assert_eq!(config.retention.audit.max_file_size, 8 * BYTES_PER_MIB);
+    }
+
+    #[test]
+    fn rejects_unsafe_retention_values() {
+        let file: FileConfig =
+            toml::from_str("[retention.snapshots]\nmax_count = 5\nmin_keep = 6\n").unwrap();
+        assert!(validate_retention(&file.retention).is_err());
+
+        let file: FileConfig = toml::from_str("[retention.audit]\nmax_files = 1\n").unwrap();
+        assert!(validate_retention(&file.retention).is_err());
     }
 
     #[test]
