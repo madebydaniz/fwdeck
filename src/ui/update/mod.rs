@@ -243,6 +243,17 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.toast(ToastKind::Info, "no data yet");
             }
         }
+        UiAction::ShowPolicyDependencies => {
+            if let Some(snapshot) = state.snapshot.clone() {
+                state
+                    .overlays
+                    .push(Overlay::Details(details::policy_dependency_graph(
+                        &snapshot,
+                    )));
+            } else {
+                state.toast(ToastKind::Info, "no data yet");
+            }
+        }
         UiAction::ShowDrift => {
             if let Some(snapshot) = state.snapshot.clone() {
                 state
@@ -1212,6 +1223,24 @@ mod tests {
         update(&mut s, UiAction::ShowDrift);
         match s.overlays.last() {
             Some(Overlay::Details(content)) => assert!(content.title.starts_with("Drift (")),
+            other => panic!("expected details overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_policy_dependencies_opens_scoped_graph() {
+        let mut s = state();
+        update(&mut s, UiAction::ShowPolicyDependencies);
+        match s.overlays.last() {
+            Some(Overlay::Details(content)) => {
+                assert!(content.title.starts_with("Policy dependency graph"));
+                assert!(
+                    content
+                        .lines
+                        .iter()
+                        .any(|(_, value)| value.contains("public → mypolicy"))
+                );
+            }
             other => panic!("expected details overlay, got {other:?}"),
         }
     }

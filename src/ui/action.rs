@@ -143,6 +143,8 @@ pub enum UiAction {
     BrowseServices,
     /// Open the policy objects overlay.
     BrowsePolicies,
+    /// Open the scoped policy-to-zone/service dependency graph.
+    ShowPolicyDependencies,
     /// Open the drift workspace: every runtime vs permanent difference
     /// across all zones.
     ShowDrift,

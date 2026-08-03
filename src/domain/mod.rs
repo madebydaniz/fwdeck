@@ -1,6 +1,7 @@
 //! Pure domain types for firewalld state. No I/O, no async, no UI dependencies.
 
 pub mod address;
+pub mod dependency;
 pub mod explain;
 pub mod ids;
 #[cfg(test)]
@@ -16,6 +17,7 @@ pub mod snapshot;
 pub mod zone;
 
 pub use address::{AddressFamily, IpSetEntry, SourceAddress};
+pub use dependency::{PolicyDependency, PolicyDependencyGraph, PolicyDependencyResource};
 pub use ids::{
     IcmpType, InterfaceName, IpProtocol, IpSetName, PolicyName, ServiceName, ValidationError,
     ZoneName,

@@ -576,6 +576,14 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
             with_data,
         ),
         cmd(
+            UiAction::ShowPolicyDependencies,
+            "Policy dependency graph",
+            "Show scoped zone/service edges and dangling references",
+            &["policy", "graph", "dependency", "impact", "reference"],
+            Category::Firewall,
+            with_data,
+        ),
+        cmd(
             UiAction::ShowDrift,
             "Drift workspace",
             "Every runtime vs permanent difference across all zones",
@@ -765,6 +773,16 @@ mod tests {
             filtered(&state)
                 .iter()
                 .any(|c| c.action == UiAction::ToggleMasqueradeRequested)
+        );
+    }
+
+    #[test]
+    fn dependency_graph_is_discoverable_by_impact_keyword() {
+        let state = state_with_palette("impact");
+        assert!(
+            filtered(&state)
+                .iter()
+                .any(|command| command.action == UiAction::ShowPolicyDependencies)
         );
     }
 

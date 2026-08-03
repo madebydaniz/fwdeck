@@ -3,7 +3,10 @@
 //! error diagnostics with recovery hints.
 
 use crate::application::ports::{FirewallError, OperationOutcome};
-use crate::domain::{FirewallOperation, FirewallSnapshot, ZoneName};
+use crate::domain::{
+    ConfigurationTarget, FirewallOperation, FirewallSnapshot, PolicyDependencyGraph,
+    PolicyDependencyResource, SnapshotSection, ZoneName,
+};
 
 use super::views::{RowId, ViewId, ViewRow};
 
@@ -565,6 +568,95 @@ pub fn policy_browse(snapshot: &FirewallSnapshot) -> DetailsContent {
     DetailsContent {
         title: format!("Policies ({})", names.len()),
         lines,
+    }
+}
+
+/// Scoped policy dependency edges with health derived from the same snapshot.
+#[must_use]
+pub fn policy_dependency_graph(snapshot: &FirewallSnapshot) -> DetailsContent {
+    let mut lines = Vec::new();
+    let mut edge_count = 0usize;
+
+    for (target, scope) in [
+        (ConfigurationTarget::Runtime, "runtime"),
+        (ConfigurationTarget::Permanent, "permanent"),
+    ] {
+        let graph = PolicyDependencyGraph::from_snapshot(snapshot, target);
+        let dependencies: Vec<_> = graph.dependencies().collect();
+        lines.push(line(scope, format!("{} edges", dependencies.len())));
+        edge_count += dependencies.len();
+
+        if dependencies.is_empty() {
+            lines.push(line("", "none"));
+            continue;
+        }
+
+        for dependency in dependencies {
+            let (role, edge, health) = match &dependency.resource {
+                PolicyDependencyResource::IngressZone(zone) => (
+                    "ingress",
+                    format!("{zone} → {}", dependency.policy),
+                    zone_dependency_health(snapshot, target, zone),
+                ),
+                PolicyDependencyResource::EgressZone(zone) => (
+                    "egress",
+                    format!("{} → {zone}", dependency.policy),
+                    zone_dependency_health(snapshot, target, zone),
+                ),
+                PolicyDependencyResource::Service(service) => (
+                    "service",
+                    format!("{service} → {}", dependency.policy),
+                    service_dependency_health(snapshot, target, service),
+                ),
+            };
+            lines.push(line(&format!("  {role}"), format!("{edge} [{health}]")));
+        }
+        lines.push(line("", ""));
+    }
+
+    lines.push(line(
+        "safety",
+        "permanent references must be removed before deleting a zone or service",
+    ));
+    DetailsContent {
+        title: format!("Policy dependency graph ({edge_count} scoped edges)"),
+        lines,
+    }
+}
+
+fn zone_dependency_health(
+    snapshot: &FirewallSnapshot,
+    target: ConfigurationTarget,
+    zone: &str,
+) -> &'static str {
+    if matches!(zone, "ANY" | "HOST") {
+        return "pseudo-zone";
+    }
+    if !snapshot.section_is_complete(SnapshotSection::Zones, target) {
+        return "unknown";
+    }
+    let exists = match target {
+        ConfigurationTarget::Runtime => snapshot.runtime.keys().any(|name| name.as_str() == zone),
+        ConfigurationTarget::Permanent => {
+            snapshot.permanent.keys().any(|name| name.as_str() == zone)
+        }
+        ConfigurationTarget::RuntimeAndPermanent => false,
+    };
+    if exists { "ok" } else { "missing" }
+}
+
+fn service_dependency_health(
+    snapshot: &FirewallSnapshot,
+    target: ConfigurationTarget,
+    service: &crate::domain::ServiceName,
+) -> &'static str {
+    if !snapshot.section_is_complete(SnapshotSection::Services, target) {
+        return "unknown";
+    }
+    if snapshot.available_services.contains(service) {
+        "ok"
+    } else {
+        "missing"
     }
 }
 
