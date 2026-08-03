@@ -687,7 +687,28 @@ rollback_timeout_seconds = 30   # dead-man's switch; 0 disables
 read_only = false
 
 [logging]
-level = "info"                  # file log: ~/.local/state/fwdeck/fwdeck.log</pre>
+level = "info"                  # file log: ~/.local/state/fwdeck/fwdeck.log
+
+[retention.snapshots]
+max_count = 100
+max_age_days = 90
+min_keep = 10                   # pinned snapshots never auto-delete
+
+[retention.exports]
+max_count = 20
+max_age_days = 30
+
+[retention.audit]
+max_files = 10                  # includes the active audit.jsonl
+max_file_size_mb = 5</pre>
+<p>Retention runs at startup and after new state is written. It only removes
+regular files with FWDeck-generated names; symlinks, imported snapshots, and
+unknown files are ignored. Preview the exact plan before applying it:</p>
+<pre>fwdeck prune --dry-run       # read-only; this is also the default mode
+fwdeck prune --apply         # apply the displayed policy
+fwdeck snapshots list       # show managed/pinned snapshots
+fwdeck snapshots pin snapshot-1700000000000.json
+fwdeck snapshots unpin snapshot-1700000000000.json</pre>
 <h3>CLI flags</h3>
 <pre>fwdeck --read-only          # inspection only
 fwdeck --zone public        # open with a zone selected
@@ -695,6 +716,7 @@ fwdeck --target runtime     # default mutation target
 fwdeck --backend dbus       # native D-Bus backend (build with --features dbus)
 fwdeck --offline            # permanent config via firewall-offline-cmd
 fwdeck --no-color           # reduced-color terminals
+fwdeck prune --dry-run      # inspect retention without deleting files
 fwdeck completions zsh      # shell completions (bash|zsh|fish)
 fwdeck manpage              # man page to stdout</pre>
 </section>
@@ -773,7 +795,10 @@ container kernels can't emit netfilter logs at all.</p>
 binding permanent, or set the zone on the NM connection itself.</p>
 <h3>Where are logs, audit, snapshots?</h3>
 <p><code>~/.local/state/fwdeck/</code> — <code>fwdeck.log</code>,
-<code>audit.jsonl</code>, <code>snapshots/</code>, <code>exports/</code>.</p>
+<code>audit.jsonl</code> plus bounded timestamped archives,
+<code>snapshots/</code>, and versioned <code>exports/</code>. Files are private;
+<code>fwdeck doctor</code> reports recognized file counts, bytes, pin state, and
+how many files the current retention policy would prune.</p>
 </section>
 
 <section id="development">

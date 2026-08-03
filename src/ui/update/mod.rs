@@ -310,7 +310,10 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         UiAction::SnapshotsListed(entries) => {
             let mut lines: Vec<(String, String)> = entries
                 .iter()
-                .map(|entry| (entry.name.clone(), format!("{} bytes", entry.bytes)))
+                .map(|entry| {
+                    let state = if entry.pinned { " · pinned" } else { "" };
+                    (entry.name.clone(), format!("{} bytes{state}", entry.bytes))
+                })
                 .collect();
             if lines.is_empty() {
                 lines.push(("snapshots".to_owned(), "none saved yet".to_owned()));

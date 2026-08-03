@@ -39,6 +39,8 @@ pub struct SnapshotEntry {
     pub name: String,
     /// File size in bytes.
     pub bytes: u64,
+    /// Excluded from automatic retention pruning.
+    pub pinned: bool,
 }
 
 fn snapshot_dir() -> Option<std::path::PathBuf> {
@@ -52,15 +54,10 @@ pub fn save(snapshot: &FirewallSnapshot) -> Result<String, String> {
     // subdirectory inherits privacy from create_private_dir.
     crate::bootstrap::ensure_state_dir().ok_or_else(|| "no state directory".to_owned())?;
     let dir = snapshot_dir().ok_or_else(|| "no state directory".to_owned())?;
-    create_private_dir(&dir).map_err(|err| err.to_string())?;
+    super::state_file::create_private_dir(&dir).map_err(|err| err.to_string())?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
-    // Reserve a unique filename by *atomically* creating it (O_EXCL), bumping a
-    // suffix on collision. This closes the check-then-create race a
-    // `while path.exists()` loop leaves open: two saves in the same millisecond
-    // can no longer pick the same name and clobber each other.
-    let path = reserve_unique_path(&dir, stamp).map_err(|err| err.to_string())?;
     let envelope = SnapshotFile {
         schema: SCHEMA_VERSION,
         host: crate::bootstrap::hostname(),
@@ -73,70 +70,25 @@ pub fn save(snapshot: &FirewallSnapshot) -> Result<String, String> {
         snapshot: snapshot.clone(),
     };
     let json = serde_json::to_string_pretty(&envelope).map_err(|err| err.to_string())?;
-    // Snapshots reveal firewall topology: private perms, written atomically
-    // (temp + fsync + rename) so a crash never leaves a torn file.
-    write_private_atomic(&path, json.as_bytes()).map_err(|err| err.to_string())?;
+    // The completed temp inode is linked into its final unique name only after
+    // fsync, so readers never observe an empty reservation or a torn file.
+    let path = write_snapshot_file(&dir, stamp, json.as_bytes()).map_err(|err| err.to_string())?;
     Ok(path.display().to_string())
 }
 
-/// Atomically claims a unique `snapshot-<stamp>[-<n>].json` name by creating it
-/// with `O_EXCL` (`0600`). Returns the reserved path; the caller fills it via
-/// the temp-file + rename in [`write_private_atomic`]. Reserving up front means
-/// two concurrent saves can never resolve to the same name.
-fn reserve_unique_path(dir: &std::path::Path, stamp: u128) -> std::io::Result<std::path::PathBuf> {
-    let mut counter = 0u32;
-    loop {
-        let name = if counter == 0 {
+fn write_snapshot_file(
+    dir: &std::path::Path,
+    stamp: u128,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    super::state_file::write_private_atomic_unique(dir, bytes, |collision| {
+        let name = if collision == 0 {
             format!("snapshot-{stamp}.json")
         } else {
-            format!("snapshot-{stamp}-{counter}.json")
+            format!("snapshot-{stamp}-{collision}.json")
         };
-        let path = dir.join(name);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(_reserved) => return Ok(path),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => counter += 1,
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-/// Creates `dir` (and parents) with `0700` on Unix.
-fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(dir)
-}
-
-/// Writes `bytes` to `path` with `0600` perms via temp file + fsync + rename.
-fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let tmp = path.with_extension("json.tmp");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)
+        dir.join(name)
+    })
 }
 
 /// Loads and deserializes a saved snapshot by filename. Deserialization
@@ -189,6 +141,41 @@ pub fn load(name: &str) -> Result<FirewallSnapshot, String> {
     Ok(snapshot)
 }
 
+/// Pins or unpins an app-generated snapshot. Pinned snapshots are excluded
+/// from automatic retention pruning.
+pub fn set_pinned(name: &str, pinned: bool) -> Result<(), String> {
+    let dir = snapshot_dir().ok_or_else(|| "no state directory".to_owned())?;
+    set_pinned_in_dir(&dir, name, pinned).map_err(|err| err.to_string())
+}
+
+fn set_pinned_in_dir(dir: &std::path::Path, name: &str, pinned: bool) -> std::io::Result<()> {
+    if !super::retention::is_snapshot_name(name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "only app-generated snapshot names can be pinned",
+        ));
+    }
+    let snapshot = dir.join(name);
+    let metadata = std::fs::symlink_metadata(&snapshot)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snapshot is not a regular file",
+        ));
+    }
+    let marker = dir.join(super::retention::pin_name(name));
+    if pinned {
+        super::state_file::create_private_dir(dir)?;
+        super::state_file::write_private_atomic_replace(&marker, b"pinned\n")
+    } else {
+        match std::fs::remove_file(marker) {
+            Ok(()) => super::state_file::sync_dir(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 /// Lists saved snapshots, newest first (filenames sort lexically by timestamp).
 #[must_use]
 pub fn list() -> Vec<SnapshotEntry> {
@@ -209,7 +196,13 @@ pub fn list() -> Vec<SnapshotEntry> {
                 return None;
             }
             let bytes = entry.metadata().ok().map_or(0, |m| m.len());
-            Some(SnapshotEntry { name, bytes })
+            let pinned = std::fs::symlink_metadata(dir.join(super::retention::pin_name(&name)))
+                .is_ok_and(|metadata| metadata.file_type().is_file());
+            Some(SnapshotEntry {
+                name,
+                bytes,
+                pinned,
+            })
         })
         .collect();
     snapshots.sort_by(|a, b| b.name.cmp(&a.name));
@@ -219,39 +212,57 @@ pub fn list() -> Vec<SnapshotEntry> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{reserve_unique_path, write_private_atomic};
+    use super::{set_pinned_in_dir, write_snapshot_file};
 
     #[test]
-    fn atomic_write_is_exact_and_private() {
-        let dir = std::env::temp_dir().join(format!("fwdeck-snapw-{}", std::process::id()));
+    fn same_millisecond_saves_publish_distinct_complete_files() {
+        let dir = std::env::temp_dir().join(format!("fwdeck-snap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("snapshot-1.json");
-        write_private_atomic(&path, br#"{"schema":1}"#).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), br#"{"schema":1}"#);
-        // The temp file is renamed into place, never left behind.
-        assert!(!path.with_extension("json.tmp").exists());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "snapshot must be 0600");
-        }
+        let stamp = 1_700_000_000_000u128;
+        let first = write_snapshot_file(&dir, stamp, b"first").unwrap();
+        let second = write_snapshot_file(&dir, stamp, b"second").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        assert_eq!(std::fs::read(second).unwrap(), b"second");
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fwdeck-")
+        }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn reserved_names_never_collide() {
-        let dir = std::env::temp_dir().join(format!("fwdeck-snap-{}", std::process::id()));
+    fn pin_marker_is_private_and_reversible() {
+        let dir = std::env::temp_dir().join(format!("fwdeck-pin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Two saves in the same millisecond must resolve to distinct files, and
-        // both names are actually reserved on disk (O_EXCL), not merely planned.
-        let stamp = 1_700_000_000_000u128;
-        let first = reserve_unique_path(&dir, stamp).unwrap();
-        let second = reserve_unique_path(&dir, stamp).unwrap();
-        assert_ne!(first, second);
-        assert!(first.exists() && second.exists());
+        let name = "snapshot-1700000000000.json";
+        std::fs::write(dir.join(name), "{}").unwrap();
+        set_pinned_in_dir(&dir, name, true).unwrap();
+        let marker = dir.join(super::super::retention::pin_name(name));
+        assert!(marker.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&marker).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        set_pinned_in_dir(&dir, name, false).unwrap();
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pin_rejects_unknown_names() {
+        let dir = std::env::temp_dir().join(format!("fwdeck-pin-bad-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("import.json"), "{}").unwrap();
+        assert!(set_pinned_in_dir(&dir, "import.json", true).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -37,7 +37,7 @@ pub fn ensure_state_dir() -> Option<PathBuf> {
             .mode(0o700)
             .create(&dir)
             .ok()?;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(&dir).ok()?;
@@ -75,6 +75,16 @@ pub fn init_tracing(config: &Config) -> bool {
     let Ok(file) = options.open(dir.join("fwdeck.log")) else {
         return false;
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .is_err()
+        {
+            return false;
+        }
+    }
     let writer = FileWriter(Arc::new(file));
     let filter = EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -168,7 +178,7 @@ pub fn hostname() -> String {
 /// other instance's PID when the firewall is already being managed.
 pub fn acquire_instance_lock() -> Result<(), Option<u32>> {
     let Some(dir) = ensure_state_dir() else {
-        return Ok(()); // no state dir → nothing to lock on
+        return Err(None); // mutation without an enforceable lock is unsafe
     };
     let path = dir.join("fwdeck.lock");
     for _ in 0..2 {
@@ -182,8 +192,11 @@ pub fn acquire_instance_lock() -> Result<(), Option<u32>> {
         match options.open(&path) {
             Ok(mut file) => {
                 use std::io::Write as _;
-                let _ = write!(file, "{}", std::process::id());
-                return Ok(());
+                if write!(file, "{}", std::process::id()).is_ok() && file.sync_data().is_ok() {
+                    return Ok(());
+                }
+                let _ = std::fs::remove_file(&path);
+                return Err(None);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 let holder = std::fs::read_to_string(&path)
@@ -198,7 +211,7 @@ pub fn acquire_instance_lock() -> Result<(), Option<u32>> {
                 }
                 return Err(holder);
             }
-            Err(_) => return Ok(()), // lock trouble must never block the tool
+            Err(_) => return Err(None), // caller degrades to read-only
         }
     }
     Ok(())
@@ -207,13 +220,30 @@ pub fn acquire_instance_lock() -> Result<(), Option<u32>> {
 /// Removes the instance lock on clean shutdown.
 pub fn release_instance_lock() {
     if let Some(dir) = state_dir() {
-        let _ = std::fs::remove_file(dir.join("fwdeck.lock"));
+        let _ = release_owned_lock(&dir.join("fwdeck.lock"));
     }
 }
 
+fn release_owned_lock(path: &Path) -> std::io::Result<bool> {
+    let owner = match std::fs::read_to_string(path) {
+        Ok(owner) => owner,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if owner.trim().parse::<u32>().ok() != Some(std::process::id()) {
+        return Ok(false);
+    }
+    std::fs::remove_file(path)?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
-    use super::parse_ip_addr_interface;
+    use super::{parse_ip_addr_interface, release_owned_lock};
 
     const IP_ADDR: &str = "1: lo    inet 127.0.0.1/8 scope host lo\n\
 2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\n\
@@ -230,5 +260,21 @@ mod tests {
             Some("eth1")
         );
         assert_eq!(parse_ip_addr_interface(IP_ADDR, "8.8.8.8"), None);
+    }
+
+    #[test]
+    fn releases_only_a_lock_owned_by_this_process() {
+        let dir = std::env::temp_dir().join(format!("fwdeck-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fwdeck.lock");
+        std::fs::write(&path, format!("{}", std::process::id())).unwrap();
+        assert!(release_owned_lock(&path).unwrap());
+        assert!(!path.exists());
+
+        std::fs::write(&path, format!("{}", std::process::id().saturating_add(1))).unwrap();
+        assert!(!release_owned_lock(&path).unwrap());
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

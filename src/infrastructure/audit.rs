@@ -1,5 +1,6 @@
 //! Structured audit trail: one JSON line per executed operation in
-//! `~/.local/state/fwdeck/audit.jsonl`, rotated at ~5 MB. Failures are
+//! `~/.local/state/fwdeck/audit.jsonl`, rotated at the configured size into
+//! timestamped archives. Failures are
 //! returned to the caller so the UI can surface them — a silent audit gap in
 //! a firewall tool is itself an incident. Files and the state dir are created
 //! private (`0700`/`0600`) — audit lines reveal topology.
@@ -12,14 +13,16 @@ use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::application::ports::OperationOutcome;
-
-/// Rotate `audit.jsonl` to `audit.jsonl.1` beyond this size.
-const ROTATE_BYTES: u64 = 5 * 1024 * 1024;
+use crate::config::AuditRetentionConfig;
 
 /// Appends one JSON line describing `outcome` (id, timestamp, actor uid, host,
 /// version, operation, status, per-step invocations) to `audit.jsonl`.
 /// Returns the failure text when the line could not be written.
-pub fn record(op_id: u64, outcome: &OperationOutcome) -> Result<(), String> {
+pub fn record(
+    op_id: u64,
+    outcome: &OperationOutcome,
+    retention: AuditRetentionConfig,
+) -> Result<(), String> {
     let Some(dir) = crate::bootstrap::ensure_state_dir() else {
         return Err("no state directory available".to_owned());
     };
@@ -56,7 +59,7 @@ pub fn record(op_id: u64, outcome: &OperationOutcome) -> Result<(), String> {
         "steps": steps,
     });
     let path = dir.join("audit.jsonl");
-    rotate_if_large(&path);
+    rotate_if_large(&path, retention.max_file_size)?;
     append_line(&path, &line.to_string())
 }
 
@@ -74,23 +77,59 @@ fn append_line(path: &std::path::Path, line: &str) -> Result<(), String> {
     let mut file = options
         .open(path)
         .map_err(|err| format!("audit open: {err}"))?;
-    writeln!(file, "{line}").map_err(|err| format!("audit write: {err}"))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("audit chmod: {err}"))?;
+    }
+    file.write_all(format!("{line}\n").as_bytes())
+        .map_err(|err| format!("audit write: {err}"))?;
+    file.sync_data().map_err(|err| format!("audit sync: {err}"))
 }
 
-/// One-deep rotation: `audit.jsonl` → `audit.jsonl.1` past [`ROTATE_BYTES`].
-fn rotate_if_large(path: &std::path::Path) {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return;
+/// Moves an oversized active log to a timestamped, collision-safe archive.
+fn rotate_if_large(path: &std::path::Path, max_bytes: u64) -> Result<(), String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    rotate_if_large_at(path, max_bytes, stamp)
+}
+
+fn rotate_if_large_at(path: &std::path::Path, max_bytes: u64, stamp: u128) -> Result<(), String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("audit metadata: {err}")),
     };
-    if metadata.len() >= ROTATE_BYTES {
-        let _ = std::fs::rename(path, path.with_extension("jsonl.1"));
+    if metadata.len() < max_bytes {
+        return Ok(());
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("audit chmod before rotation: {err}"))?;
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| "audit path has no parent directory".to_owned())?;
+    super::state_file::move_atomic_unique(path, |collision| {
+        let suffix = if collision == 0 {
+            String::new()
+        } else {
+            format!("-{collision}")
+        };
+        dir.join(format!("audit-{stamp}{suffix}.jsonl"))
+    })
+    .map(|_| ())
+    .map_err(|err| format!("audit rotation: {err}"))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{ROTATE_BYTES, append_line, rotate_if_large};
+    use super::{append_line, rotate_if_large_at};
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("fwdeck-{tag}-{}", std::process::id()));
@@ -122,19 +161,34 @@ mod tests {
     fn rotates_once_past_threshold() {
         let dir = scratch("audit-rotate");
         let path = dir.join("audit.jsonl");
-        std::fs::write(
-            &path,
-            vec![b'x'; usize::try_from(ROTATE_BYTES).unwrap() + 1],
-        )
-        .unwrap();
-        rotate_if_large(&path);
+        std::fs::write(&path, b"oversized").unwrap();
+        rotate_if_large_at(&path, 4, 123).unwrap();
         assert!(
             !path.exists(),
             "oversized log should have been rotated away"
         );
-        assert!(
-            path.with_extension("jsonl.1").exists(),
-            "rotated file missing"
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit-123.jsonl")).unwrap(),
+            "oversized"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_timestamp_rotation_never_clobbers_an_archive() {
+        let dir = scratch("audit-rotate-collision");
+        let path = dir.join("audit.jsonl");
+        std::fs::write(&path, b"first").unwrap();
+        rotate_if_large_at(&path, 1, 123).unwrap();
+        std::fs::write(&path, b"second").unwrap();
+        rotate_if_large_at(&path, 1, 123).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit-123.jsonl")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("audit-123-1.jsonl")).unwrap(),
+            "second"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

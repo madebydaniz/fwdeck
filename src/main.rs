@@ -7,7 +7,7 @@ use clap::Parser;
 
 use fwdeck::application::api::{self, EngineHandle};
 use fwdeck::application::ports::FirewallBackend;
-use fwdeck::cli::{BackendArg, Cli, Command};
+use fwdeck::cli::{BackendArg, Cli, Command, SnapshotCommand};
 use fwdeck::config::Config;
 use fwdeck::infrastructure::firewalld::CliBackend;
 use fwdeck::infrastructure::logs;
@@ -31,6 +31,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Command::Manpage) => {
             print!("{}", fwdeck::cli::manpage());
+            return Ok(());
+        }
+        Some(Command::Prune { dry_run: _, apply }) => {
+            run_prune(&config, apply)?;
+            return Ok(());
+        }
+        Some(Command::Snapshots { command }) => {
+            run_snapshot_command(command)?;
             return Ok(());
         }
         None => {}
@@ -72,6 +80,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    if holds_lock {
+        enforce_startup_retention(config.retention).await;
+    }
+
     // The D-Bus backend mutates runtime only. Narrow the default `both` target
     // to its achievable subset so mutations don't all fail against it; an
     // explicit `--target permanent` is left alone to fail loudly with a pointer
@@ -112,6 +124,148 @@ async fn main() -> anyhow::Result<()> {
     }
     result?;
     Ok(())
+}
+
+struct StateMutationLock;
+
+impl StateMutationLock {
+    fn acquire() -> anyhow::Result<Self> {
+        match bootstrap::acquire_instance_lock() {
+            Ok(()) => Ok(Self),
+            Err(holder) => {
+                let who =
+                    holder.map_or_else(|| "another process".to_owned(), |pid| format!("PID {pid}"));
+                anyhow::bail!("fwdeck is already running ({who}); refusing local-state mutation")
+            }
+        }
+    }
+}
+
+impl Drop for StateMutationLock {
+    fn drop(&mut self) {
+        bootstrap::release_instance_lock();
+    }
+}
+
+fn run_prune(config: &Config, apply: bool) -> anyhow::Result<()> {
+    use fwdeck::infrastructure::retention::{self, RetentionScope};
+
+    if !apply {
+        let plan =
+            retention::plan(&config.retention, RetentionScope::All).map_err(anyhow::Error::msg)?;
+        println!("retention dry-run (no files deleted)");
+        print_retention_plan(&plan);
+        return Ok(());
+    }
+
+    let _lock = StateMutationLock::acquire()?;
+    let report =
+        retention::prune(&config.retention, RetentionScope::All).map_err(anyhow::Error::msg)?;
+    print_retention_plan(&report.plan);
+    println!(
+        "removed:       {} file(s), {} bytes reclaimed",
+        report.removed.len(),
+        report.reclaimed_bytes
+    );
+    for path in &report.skipped_protected {
+        println!("preserved:     {} (pinned after planning)", path.display());
+    }
+    for failure in &report.failures {
+        eprintln!("prune warning: {failure}");
+    }
+    if !report.failures.is_empty() {
+        anyhow::bail!(
+            "retention completed with {} cleanup failure(s)",
+            report.failures.len()
+        );
+    }
+    Ok(())
+}
+
+fn print_retention_plan(plan: &fwdeck::infrastructure::retention::RetentionPlan) {
+    print_collection_plan("snapshots", &plan.snapshots);
+    print_collection_plan("exports", &plan.exports);
+    print_collection_plan("audit", &plan.audit);
+    for candidate in plan
+        .snapshots
+        .candidates
+        .iter()
+        .chain(&plan.exports.candidates)
+        .chain(&plan.audit.candidates)
+    {
+        println!(
+            "prune:         {} ({} bytes; {})",
+            candidate.path.display(),
+            candidate.bytes,
+            candidate.reason.label()
+        );
+    }
+}
+
+fn print_collection_plan(label: &str, plan: &fwdeck::infrastructure::retention::CollectionPlan) {
+    println!(
+        "{label:<14} {} file(s), {} bytes, {} protected, {} prunable",
+        plan.files,
+        plan.bytes,
+        plan.protected,
+        plan.candidates.len()
+    );
+}
+
+fn run_snapshot_command(command: SnapshotCommand) -> anyhow::Result<()> {
+    match command {
+        SnapshotCommand::List => {
+            for snapshot in fwdeck::infrastructure::snapshot_store::list() {
+                println!(
+                    "{}\t{} bytes\t{}",
+                    snapshot.name,
+                    snapshot.bytes,
+                    if snapshot.pinned { "pinned" } else { "managed" }
+                );
+            }
+        }
+        SnapshotCommand::Pin { name } => {
+            let _lock = StateMutationLock::acquire()?;
+            fwdeck::infrastructure::snapshot_store::set_pinned(&name, true)
+                .map_err(anyhow::Error::msg)?;
+            println!("pinned {name}");
+        }
+        SnapshotCommand::Unpin { name } => {
+            let _lock = StateMutationLock::acquire()?;
+            fwdeck::infrastructure::snapshot_store::set_pinned(&name, false)
+                .map_err(anyhow::Error::msg)?;
+            println!("unpinned {name}");
+        }
+    }
+    Ok(())
+}
+
+async fn enforce_startup_retention(retention: fwdeck::config::RetentionConfig) {
+    use fwdeck::infrastructure::retention::{self, RetentionScope};
+
+    let result =
+        tokio::task::spawn_blocking(move || retention::prune(&retention, RetentionScope::All))
+            .await
+            .unwrap_or_else(|join| Err(format!("startup retention task failed: {join}")));
+    match result {
+        Ok(report) => {
+            if !report.removed.is_empty() {
+                tracing::info!(
+                    removed = report.removed.len(),
+                    reclaimed_bytes = report.reclaimed_bytes,
+                    "startup retention pruned local state"
+                );
+            }
+            for failure in report.failures {
+                eprintln!("warning: retention cleanup failed: {failure}");
+                tracing::warn!(error = %failure, "startup retention cleanup failure");
+            }
+        }
+        Err(err) => {
+            eprintln!("warning: retention check failed: {err}");
+            tracing::warn!(error = %err, "startup retention check failed");
+        }
+    }
 }
 
 /// Reports systemd `fwdeck-rollback-*` units left over from an earlier
@@ -220,6 +374,7 @@ async fn run_doctor(config: &Config) {
     let state_dir = bootstrap::state_dir()
         .map_or_else(|| "<unavailable>".to_owned(), |p| p.display().to_string());
     println!("state dir:     {state_dir}");
+    print_retention_status(config);
     println!(
         "TERM:          {}",
         std::env::var("TERM").unwrap_or_else(|_| "<unset>".to_owned())
@@ -294,6 +449,35 @@ async fn run_doctor(config: &Config) {
         Err(err) => println!("read access:   FAILED — {err}"),
     }
     preflight(&backend).await;
+}
+
+fn print_retention_policy(config: &Config) {
+    const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
+    println!(
+        "retention:     snapshots {} files / {} days (keep {}), exports {} / {} days, audit {} × {} MiB",
+        config.retention.snapshots.max_count,
+        config.retention.snapshots.max_age.as_secs() / SECONDS_PER_DAY,
+        config.retention.snapshots.min_keep,
+        config.retention.exports.max_count,
+        config.retention.exports.max_age.as_secs() / SECONDS_PER_DAY,
+        config.retention.audit.max_files,
+        config.retention.audit.max_file_size / (1024 * 1024),
+    );
+}
+
+fn print_retention_status(config: &Config) {
+    print_retention_policy(config);
+    match fwdeck::infrastructure::retention::plan(
+        &config.retention,
+        fwdeck::infrastructure::retention::RetentionScope::All,
+    ) {
+        Ok(plan) => {
+            print_collection_plan("snapshots", &plan.snapshots);
+            print_collection_plan("exports", &plan.exports);
+            print_collection_plan("audit", &plan.audit);
+        }
+        Err(err) => println!("retention:     FAILED — {err}"),
+    }
 }
 
 /// Environment preflight: authorization, binaries, host managers, `SELinux`,

@@ -81,6 +81,7 @@ Once installed:
 
 ```bash
 fwdeck doctor        # checks your environment — never touches the firewall
+fwdeck prune --dry-run # previews bounded local-state retention
 fwdeck --read-only   # look around safely; mutations are disabled
 sudo fwdeck          # full control
 ```
@@ -106,8 +107,8 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
   `firewall-cmd` script, JSON, or Ansible playbook.
 - 🚨 **SSH-aware** — warns precisely when a change targets the zone your session
   depends on.
-- 📸 **Snapshots** with diff-based restore (staged, never automatic), plus
-  read-only snapshot and session diffs.
+- 📸 **Snapshots** with diff-based restore (staged, never automatic), read-only
+  snapshot/session diffs, pinning, and bounded enterprise retention.
 - 🧯 **Offline mode** (`--offline`) — fix the permanent config from rescue/chroot,
   no daemon needed.
 
@@ -122,7 +123,9 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
 - ⌨️ Fuzzy command palette (`:`) with context-aware availability; live filtering (`/`); global search (`ctrl-f`) across every view at once.
 - 🗑️ Multi-select bulk delete with one reviewed confirmation.
 - 📜 Live kernel/netfilter log tail with a denied-packet counter.
-- 🪪 Honest results: partial failures reported as partial failures, with per-step diagnostics and a JSONL audit trail.
+- 🪪 Honest results: partial failures reported as partial failures, with per-step diagnostics and a private, rotated JSONL audit trail.
+- 🧹 Configurable local-state retention with safe defaults, dry-run/apply CLI,
+  pinned snapshots, strict filename matching, and symlink refusal.
 - 🔌 Two backends behind one trait: `firewall-cmd` (default, full-featured) and native D-Bus (reads + runtime edits; refuses what it can't do fully).
 - 🔏 Every release checksummed and signed with Cosign keyless (Sigstore).
 - 🩺 `fwdeck doctor`, shell completions, man page, XDG config, three themes.
