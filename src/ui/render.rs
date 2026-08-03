@@ -336,4 +336,19 @@ mod tests {
         assert!(content.contains("deprecated"));
         assert!(content.contains("12345"));
     }
+
+    #[test]
+    fn policy_workspace_renders_sidebar_shortcut_and_policy_state() {
+        let mut s = state();
+        update(
+            &mut s,
+            UiAction::SwitchView(crate::ui::views::ViewId::Policies),
+        );
+        let content = draw(&mut s, 140, 36);
+
+        assert!(content.contains("<p>"));
+        assert!(content.contains("mypolicy"));
+        assert!(content.contains("public"));
+        assert!(content.contains("active"));
+    }
 }

@@ -281,6 +281,13 @@ pub fn parse_policy_names(raw: &str) -> Result<Vec<PolicyName>, ParseError> {
 /// `--info-policy=<name>` block. The first line is the policy name (with an
 /// optional `(active)` marker); the rest are `key: value` attributes.
 pub fn parse_policy_info(raw: &str) -> Result<PolicyDetails, ParseError> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Section {
+        None,
+        ForwardPorts,
+        RichRules,
+    }
+
     let mut lines = raw.lines();
     let header = lines
         .next()
@@ -289,12 +296,37 @@ pub fn parse_policy_info(raw: &str) -> Result<PolicyDetails, ParseError> {
     let name = PolicyName::parse(name)
         .map_err(|err| ParseError::new(format!("invalid policy `{name}`: {err}")))?;
     let mut details = PolicyDetails::empty(name);
+    details.active = header.split_whitespace().any(|token| token == "(active)");
+    let mut section = Section::None;
     for line in lines {
+        if line.starts_with('\t') {
+            let entry = line.trim();
+            match section {
+                Section::ForwardPorts => details.forward_ports.push(parse_forward_port(entry)?),
+                Section::RichRules => details.rich_rules.push(
+                    RichRule::parse(entry)
+                        .map_err(|err| ParseError::new(format!("invalid rich rule: {err}")))?,
+                ),
+                Section::None => {
+                    return Err(ParseError::new(format!(
+                        "entry line outside a known policy section: `{entry}`"
+                    )));
+                }
+            }
+            continue;
+        }
         let Some((key, value)) = line.trim_start().split_once(':') else {
             continue;
         };
         let value = value.trim();
+        section = Section::None;
         match key.trim() {
+            "disable" => details.disabled = value == "yes",
+            "priority" => {
+                details.priority = value.parse().map_err(|err| {
+                    ParseError::new(format!("invalid policy priority `{value}`: {err}"))
+                })?;
+            }
             "target" => {
                 if let Some(target) = PolicyTarget::parse(value) {
                     details.target = target;
@@ -311,6 +343,31 @@ pub fn parse_policy_info(raw: &str) -> Result<PolicyDetails, ParseError> {
             }
             "ports" => {
                 details.ports = parse_items(value, str::parse, "port")?;
+            }
+            "protocols" => {
+                details.protocols = parse_items(value, IpProtocol::parse, "protocol")?;
+            }
+            "masquerade" => details.masquerade = value == "yes",
+            "forward-ports" => {
+                section = Section::ForwardPorts;
+                for token in value.split_whitespace() {
+                    details.forward_ports.push(parse_forward_port(token)?);
+                }
+            }
+            "source-ports" => {
+                details.source_ports = parse_items(value, str::parse, "source port")?;
+            }
+            "icmp-blocks" => {
+                details.icmp_blocks = parse_items(value, IcmpType::parse, "icmp type")?;
+            }
+            "rich rules" => {
+                section = Section::RichRules;
+                if !value.is_empty() {
+                    details.rich_rules.push(
+                        RichRule::parse(value)
+                            .map_err(|err| ParseError::new(format!("invalid rich rule: {err}")))?,
+                    );
+                }
             }
             _ => {}
         }

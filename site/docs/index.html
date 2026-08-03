@@ -199,6 +199,7 @@ CLI. If you know firewalld, here is where each command lives:</p>
 <tr><td><code>--add-masquerade</code> · <code>--add-forward</code> · <code>--add-icmp-block-inversion</code></td><td>Zones → <kbd>m</kbd> · <kbd>:</kbd> → <em>Toggle forwarding</em> / <em>Toggle inversion</em></td></tr>
 <tr><td><code>--add-source-port</code> · <code>--add-protocol</code></td><td>Zones → <kbd>:</kbd> → <em>Add source-port</em> / <em>Allow protocol</em></td></tr>
 <tr><td><code>--new-ipset</code> / <code>--ipset ... --add-entry</code></td><td>IPSets (<kbd>7</kbd>) → <kbd>:</kbd> → <em>Create ipset</em> / <em>Add ipset entry</em></td></tr>
+<tr><td><code>--get-policies</code> / <code>--info-policy</code></td><td>Policies (<kbd>p</kbd>) → <kbd>enter</kbd> for full runtime/permanent details</td></tr>
 <tr><td><code>--set-default-zone</code></td><td>Zones → <kbd>:</kbd> → <em>Set default zone</em></td></tr>
 <tr><td><code>--permanent</code> (scope)</td><td>the mutation <strong>target</strong> (<code>--target</code> / config, or narrowed per-op); <kbd>t</kbd> flips the runtime/permanent view</td></tr>
 <tr><td><code>--reload</code></td><td><kbd>ctrl-r</kbd></td></tr>
@@ -219,8 +220,8 @@ runtime-vs-permanent state (<code>synced</code> / <code>different</code>),
 LogDenied, and live counters (zones, active, denied this session).</li>
 <li><strong>Breadcrumb</strong> — where you are: zone › view · scope ·
 <code>[viewing: runtime|permanent]</code> perspective.</li>
-<li><strong>Views sidebar</strong> — the ten views with row counts; switch with
-<kbd>0</kbd>–<kbd>9</kbd>.</li>
+<li><strong>Views sidebar</strong> — eleven views with row counts; switch with
+<kbd>0</kbd>–<kbd>9</kbd>, and <kbd>p</kbd> for Policies.</li>
 <li><strong>Table</strong> — the current view's rows. Inactive zones are dimmed;
 the <code>≠</code> marker means that row differs between runtime and permanent.</li>
 <li><strong>Status bar</strong> — mutation target and the three always-on
@@ -230,7 +231,8 @@ entries: <kbd>:</kbd> palette · <kbd>/</kbd> filter · <kbd>?</kbd> help.</li>
 
 <section id="views">
 <h2>Views — the complete guide</h2>
-<p>Ten views, switched with <kbd>0</kbd>–<kbd>9</kbd> (or the sidebar). Each
+<p>Eleven views, switched with <kbd>0</kbd>–<kbd>9</kbd> plus <kbd>p</kbd> for
+Policies (or the sidebar). Each
 section below shows the view, explains what it is for, and walks through every
 action with a hands-on example. Every mutation opens a confirmation first —
 <kbd>y</kbd> applies, <kbd>s</kbd> stages it for a batch, <kbd>n</kbd> cancels.</p>
@@ -447,6 +449,21 @@ real time and filter it. This view is read-only.</p>
 <li><strong>Filter</strong>: <kbd>/</kbd> → type an address or port to narrow
 the tail; <kbd>ctrl-f</kbd> searches log rows alongside every other view.</li>
 </ul>
+
+<h3>p · Policies</h3>
+<p><strong>What you see</strong> — first-class firewalld policy objects with
+target, ingress → egress direction, services, aggregate rule count, active
+state, and runtime/permanent scope. A <code>broken</code> state means a
+referenced zone or service is missing.</p>
+<p><strong>What you can do here</strong> — press <kbd>enter</kbd> for the full
+configuration (priority, ports, protocols, forwarding, source ports, ICMP,
+masquerade, rich rules, and dependency health). Press <kbd>a</kbd> to add a
+service to the selected policy, or to create the first policy when the view is
+empty. Press <kbd>d</kbd> to review deletion of the selected permanent policy.
+All changes still use the normal validation and confirmation flow.</p>
+<p>Policies are stateful and unidirectional: an ingress → egress policy does
+not automatically govern the reverse direction. See the
+<a href="https://firewalld.org/documentation/man-pages/firewalld.policies">official firewalld policy model</a>.</p>
 </section>
 
 <section id="power">

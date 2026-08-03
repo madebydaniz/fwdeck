@@ -6,11 +6,11 @@ use strum::{EnumIter, FromRepr};
 
 use crate::domain::{
     ConfigurationTarget, FirewallSnapshot, ForwardPort, InterfaceName, IpSetName, LogEntry,
-    PortSpec, RichRule, ServiceName, SourceAddress, ZoneName,
+    PolicyName, PortSpec, RichRule, ServiceName, SourceAddress, ZoneName,
 };
 
 /// Number of views; sizes the per-view state array in `UiState`.
-pub const VIEW_COUNT: usize = 10;
+pub const VIEW_COUNT: usize = 11;
 
 /// Stable, typed identity and mutation payload for one table row.
 ///
@@ -69,6 +69,11 @@ pub enum RowId {
     IpSet {
         /// IP set name.
         name: IpSetName,
+    },
+    /// A firewalld policy object.
+    Policy {
+        /// Policy name.
+        name: PolicyName,
     },
     /// A read-only direct rule. The ordinal distinguishes duplicate text.
     Direct {
@@ -206,6 +211,8 @@ pub enum ViewId {
     Direct,
     /// Kernel/netfilter log entries, newest first.
     Logs,
+    /// Policy objects governing traffic between zones.
+    Policies,
 }
 
 impl ViewId {
@@ -235,6 +242,25 @@ impl ViewId {
             Self::IpSets => "IPSets",
             Self::Direct => "Direct",
             Self::Logs => "Logs",
+            Self::Policies => "Policies",
+        }
+    }
+
+    /// Sidebar/keyboard shortcut for this view.
+    #[must_use]
+    pub const fn shortcut(self) -> &'static str {
+        match self {
+            Self::Zones => "0",
+            Self::Services => "1",
+            Self::Ports => "2",
+            Self::Forwarding => "3",
+            Self::RichRules => "4",
+            Self::Interfaces => "5",
+            Self::Sources => "6",
+            Self::IpSets => "7",
+            Self::Direct => "8",
+            Self::Logs => "9",
+            Self::Policies => "p",
         }
     }
 
@@ -269,6 +295,9 @@ impl ViewId {
                 "DPORT",
                 "PROTO",
                 "IFACE",
+            ],
+            Self::Policies => &[
+                "NAME", "TARGET", "INGRESS", "EGRESS", "SERVICES", "RULES", "STATE", "SCOPE",
             ],
         }
     }
@@ -343,6 +372,16 @@ impl ViewId {
                 Constraint::Length(6),
                 Constraint::Length(6),
                 Constraint::Min(8),
+            ],
+            Self::Policies => vec![
+                Constraint::Min(14),
+                Constraint::Length(10),
+                Constraint::Min(12),
+                Constraint::Min(12),
+                Constraint::Min(14),
+                Constraint::Length(7),
+                Constraint::Length(9),
+                Constraint::Length(9),
             ],
         }
     }
@@ -451,7 +490,106 @@ pub fn rows(
         ViewId::Direct => direct_rows(snap),
         // Logs rows come from the UI's ring buffer (`UiState::all_rows`).
         ViewId::Logs => Vec::new(),
+        ViewId::Policies => policies_rows(snap, config),
     }
+}
+
+fn policies_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewRow> {
+    let mut names: Vec<_> = snap
+        .policies
+        .runtime
+        .keys()
+        .chain(snap.policies.permanent.keys())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let runtime = snap.policies.runtime.get(name);
+            let permanent = snap.policies.permanent.get(name);
+            let policy = if config == ConfigurationTarget::Permanent {
+                permanent.or(runtime)
+            } else {
+                runtime.or(permanent)
+            }?;
+            let scope = match (runtime, permanent) {
+                (Some(runtime), Some(permanent)) if runtime.configuration_eq(permanent) => {
+                    Scope::Both
+                }
+                (Some(_), Some(_)) => Scope::Drift,
+                (Some(_), None) => Scope::Runtime,
+                (None, Some(_)) => Scope::Permanent,
+                (None, None) => Scope::None,
+            };
+            let rules = policy.services.len()
+                + policy.ports.len()
+                + policy.protocols.len()
+                + policy.forward_ports.len()
+                + policy.source_ports.len()
+                + policy.icmp_blocks.len()
+                + policy.rich_rules.len()
+                + usize::from(policy.masquerade);
+            let dependency_issues = policy_dependency_issues(snap, policy);
+            let state = if !dependency_issues.is_empty() {
+                "broken"
+            } else if policy.disabled {
+                "disabled"
+            } else if policy.active {
+                "active"
+            } else {
+                "inactive"
+            };
+            Some(ViewRow::scoped(
+                RowId::Policy { name: name.clone() },
+                scope,
+                vec![
+                    name.to_string(),
+                    policy.target.as_str().to_owned(),
+                    join(&policy.ingress_zones),
+                    join(&policy.egress_zones),
+                    join(&policy.services),
+                    rules.to_string(),
+                    state.to_owned(),
+                    scope.as_str().to_owned(),
+                ],
+            ))
+        })
+        .collect()
+}
+
+/// Missing zone/service references for one policy. Symbolic zones are valid
+/// graph endpoints and therefore never reported as missing dependencies.
+pub(super) fn policy_dependency_issues(
+    snapshot: &FirewallSnapshot,
+    policy: &crate::domain::PolicyDetails,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for zone in policy
+        .ingress_zones
+        .iter()
+        .chain(&policy.egress_zones)
+        .filter(|zone| zone.as_str() != "ANY" && zone.as_str() != "HOST")
+    {
+        let known = snapshot
+            .runtime
+            .keys()
+            .chain(snapshot.permanent.keys())
+            .any(|known| known.as_str() == zone);
+        if !known {
+            missing.push(format!("zone `{zone}`"));
+        }
+    }
+    for service in &policy.services {
+        let known = snapshot.available_services.contains(service)
+            || snapshot.service_definitions.contains_key(service);
+        if !known {
+            missing.push(format!("service `{service}`"));
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 fn ipsets_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewRow> {
@@ -881,6 +1019,13 @@ mod tests {
                 .iter()
                 .all(|row| matches!(&row.id, RowId::IpSet { .. }) && row.scope().is_some())
         );
+
+        let policies = rows(ViewId::Policies, &snap, &zone, ConfigurationTarget::Runtime);
+        assert!(
+            policies
+                .iter()
+                .all(|row| { matches!(&row.id, RowId::Policy { .. }) && row.scope().is_some() })
+        );
     }
 
     #[test]
@@ -894,5 +1039,52 @@ mod tests {
 
         assert_eq!(runtime.id, both.id);
         assert_ne!(runtime.scope(), both.scope());
+    }
+
+    #[test]
+    fn policies_view_summarizes_real_policy_state() {
+        let snap = mock::sample().unwrap();
+        let rows = rows(
+            ViewId::Policies,
+            &snap,
+            &snap.default_zone,
+            ConfigurationTarget::Runtime,
+        );
+        let policy = rows
+            .iter()
+            .find(|row| matches!(&row.id, RowId::Policy { name } if name.as_str() == "mypolicy"))
+            .unwrap();
+
+        assert_eq!(policy[1], "DROP");
+        assert_eq!(policy[2], "public");
+        assert_eq!(policy[3], "ANY");
+        assert_eq!(policy[4], "http");
+        assert_eq!(policy[6], "active");
+        assert_eq!(policy[7], "both");
+    }
+
+    #[test]
+    fn policies_view_flags_missing_dependencies() {
+        let mut snap = mock::sample().unwrap();
+        snap.policies
+            .runtime
+            .values_mut()
+            .next()
+            .unwrap()
+            .ingress_zones
+            .push("ghost-zone".to_owned());
+        let rows = rows(
+            ViewId::Policies,
+            &snap,
+            &snap.default_zone,
+            ConfigurationTarget::Runtime,
+        );
+
+        assert_eq!(rows[0][6], "broken");
+        let policy = snap.policies.runtime.values().next().unwrap();
+        assert_eq!(
+            policy_dependency_issues(&snap, policy),
+            vec!["zone `ghost-zone`".to_owned()]
+        );
     }
 }
