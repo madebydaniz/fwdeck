@@ -48,6 +48,9 @@ async fn probe_and_snapshot_against_real_daemon() {
         "default zone must exist in the runtime set"
     );
     assert!(!snapshot.available_services.is_empty());
+    let blocklist = fwdeck::domain::IpSetName::parse("blocklist").unwrap();
+    assert!(snapshot.ipsets.runtime.contains_key(&blocklist));
+    assert!(snapshot.ipsets.permanent.contains_key(&blocklist));
     // Drift is intentionally NOT asserted here: it depends on seed state other
     // integration tests may disturb. `cli_parsing.rs` covers drift on fixtures.
 }

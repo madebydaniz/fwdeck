@@ -27,7 +27,7 @@ pub use port::{ForwardPort, PortNumber, PortRange, PortSelector, PortSpec, Proto
 pub use proposal::{DeniedFlow, ProposalError};
 pub use rich_rule::RichRule;
 pub use snapshot::{
-    ConfigurationTarget, FirewallSnapshot, FirewallStatus, IpSetInfo, LogDenied, NetfilterBackend,
-    ServiceDefinition,
+    ConfigurationTarget, DegradedSection, FirewallSnapshot, FirewallStatus, IpSetInfo, LogDenied,
+    NetfilterBackend, Scoped, ServiceDefinition, SnapshotSection,
 };
 pub use zone::{ActiveZone, ZoneDetails, ZoneTarget};

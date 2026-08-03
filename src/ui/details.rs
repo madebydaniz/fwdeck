@@ -289,21 +289,7 @@ pub fn for_row(
             title: format!("Source {}", cell(0)),
             lines: vec![line("family", cell(1)), line("zone", cell(2))],
         }),
-        ViewId::IpSets => {
-            let name = crate::domain::IpSetName::parse(row.first()?).ok()?;
-            let info = snapshot.ipsets.get(&name)?;
-            let mut lines = vec![line("type", info.kind.clone())];
-            if info.entries.is_empty() {
-                lines.push(line("entries", "none"));
-            }
-            for entry in &info.entries {
-                lines.push(line("entry", entry.clone()));
-            }
-            Some(DetailsContent {
-                title: format!("IPSet `{name}`"),
-                lines,
-            })
-        }
+        ViewId::IpSets => ipset_details(snapshot, row),
         ViewId::Direct => Some(DetailsContent {
             title: "Direct rule (deprecated)".to_owned(),
             lines: vec![
@@ -331,6 +317,37 @@ pub fn for_row(
             ],
         }),
     }
+}
+
+fn ipset_details(snapshot: &FirewallSnapshot, row: &[String]) -> Option<DetailsContent> {
+    let name = crate::domain::IpSetName::parse(row.first()?).ok()?;
+    let runtime = snapshot.ipsets.runtime.get(&name);
+    let permanent = snapshot.ipsets.permanent.get(&name);
+    let info = runtime.or(permanent)?;
+    let mut lines = vec![
+        line("type", info.kind.clone()),
+        line("scope", row.get(3).map_or("", String::as_str)),
+    ];
+    if runtime.is_none_or(|value| value.entries.is_empty()) {
+        lines.push(line("runtime entries", "none"));
+    }
+    if let Some(runtime) = runtime {
+        for entry in &runtime.entries {
+            lines.push(line("runtime entry", entry.clone()));
+        }
+    }
+    if permanent.is_none_or(|value| value.entries.is_empty()) {
+        lines.push(line("permanent entries", "none"));
+    }
+    if let Some(permanent) = permanent {
+        for entry in &permanent.entries {
+            lines.push(line("permanent entry", entry.clone()));
+        }
+    }
+    Some(DetailsContent {
+        title: format!("IPSet `{name}`"),
+        lines,
+    })
 }
 
 /// Post-execution operation report: one line per step with the exact
@@ -379,40 +396,63 @@ pub fn for_outcome(outcome: &OperationOutcome) -> DetailsContent {
 #[must_use]
 pub fn policy_browse(snapshot: &FirewallSnapshot) -> DetailsContent {
     let mut lines: Vec<(String, String)> = Vec::new();
-    if snapshot.policies.is_empty() {
+    let mut names: Vec<_> = snapshot
+        .policies
+        .runtime
+        .keys()
+        .chain(snapshot.policies.permanent.keys())
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
         lines.push(("policies".to_owned(), "none defined".to_owned()));
     }
-    for (name, policy) in &snapshot.policies {
-        lines.push((name.to_string(), String::new()));
-        lines.push((String::new(), format!("target: {}", policy.target.as_str())));
-        lines.push((
-            String::new(),
-            format!(
-                "ingress: {} → egress: {}",
-                join(&policy.ingress_zones),
-                join(&policy.egress_zones)
-            ),
-        ));
-        if !policy.services.is_empty() {
+    let mut add_policy =
+        |name: &crate::domain::PolicyName, scope: &str, policy: &crate::domain::PolicyDetails| {
+            lines.push((format!("{name} [{scope}]"), String::new()));
+            lines.push((String::new(), format!("target: {}", policy.target.as_str())));
             lines.push((
                 String::new(),
-                format!("services: {}", join(&policy.services)),
+                format!(
+                    "ingress: {} → egress: {}",
+                    join(&policy.ingress_zones),
+                    join(&policy.egress_zones)
+                ),
             ));
-        }
-        if !policy.ports.is_empty() {
-            lines.push((String::new(), format!("ports: {}", join(&policy.ports))));
+            if !policy.services.is_empty() {
+                lines.push((
+                    String::new(),
+                    format!("services: {}", join(&policy.services)),
+                ));
+            }
+            if !policy.ports.is_empty() {
+                lines.push((String::new(), format!("ports: {}", join(&policy.ports))));
+            }
+        };
+    for name in &names {
+        let runtime = snapshot.policies.runtime.get(*name);
+        let permanent = snapshot.policies.permanent.get(*name);
+        match (runtime, permanent) {
+            (Some(runtime), Some(permanent)) if runtime == permanent => {
+                add_policy(name, "both", runtime);
+            }
+            (Some(runtime), Some(permanent)) => {
+                add_policy(name, "runtime drift", runtime);
+                add_policy(name, "permanent drift", permanent);
+            }
+            (Some(runtime), None) => add_policy(name, "runtime", runtime),
+            (None, Some(permanent)) => add_policy(name, "permanent", permanent),
+            (None, None) => {}
         }
     }
     DetailsContent {
-        title: format!("Policies ({})", snapshot.policies.len()),
+        title: format!("Policies ({})", names.len()),
         lines,
     }
 }
 
-/// Drift workspace: every runtime vs permanent difference across all zones,
-/// grouped per zone, so an operator sees at a glance what won't survive a
-/// reload. Zones present in only one scope are reported as a single
-/// lifecycle line instead of per-attribute drift.
+/// Drift workspace: every runtime vs permanent difference across zones,
+/// ipsets, and policies, so an operator sees what won't survive a reload.
 #[must_use]
 pub fn drift_workspace(snapshot: &FirewallSnapshot) -> DetailsContent {
     let mut lines: Vec<(String, String)> = Vec::new();
@@ -445,17 +485,98 @@ pub fn drift_workspace(snapshot: &FirewallSnapshot) -> DetailsContent {
             (None, None) => {}
         }
     }
+    let object_drift = scoped_object_drift_lines(snapshot);
+    differences += object_drift.len();
+    lines.extend(object_drift);
 
     if differences == 0 {
+        let complete = [
+            crate::domain::SnapshotSection::Zones,
+            crate::domain::SnapshotSection::IpSets,
+            crate::domain::SnapshotSection::Policies,
+        ]
+        .into_iter()
+        .all(|section| {
+            snapshot.section_is_complete(
+                section,
+                crate::domain::ConfigurationTarget::RuntimeAndPermanent,
+            )
+        });
         lines.push((
             String::new(),
-            "runtime and permanent are in sync".to_owned(),
+            if complete {
+                "runtime and permanent are in sync".to_owned()
+            } else {
+                "no observed drift, but incomplete sections make sync status unknown".to_owned()
+            },
         ));
     }
     DetailsContent {
         title: format!("Drift ({differences} differences)"),
         lines,
     }
+}
+
+fn scoped_object_drift_lines(snapshot: &FirewallSnapshot) -> Vec<(String, String)> {
+    let mut lines = Vec::new();
+    let mut ipsets: Vec<_> = snapshot
+        .ipsets
+        .runtime
+        .keys()
+        .chain(snapshot.ipsets.permanent.keys())
+        .collect();
+    ipsets.sort();
+    ipsets.dedup();
+    for name in ipsets {
+        match (
+            snapshot.ipsets.runtime.get(name),
+            snapshot.ipsets.permanent.get(name),
+        ) {
+            (Some(runtime), Some(permanent)) if runtime != permanent => lines.push(line(
+                "ipset",
+                format!(
+                    "{name} — runtime {} ({} entries) / permanent {} ({} entries)",
+                    runtime.kind,
+                    runtime.entries.len(),
+                    permanent.kind,
+                    permanent.entries.len()
+                ),
+            )),
+            (Some(_), None) => lines.push(line("ipset", format!("{name} — runtime only"))),
+            (None, Some(_)) => lines.push(line("ipset", format!("{name} — permanent only"))),
+            _ => {}
+        }
+    }
+
+    let mut policies: Vec<_> = snapshot
+        .policies
+        .runtime
+        .keys()
+        .chain(snapshot.policies.permanent.keys())
+        .collect();
+    policies.sort();
+    policies.dedup();
+    for name in policies {
+        match (
+            snapshot.policies.runtime.get(name),
+            snapshot.policies.permanent.get(name),
+        ) {
+            (Some(runtime), Some(permanent)) if runtime != permanent => lines.push(line(
+                "policy",
+                format!(
+                    "{name} — runtime {} ({} services) / permanent {} ({} services)",
+                    runtime.target.as_str(),
+                    runtime.services.len(),
+                    permanent.target.as_str(),
+                    permanent.services.len()
+                ),
+            )),
+            (Some(_), None) => lines.push(line("policy", format!("{name} — runtime only"))),
+            (None, Some(_)) => lines.push(line("policy", format!("{name} — permanent only"))),
+            _ => {}
+        }
+    }
+    lines
 }
 
 /// Per-attribute drift lines for one zone present in both scopes.
@@ -694,6 +815,23 @@ mod tests {
         let content = drift_workspace(&snapshot);
         assert!(content.lines.iter().any(|(key, value)| {
             key == "zone" && value.contains("staging — permanent only (reload to activate)")
+        }));
+    }
+
+    #[test]
+    fn drift_workspace_includes_ipset_entry_drift() {
+        let mut snapshot = mock::sample().unwrap();
+        let blocklist = crate::domain::IpSetName::parse("blocklist").unwrap();
+        snapshot
+            .ipsets
+            .permanent
+            .get_mut(&blocklist)
+            .unwrap()
+            .entries
+            .clear();
+        let content = drift_workspace(&snapshot);
+        assert!(content.lines.iter().any(|(key, value)| {
+            key == "ipset" && value.contains("blocklist") && value.contains("runtime")
         }));
     }
 

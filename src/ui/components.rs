@@ -198,9 +198,9 @@ pub fn render_breadcrumb(f: &mut Frame, area: Rect, state: &UiState, theme: &The
     if let Some(snapshot) = &state.snapshot
         && !snapshot.degraded.is_empty()
     {
-        // Honest-state chip: these sections are unknown, not empty.
+        // Honest-state chip: these observations are unknown, not empty.
         spans.push(Span::styled(
-            format!("  ⚠ {} section(s) unavailable", snapshot.degraded.len()),
+            format!("  ⚠ {} observation warning(s)", snapshot.degraded.len()),
             theme.warn(),
         ));
     }

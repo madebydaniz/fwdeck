@@ -397,16 +397,32 @@ impl FirewallBackend for DbusBackend {
             permanent,
             // Not yet fetched via D-Bus — the CLI backend is the full-featured
             // reference. Declared degraded so the UI shows "unknown", not "none".
-            ipsets: BTreeMap::new(),
+            ipsets: crate::domain::Scoped::default(),
             service_definitions: BTreeMap::new(),
             available_services,
-            policies: BTreeMap::new(),
+            policies: crate::domain::Scoped::default(),
             direct_rules: Vec::new(),
             degraded: vec![
-                "ipsets: not fetched by the D-Bus backend yet".to_owned(),
-                "policies: not fetched by the D-Bus backend yet".to_owned(),
-                "direct rules: not fetched by the D-Bus backend yet".to_owned(),
-                "service definitions: not fetched by the D-Bus backend yet".to_owned(),
+                crate::domain::DegradedSection::new(
+                    crate::domain::SnapshotSection::IpSets,
+                    None,
+                    "not fetched by the D-Bus backend yet",
+                ),
+                crate::domain::DegradedSection::new(
+                    crate::domain::SnapshotSection::Policies,
+                    None,
+                    "not fetched by the D-Bus backend yet",
+                ),
+                crate::domain::DegradedSection::new(
+                    crate::domain::SnapshotSection::DirectRules,
+                    Some(crate::domain::ConfigurationTarget::Runtime),
+                    "not fetched by the D-Bus backend yet",
+                ),
+                crate::domain::DegradedSection::new(
+                    crate::domain::SnapshotSection::ServiceDefinitions,
+                    None,
+                    "not fetched by the D-Bus backend yet",
+                ),
             ],
         })
     }
