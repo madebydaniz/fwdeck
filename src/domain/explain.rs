@@ -49,7 +49,7 @@ pub fn explain(snapshot: &FirewallSnapshot, source: &str, port: PortSpec) -> Vec
         details
             .sources
             .iter()
-            .find(|binding| source_matches(binding, ip, &snapshot.ipsets))
+            .find(|binding| source_matches(binding, ip, &snapshot.ipsets.runtime))
             .map(|binding| (name, details, binding))
     });
     let details = if let Some((name, details, binding)) = by_source {
@@ -195,7 +195,7 @@ pub fn zone_for_source_ip(snapshot: &FirewallSnapshot, ip: IpAddr) -> Option<Zon
             details
                 .sources
                 .iter()
-                .any(|binding| source_matches(binding, ip, &snapshot.ipsets))
+                .any(|binding| source_matches(binding, ip, &snapshot.ipsets.runtime))
         })
         .map(|(zone, _)| zone.clone())
 }

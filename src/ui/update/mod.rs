@@ -6,7 +6,7 @@ mod lifecycle;
 mod plans;
 mod rows;
 
-use crate::domain::{ConfigurationTarget, FirewallOperation, ZoneName};
+use crate::domain::{ConfigurationTarget, FirewallOperation, SnapshotSection, ZoneName};
 
 use super::action::{Effect, UiAction};
 use super::details;
@@ -760,6 +760,8 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
         Some(zone)
             if !snapshot.runtime.contains_key(zone)
                 && snapshot.permanent.contains_key(zone)
+                && snapshot
+                    .section_is_complete(SnapshotSection::Zones, ConfigurationTarget::Runtime)
                 && operation.target() != ConfigurationTarget::Permanent =>
         {
             let retargeted = if operation.target() == ConfigurationTarget::RuntimeAndPermanent {
@@ -2044,6 +2046,40 @@ mod tests {
                 .unwrap()
                 .text
                 .contains("reload (ctrl-r) first")
+        );
+    }
+
+    #[test]
+    fn incomplete_runtime_zone_state_is_not_mistaken_for_permanent_only() {
+        let mut s = state();
+        let mut snapshot = mock::sample().unwrap();
+        let staging = ZoneName::parse("staging").unwrap();
+        snapshot.permanent.insert(
+            staging.clone(),
+            crate::domain::ZoneDetails::empty(staging.clone()),
+        );
+        snapshot.degraded.push(crate::domain::DegradedSection::new(
+            SnapshotSection::Zones,
+            Some(ConfigurationTarget::Runtime),
+            "runtime zone listing failed",
+        ));
+        s.snapshot = Some(std::sync::Arc::new(snapshot));
+
+        update(
+            &mut s,
+            UiAction::RequestOperation(FirewallOperation::AddService {
+                zone: staging,
+                service: ServiceName::parse("https").unwrap(),
+                target: ConfigurationTarget::RuntimeAndPermanent,
+            }),
+        );
+        assert!(s.overlays.is_empty());
+        assert!(
+            s.toasts
+                .back()
+                .unwrap()
+                .text
+                .contains("snapshot is incomplete")
         );
     }
 

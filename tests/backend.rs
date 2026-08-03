@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fwdeck::application::ports::{FirewallBackend, FirewallError, OperationOutcome};
-use fwdeck::domain::{ConfigurationTarget, FirewallOperation, ServiceName, ZoneName};
+use fwdeck::domain::{
+    ConfigurationTarget, FirewallOperation, ServiceName, SnapshotSection, ZoneName,
+};
 use fwdeck::infrastructure::firewalld::CliBackend;
 use fwdeck::infrastructure::process::{
     CommandOutput, CommandRequest, CommandRunner, DEFAULT_TIMEOUT, ProcessError,
@@ -21,6 +23,7 @@ const ACTIVE_ZONES: &str = include_str!("fixtures/firewall_cmd/active_zones.txt"
 const PERM_DENIED_STDERR: &str = include_str!("fixtures/firewall_cmd/perm_denied_stderr.txt");
 const INFO_IPSET: &str = include_str!("fixtures/firewall_cmd/info_ipset.txt");
 const INFO_SERVICE: &str = include_str!("fixtures/firewall_cmd/info_service.txt");
+const INFO_POLICY: &str = include_str!("fixtures/firewall_cmd/info_policy.txt");
 const DIRECT_RULES: &str = include_str!("fixtures/firewall_cmd/direct_rules.txt");
 
 #[derive(Clone, Default)]
@@ -83,9 +86,14 @@ async fn snapshot_issues_exact_commands_in_order() {
     runner.push_ok(LIST_ALL_PERMANENT);
     runner.push_ok("blocklist\n"); // --get-ipsets
     runner.push_ok(INFO_IPSET);
+    runner.push_ok("blocklist\n"); // --permanent --get-ipsets
+    runner.push_ok(INFO_IPSET);
     runner.push_ok(DIRECT_RULES);
     runner.push_ok("ssh http https\n"); // --get-services
-    runner.push_ok("\n"); // --get-policies (none)
+    runner.push_ok("fwdeck-fixture\n");
+    runner.push_ok(INFO_POLICY);
+    runner.push_ok("fwdeck-fixture\n");
+    runner.push_ok(INFO_POLICY);
     // One --info-service per referenced service (sorted union across configs).
     for _ in 0..7 {
         runner.push_ok(INFO_SERVICE);
@@ -107,9 +115,20 @@ async fn snapshot_issues_exact_commands_in_order() {
             vec!["--permanent".to_owned(), "--list-all-zones".to_owned()],
             vec!["--get-ipsets".to_owned()],
             vec!["--info-ipset=blocklist".to_owned()],
+            vec!["--permanent".to_owned(), "--get-ipsets".to_owned()],
+            vec![
+                "--permanent".to_owned(),
+                "--info-ipset=blocklist".to_owned(),
+            ],
             vec!["--direct".to_owned(), "--get-all-rules".to_owned()],
             vec!["--get-services".to_owned()],
             vec!["--get-policies".to_owned()],
+            vec!["--info-policy=fwdeck-fixture".to_owned()],
+            vec!["--permanent".to_owned(), "--get-policies".to_owned()],
+            vec![
+                "--permanent".to_owned(),
+                "--info-policy=fwdeck-fixture".to_owned(),
+            ],
             vec!["--info-service=cockpit".to_owned()],
             vec!["--info-service=dhcpv6-client".to_owned()],
             vec!["--info-service=http".to_owned()],
@@ -127,8 +146,17 @@ async fn snapshot_issues_exact_commands_in_order() {
     assert_eq!(snapshot.runtime.len(), 11);
     assert_eq!(snapshot.active.len(), 2);
     assert!(!snapshot.all_synced(), "seeded drift must be detected");
-    let ipset = snapshot.ipsets.keys().next().unwrap();
+    let ipset = snapshot.ipsets.runtime.keys().next().unwrap();
     assert_eq!(ipset.as_str(), "blocklist");
+    assert_eq!(snapshot.ipsets.runtime, snapshot.ipsets.permanent);
+    assert_eq!(snapshot.policies.runtime, snapshot.policies.permanent);
+    assert!(
+        snapshot
+            .policies
+            .runtime
+            .keys()
+            .any(|name| name.as_str() == "fwdeck-fixture")
+    );
     assert_eq!(snapshot.direct_rules.len(), 1);
     assert_eq!(snapshot.service_definitions.len(), 7);
     assert_eq!(snapshot.available_services.len(), 3);
@@ -147,9 +175,11 @@ async fn service_definitions_are_cached_across_snapshots() {
         runner.push_ok(LIST_ALL_RUNTIME);
         runner.push_ok(LIST_ALL_PERMANENT);
         runner.push_ok("\n"); // no ipsets
+        runner.push_ok("\n"); // no permanent ipsets
         runner.push_ok(DIRECT_RULES);
         runner.push_ok("ssh http https\n"); // --get-services
         runner.push_ok("\n"); // --get-policies
+        runner.push_ok("\n"); // --permanent --get-policies
     };
 
     push_round(&runner);
@@ -157,7 +187,15 @@ async fn service_definitions_are_cached_across_snapshots() {
     for _ in 0..7 {
         runner.push_ok(INFO_SERVICE);
     }
-    push_round(&runner);
+    runner.push_ok("running\n");
+    runner.push_ok("2.3.2\n");
+    runner.push_ok("off\n");
+    runner.push(Ok(output(Some(1), "no\n", "")));
+    runner.push_ok("public\n");
+    runner.push_ok(ACTIVE_ZONES);
+    runner.push_ok(LIST_ALL_RUNTIME);
+    runner.push_ok(LIST_ALL_PERMANENT);
+    runner.push_ok("ssh http https\n"); // cached heavy sections; service catalog still refreshes
 
     let backend = CliBackend::new(runner.clone());
     let first = backend.snapshot().await.unwrap();
@@ -174,6 +212,85 @@ async fn service_definitions_are_cached_across_snapshots() {
         .filter(|args| args[0].starts_with("--info-service="))
         .count();
     assert_eq!(info_calls, 7, "no repeat fetches");
+}
+
+#[tokio::test]
+async fn ipset_object_failure_is_reported_with_scope_and_identity() {
+    let runner = FakeRunner::default();
+    runner.push_ok("running\n");
+    runner.push_ok("2.3.2\n");
+    runner.push_ok("off\n");
+    runner.push(Ok(output(Some(1), "no\n", "")));
+    runner.push_ok("public\n");
+    runner.push_ok(ACTIVE_ZONES);
+    runner.push_ok(LIST_ALL_RUNTIME);
+    runner.push_ok(LIST_ALL_PERMANENT);
+    runner.push_ok("blocklist\n");
+    runner.push(Ok(output(Some(13), "", "object read failed")));
+    runner.push_ok("\n");
+    runner.push_ok(DIRECT_RULES);
+    runner.push_ok("ssh http https\n");
+    runner.push_ok("\n");
+    runner.push_ok("\n");
+    for _ in 0..7 {
+        runner.push_ok(INFO_SERVICE);
+    }
+
+    let snapshot = CliBackend::new(runner).snapshot().await.unwrap();
+    assert!(snapshot.ipsets.runtime.is_empty());
+    let failure = snapshot
+        .degraded
+        .iter()
+        .find(|failure| failure.section == SnapshotSection::IpSets)
+        .expect("ipset failure must remain visible");
+    assert_eq!(failure.target, Some(ConfigurationTarget::Runtime));
+    assert_eq!(failure.object.as_deref(), Some("blocklist"));
+    assert!(failure.reason.contains("object read failed"));
+}
+
+#[tokio::test]
+async fn service_mutation_invalidates_definition_cache() {
+    let runner = FakeRunner::default();
+    let push_full_snapshot = |runner: &FakeRunner| {
+        runner.push_ok("running\n");
+        runner.push_ok("2.3.2\n");
+        runner.push_ok("off\n");
+        runner.push(Ok(output(Some(1), "no\n", "")));
+        runner.push_ok("public\n");
+        runner.push_ok(ACTIVE_ZONES);
+        runner.push_ok(LIST_ALL_RUNTIME);
+        runner.push_ok(LIST_ALL_PERMANENT);
+        runner.push_ok("\n");
+        runner.push_ok("\n");
+        runner.push_ok(DIRECT_RULES);
+        runner.push_ok("ssh http https\n");
+        runner.push_ok("\n");
+        runner.push_ok("\n");
+        for _ in 0..7 {
+            runner.push_ok(INFO_SERVICE);
+        }
+    };
+    push_full_snapshot(&runner);
+    runner.push_ok("success\n");
+    push_full_snapshot(&runner);
+
+    let backend = CliBackend::new(runner.clone());
+    backend.snapshot().await.unwrap();
+    let outcome = backend
+        .apply(&FirewallOperation::AddServicePort {
+            service: ServiceName::parse("ssh").unwrap(),
+            port: "2222/tcp".parse().unwrap(),
+        })
+        .await;
+    assert!(matches!(outcome, OperationOutcome::Applied { .. }));
+    backend.snapshot().await.unwrap();
+
+    let info_calls = runner
+        .seen_args()
+        .iter()
+        .filter(|args| args[0].starts_with("--info-service="))
+        .count();
+    assert_eq!(info_calls, 14, "definitions must refetch after mutation");
 }
 
 #[tokio::test]

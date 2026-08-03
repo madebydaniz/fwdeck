@@ -190,12 +190,12 @@ fn direct_rules_fixture_parses_verbatim() {
 
 #[test]
 fn policy_info_parses() {
-    let raw = "mypolicy (active)\n  priority: -1\n  target: DROP\n  ingress-zones: public\n  egress-zones: ANY\n  services: http https\n  ports: 8080/tcp\n";
+    let raw = include_str!("fixtures/firewall_cmd/info_policy.txt");
     let policy = parse::parse_policy_info(raw).unwrap();
-    assert_eq!(policy.name.as_str(), "mypolicy");
+    assert_eq!(policy.name.as_str(), "fwdeck-fixture");
     assert_eq!(policy.target, fwdeck::domain::PolicyTarget::Drop);
     assert_eq!(policy.ingress_zones, vec!["public".to_owned()]);
     assert_eq!(policy.egress_zones, vec!["ANY".to_owned()]);
-    assert_eq!(policy.services.len(), 2);
+    assert_eq!(policy.services.len(), 1);
     assert_eq!(policy.ports[0].to_string(), "8080/tcp");
 }

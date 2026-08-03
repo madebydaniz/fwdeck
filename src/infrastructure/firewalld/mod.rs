@@ -16,8 +16,9 @@ use crate::application::ports::{FirewallBackend, FirewallError, OperationOutcome
 use std::collections::BTreeMap;
 
 use crate::domain::{
-    FirewallOperation, FirewallSnapshot, FirewallStatus, IpSetInfo, IpSetName, LogDenied,
-    NetfilterBackend, PolicyDetails, PolicyName, ServiceDefinition, ServiceName,
+    ActiveZone, ConfigurationTarget, DegradedSection, FirewallOperation, FirewallSnapshot,
+    FirewallStatus, IpSetInfo, IpSetName, LogDenied, NetfilterBackend, PolicyDetails, PolicyName,
+    Scoped, ServiceDefinition, ServiceName, SnapshotSection, ZoneDetails, ZoneName,
 };
 
 /// Fallback so the browse overlay is never empty if `--get-services` fails.
@@ -37,15 +38,22 @@ const FIREWALLD_CONF: &str = "/etc/firewalld/firewalld.conf";
 struct HeavySections {
     /// Refreshes since the last full heavy fetch; `None` forces a fetch.
     age: Option<u32>,
-    ipsets: BTreeMap<IpSetName, IpSetInfo>,
-    policies: BTreeMap<PolicyName, PolicyDetails>,
+    ipsets: Scoped<BTreeMap<IpSetName, IpSetInfo>>,
+    policies: Scoped<BTreeMap<PolicyName, PolicyDetails>>,
     direct_rules: Vec<String>,
-    degraded: Vec<String>,
+    degraded: Vec<DegradedSection>,
 }
 
 /// Heavy sections are refetched on every Nth refresh (they change rarely and
 /// cost one process per object); mutations invalidate the cache immediately.
 const HEAVY_SECTION_EVERY: u32 = 3;
+
+type ZoneSections = (
+    BTreeMap<ZoneName, ActiveZone>,
+    BTreeMap<ZoneName, ZoneDetails>,
+    BTreeMap<ZoneName, ZoneDetails>,
+    Vec<DegradedSection>,
+);
 
 /// The `firewall-cmd` backend: the full-featured reference implementation of
 /// `FirewallBackend`. Sections that fail to fetch degrade with an honest
@@ -54,8 +62,7 @@ pub struct CliBackend<R> {
     runner: R,
     timeout: Duration,
     mode: command::BackendMode,
-    // process-lifetime cache — service definitions only change when
-    // service files change; restart fwdeck to pick those up.
+    // Service-definition cache. Service mutations invalidate it before apply.
     definitions: std::sync::Mutex<BTreeMap<ServiceName, ServiceDefinition>>,
     /// Tiered-refresh cache for ipsets/policies/direct rules.
     heavy: std::sync::Mutex<HeavySections>,
@@ -90,11 +97,15 @@ impl<R: CommandRunner> CliBackend<R> {
     }
 
     /// Definitions for every referenced service; fetches only cache misses.
-    /// Soft-fails per service — enrichment must never kill a snapshot.
+    /// Soft-fails per service, with a structured degradation record so a
+    /// missing definition is never presented as an empty definition.
     async fn service_definitions(
         &self,
         names: Vec<ServiceName>,
-    ) -> BTreeMap<ServiceName, ServiceDefinition> {
+    ) -> (
+        BTreeMap<ServiceName, ServiceDefinition>,
+        Vec<DegradedSection>,
+    ) {
         let missing: Vec<ServiceName> = {
             let cache = self
                 .definitions
@@ -109,29 +120,40 @@ impl<R: CommandRunner> CliBackend<R> {
         let fetched = bounded_fan_out(missing.into_iter().map(|name| async move {
             let arg = format!("--info-service={name}");
             match self.run_ok(self.request(&[&arg])).await {
-                Ok(raw) => Some((name, parse::parse_service_info(&raw))),
+                Ok(raw) => (Some((name, parse::parse_service_info(&raw))), None),
                 Err(err) => {
                     tracing::warn!(service = %name, error = %err, "service info failed");
-                    None
+                    let degraded = DegradedSection::new(
+                        SnapshotSection::ServiceDefinitions,
+                        None,
+                        err.to_string(),
+                    )
+                    .with_object(name.to_string());
+                    (None, Some(degraded))
                 }
             }
         }))
         .await;
+        let mut degraded = Vec::new();
         {
             let mut cache = self
                 .definitions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.extend(fetched.into_iter().flatten());
+            for (definition, failure) in fetched {
+                cache.extend(definition);
+                degraded.extend(failure);
+            }
         }
         let cache = self
             .definitions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        names
+        let definitions = names
             .into_iter()
             .filter_map(|name| cache.get(&name).cloned().map(|def| (name, def)))
-            .collect()
+            .collect();
+        (definitions, degraded)
     }
 
     fn request(&self, args: &[&str]) -> CommandRequest {
@@ -173,21 +195,19 @@ impl<R: CommandRunner> CliBackend<R> {
     async fn fetch_heavy_sections(
         &self,
     ) -> (
-        BTreeMap<IpSetName, IpSetInfo>,
-        BTreeMap<PolicyName, PolicyDetails>,
+        Scoped<BTreeMap<IpSetName, IpSetInfo>>,
+        Scoped<BTreeMap<PolicyName, PolicyDetails>>,
         Vec<String>,
-        Vec<String>,
+        Vec<DegradedSection>,
         Vec<ServiceName>,
-        Option<String>,
+        Option<DegradedSection>,
     ) {
-        let (ipsets, ipsets_err) = self.ipsets().await;
+        let (ipsets, mut degraded) = self.ipsets().await;
         let (direct_rules, direct_err) = self.direct_rules().await;
         let (available_services, services_err) = self.available_services().await;
-        let (policies, policies_err) = self.policies().await;
-        let degraded: Vec<String> = [ipsets_err, direct_err, policies_err]
-            .into_iter()
-            .flatten()
-            .collect();
+        let (policies, policy_degraded) = self.policies().await;
+        degraded.extend(direct_err);
+        degraded.extend(policy_degraded);
         let mut heavy = self
             .heavy
             .lock()
@@ -225,43 +245,101 @@ impl<R: CommandRunner> CliBackend<R> {
         }
     }
 
-    /// IP sets are optional data: failures degrade to empty, never kill the
-    /// snapshot — but the failure is reported so the UI can say "unknown"
-    /// instead of "none".
-    async fn ipsets(&self) -> (BTreeMap<IpSetName, IpSetInfo>, Option<String>) {
-        let names = match self.run_ok(self.request(&["--get-ipsets"])).await {
+    /// Fetches one scope of IP sets, recording list and per-object failures.
+    async fn ipsets_for(
+        &self,
+        target: ConfigurationTarget,
+    ) -> (BTreeMap<IpSetName, IpSetInfo>, Vec<DegradedSection>) {
+        let request = if target == ConfigurationTarget::Permanent && !self.is_offline() {
+            self.request(&["--permanent", "--get-ipsets"])
+        } else {
+            self.request(&["--get-ipsets"])
+        };
+        let names = match self.run_ok(request).await {
             Ok(raw) => match parse::parse_ipset_names(&raw) {
                 Ok(names) => names,
                 Err(err) => {
                     tracing::warn!(error = %err, "ipset listing unparseable");
                     return (
                         BTreeMap::new(),
-                        Some(format!("ipsets: unparseable listing: {err}")),
+                        vec![DegradedSection::new(
+                            SnapshotSection::IpSets,
+                            Some(target),
+                            format!("unparseable listing: {err}"),
+                        )],
                     );
                 }
             },
             Err(err) => {
                 tracing::warn!(error = %err, "ipset listing failed");
-                return (BTreeMap::new(), Some(format!("ipsets: {err}")));
+                return (
+                    BTreeMap::new(),
+                    vec![DegradedSection::new(
+                        SnapshotSection::IpSets,
+                        Some(target),
+                        err.to_string(),
+                    )],
+                );
             }
         };
         // Concurrent: each `--info-ipset` spawn costs ~100 ms; serially that
         // scales with the set count and stalls every refresh (ADR-2 intent).
         let infos = bounded_fan_out(names.into_iter().map(|name| async move {
             let arg = format!("--info-ipset={name}");
-            match self.run_ok(self.request(&[&arg])).await {
-                Ok(raw) => Some((name, parse::parse_ipset_info(&raw))),
+            let request = if target == ConfigurationTarget::Permanent && !self.is_offline() {
+                self.request(&["--permanent", &arg])
+            } else {
+                self.request(&[&arg])
+            };
+            match self.run_ok(request).await {
+                Ok(raw) => (Some((name, parse::parse_ipset_info(&raw))), None),
                 Err(err) => {
                     tracing::warn!(ipset = %name, error = %err, "ipset info failed");
-                    None
+                    let failure = DegradedSection::new(
+                        SnapshotSection::IpSets,
+                        Some(target),
+                        err.to_string(),
+                    )
+                    .with_object(name.to_string());
+                    (None, Some(failure))
                 }
             }
         }))
         .await;
-        (infos.into_iter().flatten().collect(), None)
+        let mut ipsets = BTreeMap::new();
+        let mut degraded = Vec::new();
+        for (info, failure) in infos {
+            ipsets.extend(info);
+            degraded.extend(failure);
+        }
+        (ipsets, degraded)
     }
 
-    async fn available_services(&self) -> (Vec<ServiceName>, Option<String>) {
+    /// Fetches runtime and permanent IP sets independently. Offline mode has
+    /// no runtime configuration, so only permanent data is queried.
+    async fn ipsets(&self) -> (Scoped<BTreeMap<IpSetName, IpSetInfo>>, Vec<DegradedSection>) {
+        if self.is_offline() {
+            let (permanent, mut degraded) = self.ipsets_for(ConfigurationTarget::Permanent).await;
+            degraded.push(DegradedSection::new(
+                SnapshotSection::IpSets,
+                Some(ConfigurationTarget::Runtime),
+                "runtime configuration is unavailable in offline mode",
+            ));
+            return (
+                Scoped {
+                    runtime: BTreeMap::new(),
+                    permanent,
+                },
+                degraded,
+            );
+        }
+        let (runtime, mut degraded) = self.ipsets_for(ConfigurationTarget::Runtime).await;
+        let (permanent, permanent_degraded) = self.ipsets_for(ConfigurationTarget::Permanent).await;
+        degraded.extend(permanent_degraded);
+        (Scoped { runtime, permanent }, degraded)
+    }
+
+    async fn available_services(&self) -> (Vec<ServiceName>, Option<DegradedSection>) {
         match self.run_ok(self.request(&["--get-services"])).await {
             Ok(raw) => match parse::parse_service_names(&raw) {
                 Ok(names) => (names, None),
@@ -269,57 +347,137 @@ impl<R: CommandRunner> CliBackend<R> {
                     tracing::warn!(error = %err, "service listing unparseable");
                     (
                         Vec::new(),
-                        Some(format!("services: unparseable listing: {err}")),
+                        Some(DegradedSection::new(
+                            SnapshotSection::Services,
+                            None,
+                            format!("unparseable listing: {err}"),
+                        )),
                     )
                 }
             },
             Err(err) => {
                 tracing::warn!(error = %err, "service listing failed");
-                (Vec::new(), Some(format!("services: {err}")))
+                (
+                    Vec::new(),
+                    Some(DegradedSection::new(
+                        SnapshotSection::Services,
+                        None,
+                        err.to_string(),
+                    )),
+                )
             }
         }
     }
 
-    /// Policies degrade to empty on failure — optional data, never fatal, but
-    /// the failure is reported for honest display.
-    async fn policies(&self) -> (BTreeMap<PolicyName, PolicyDetails>, Option<String>) {
-        let names = match self.run_ok(self.request(&["--get-policies"])).await {
+    /// Fetches one scope of policies, recording list, info, and parse failures.
+    async fn policies_for(
+        &self,
+        target: ConfigurationTarget,
+    ) -> (BTreeMap<PolicyName, PolicyDetails>, Vec<DegradedSection>) {
+        let request = if target == ConfigurationTarget::Permanent && !self.is_offline() {
+            self.request(&["--permanent", "--get-policies"])
+        } else {
+            self.request(&["--get-policies"])
+        };
+        let names = match self.run_ok(request).await {
             Ok(raw) => match parse::parse_policy_names(&raw) {
                 Ok(names) => names,
                 Err(err) => {
                     tracing::warn!(error = %err, "policy listing unparseable");
                     return (
                         BTreeMap::new(),
-                        Some(format!("policies: unparseable listing: {err}")),
+                        vec![DegradedSection::new(
+                            SnapshotSection::Policies,
+                            Some(target),
+                            format!("unparseable listing: {err}"),
+                        )],
                     );
                 }
             },
             Err(err) => {
                 tracing::warn!(error = %err, "policy listing failed");
-                return (BTreeMap::new(), Some(format!("policies: {err}")));
+                return (
+                    BTreeMap::new(),
+                    vec![DegradedSection::new(
+                        SnapshotSection::Policies,
+                        Some(target),
+                        err.to_string(),
+                    )],
+                );
             }
         };
         let infos = bounded_fan_out(names.into_iter().map(|name| async move {
             let arg = format!("--info-policy={name}");
-            match self.run_ok(self.request(&[&arg])).await {
+            let request = if target == ConfigurationTarget::Permanent && !self.is_offline() {
+                self.request(&["--permanent", &arg])
+            } else {
+                self.request(&[&arg])
+            };
+            match self.run_ok(request).await {
                 Ok(raw) => match parse::parse_policy_info(&raw) {
-                    Ok(details) => Some((name, details)),
+                    Ok(details) => (Some((name, details)), None),
                     Err(err) => {
                         tracing::warn!(policy = %name, error = %err, "policy parse failed");
-                        None
+                        let failure = DegradedSection::new(
+                            SnapshotSection::Policies,
+                            Some(target),
+                            format!("unparseable details: {err}"),
+                        )
+                        .with_object(name.to_string());
+                        (None, Some(failure))
                     }
                 },
                 Err(err) => {
                     tracing::warn!(policy = %name, error = %err, "policy info failed");
-                    None
+                    let failure = DegradedSection::new(
+                        SnapshotSection::Policies,
+                        Some(target),
+                        err.to_string(),
+                    )
+                    .with_object(name.to_string());
+                    (None, Some(failure))
                 }
             }
         }))
         .await;
-        (infos.into_iter().flatten().collect(), None)
+        let mut policies = BTreeMap::new();
+        let mut degraded = Vec::new();
+        for (info, failure) in infos {
+            policies.extend(info);
+            degraded.extend(failure);
+        }
+        (policies, degraded)
     }
 
-    async fn direct_rules(&self) -> (Vec<String>, Option<String>) {
+    async fn policies(
+        &self,
+    ) -> (
+        Scoped<BTreeMap<PolicyName, PolicyDetails>>,
+        Vec<DegradedSection>,
+    ) {
+        if self.is_offline() {
+            let (permanent, mut degraded) = self.policies_for(ConfigurationTarget::Permanent).await;
+            degraded.push(DegradedSection::new(
+                SnapshotSection::Policies,
+                Some(ConfigurationTarget::Runtime),
+                "runtime configuration is unavailable in offline mode",
+            ));
+            return (
+                Scoped {
+                    runtime: BTreeMap::new(),
+                    permanent,
+                },
+                degraded,
+            );
+        }
+        let (runtime, mut degraded) = self.policies_for(ConfigurationTarget::Runtime).await;
+        let (permanent, permanent_degraded) =
+            self.policies_for(ConfigurationTarget::Permanent).await;
+        degraded.extend(permanent_degraded);
+        (Scoped { runtime, permanent }, degraded)
+    }
+
+    async fn direct_rules(&self) -> (Vec<String>, Option<DegradedSection>) {
         match self
             .run_ok(self.request(&["--direct", "--get-all-rules"]))
             .await
@@ -327,9 +485,68 @@ impl<R: CommandRunner> CliBackend<R> {
             Ok(raw) => (parse::parse_direct_rules(&raw), None),
             Err(err) => {
                 tracing::warn!(error = %err, "direct rule listing failed");
-                (Vec::new(), Some(format!("direct rules: {err}")))
+                (
+                    Vec::new(),
+                    Some(DegradedSection::new(
+                        SnapshotSection::DirectRules,
+                        Some(ConfigurationTarget::Runtime),
+                        err.to_string(),
+                    )),
+                )
             }
         }
+    }
+
+    /// Fetches runtime/permanent zones and records malformed individual zone
+    /// blocks without making the entire snapshot unavailable.
+    async fn zone_sections(&self) -> Result<ZoneSections, FirewallError> {
+        if self.is_offline() {
+            let config = self.run_ok(self.request(&["--list-all-zones"])).await?;
+            let (config, degraded) = parse::parse_list_all_zones(&config);
+            let mut degraded: Vec<_> = degraded
+                .into_iter()
+                .map(|message| {
+                    DegradedSection::new(
+                        SnapshotSection::Zones,
+                        Some(ConfigurationTarget::Permanent),
+                        message,
+                    )
+                })
+                .collect();
+            degraded.push(DegradedSection::new(
+                SnapshotSection::Zones,
+                Some(ConfigurationTarget::Runtime),
+                "runtime configuration is unavailable in offline mode",
+            ));
+            return Ok((BTreeMap::new(), BTreeMap::new(), config, degraded));
+        }
+
+        let active = self.run_ok(self.request(&["--get-active-zones"])).await?;
+        let active = parse::parse_active_zones(&active)?;
+        let runtime = self.run_ok(self.request(&["--list-all-zones"])).await?;
+        let (runtime, runtime_degraded) = parse::parse_list_all_zones(&runtime);
+        let mut degraded: Vec<DegradedSection> = runtime_degraded
+            .into_iter()
+            .map(|message| {
+                DegradedSection::new(
+                    SnapshotSection::Zones,
+                    Some(ConfigurationTarget::Runtime),
+                    message,
+                )
+            })
+            .collect();
+        let permanent = self
+            .run_ok(self.request(&["--permanent", "--list-all-zones"]))
+            .await?;
+        let (permanent, permanent_degraded) = parse::parse_list_all_zones(&permanent);
+        degraded.extend(permanent_degraded.into_iter().map(|message| {
+            DegradedSection::new(
+                SnapshotSection::Zones,
+                Some(ConfigurationTarget::Permanent),
+                message,
+            )
+        }));
+        Ok((active, runtime, permanent, degraded))
     }
 }
 
@@ -413,38 +630,7 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
         let default_zone = self.run_ok(self.request(&["--get-default-zone"])).await?;
         let default_zone = parse::parse_default_zone(&default_zone)?;
 
-        // Offline: no daemon → no active zones, and the single permanent config
-        // stands in for both runtime and permanent (there is no drift offline).
-        // A single malformed zone degrades only itself (recorded below) rather
-        // than failing the whole refresh.
-        let (active, runtime, permanent, zone_degraded) = if self.is_offline() {
-            let config = self.run_ok(self.request(&["--list-all-zones"])).await?;
-            let (config, degraded) = parse::parse_list_all_zones(&config);
-            let degraded: Vec<String> = degraded
-                .into_iter()
-                .map(|msg| format!("config {msg}"))
-                .collect();
-            (BTreeMap::new(), config.clone(), config, degraded)
-        } else {
-            let active = self.run_ok(self.request(&["--get-active-zones"])).await?;
-            let active = parse::parse_active_zones(&active)?;
-            let runtime = self.run_ok(self.request(&["--list-all-zones"])).await?;
-            let (runtime, runtime_degraded) = parse::parse_list_all_zones(&runtime);
-            let mut zone_degraded: Vec<String> = runtime_degraded
-                .into_iter()
-                .map(|msg| format!("runtime {msg}"))
-                .collect();
-            let permanent = self
-                .run_ok(self.request(&["--permanent", "--list-all-zones"]))
-                .await?;
-            let (permanent, permanent_degraded) = parse::parse_list_all_zones(&permanent);
-            zone_degraded.extend(
-                permanent_degraded
-                    .into_iter()
-                    .map(|msg| format!("permanent {msg}")),
-            );
-            (active, runtime, permanent, zone_degraded)
-        };
+        let (active, runtime, permanent, zone_degraded) = self.zone_sections().await?;
         // Tiered refresh: the per-object sections (one subprocess each) are
         // reused for a few refreshes; mutations invalidate the cache.
         let cached = {
@@ -496,9 +682,11 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
             direct_rules,
             degraded,
         };
-        snapshot.service_definitions = self
+        let (definitions, definition_degraded) = self
             .service_definitions(snapshot.referenced_services())
             .await;
+        snapshot.service_definitions = definitions;
+        snapshot.degraded.extend(definition_degraded);
         Ok(snapshot)
     }
 
@@ -509,6 +697,18 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .age = None;
+        if matches!(
+            operation,
+            FirewallOperation::CreateService { .. }
+                | FirewallOperation::DeleteService { .. }
+                | FirewallOperation::AddServicePort { .. }
+                | FirewallOperation::RemoveServicePort { .. }
+        ) {
+            self.definitions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
         let planned = command::plan_in(operation, self.timeout, self.mode);
         if planned.is_empty() {
             return OperationOutcome::Failed {

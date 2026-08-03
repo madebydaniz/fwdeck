@@ -9,7 +9,8 @@ use super::ids::{InterfaceName, IpSetName, ServiceName, ValidationError, ZoneNam
 use super::port::{ForwardPort, Protocol};
 use super::rich_rule::RichRule;
 use super::snapshot::{
-    FirewallSnapshot, FirewallStatus, IpSetInfo, LogDenied, NetfilterBackend, ServiceDefinition,
+    FirewallSnapshot, FirewallStatus, IpSetInfo, LogDenied, NetfilterBackend, Scoped,
+    ServiceDefinition,
 };
 use super::zone::{ActiveZone, ZoneDetails, ZoneTarget};
 
@@ -158,7 +159,10 @@ pub fn sample() -> Result<FirewallSnapshot, ValidationError> {
         active,
         runtime,
         permanent,
-        ipsets,
+        ipsets: Scoped {
+            runtime: ipsets.clone(),
+            permanent: ipsets,
+        },
         service_definitions,
         available_services: vec![
             ServiceName::parse("ssh")?,
@@ -181,7 +185,10 @@ pub fn sample() -> Result<FirewallSnapshot, ValidationError> {
                     ports: Vec::new(),
                 },
             );
-            policies
+            Scoped {
+                runtime: policies.clone(),
+                permanent: policies,
+            }
         },
         degraded: Vec::new(),
         direct_rules: vec!["ipv4 filter INPUT 9 -p tcp --dport 12345 -j ACCEPT".to_owned()],

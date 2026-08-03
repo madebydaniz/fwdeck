@@ -86,7 +86,7 @@ impl ViewId {
             Self::RichRules => &["FAMILY", "ACTION", "SCOPE", "RULE"],
             Self::Interfaces => &["INTERFACE", "ZONE", "ACTIVE"],
             Self::Sources => &["SOURCE", "FAMILY", "ZONE"],
-            Self::IpSets => &["NAME", "TYPE", "ENTRIES"],
+            Self::IpSets => &["NAME", "TYPE", "ENTRIES", "SCOPE"],
             Self::Direct => &["FAMILY", "TABLE", "CHAIN", "PRIO", "ARGS"],
             Self::Logs => &[
                 "TIME",
@@ -153,6 +153,7 @@ impl ViewId {
                 Constraint::Min(16),
                 Constraint::Min(10),
                 Constraint::Length(8),
+                Constraint::Length(9),
             ],
             Self::Direct => vec![
                 Constraint::Length(6),
@@ -199,6 +200,8 @@ pub enum Scope {
     Runtime,
     /// Permanent only — takes effect after a reload.
     Permanent,
+    /// Present in both configurations, but the values differ.
+    Drift,
     /// Present in neither (an empty cell).
     None,
 }
@@ -211,6 +214,7 @@ impl Scope {
             Self::Both => "both",
             Self::Runtime => "runtime",
             Self::Permanent => "permanent",
+            Self::Drift => "drift",
             Self::None => "",
         }
     }
@@ -222,6 +226,7 @@ impl Scope {
             "both" => Self::Both,
             "runtime" => Self::Runtime,
             "permanent" => Self::Permanent,
+            "drift" => Self::Drift,
             _ => Self::None,
         }
     }
@@ -233,7 +238,7 @@ impl Scope {
         match self {
             Self::Runtime => ConfigurationTarget::Runtime,
             Self::Permanent => ConfigurationTarget::Permanent,
-            Self::Both | Self::None => default,
+            Self::Both | Self::Drift | Self::None => default,
         }
     }
 }
@@ -283,22 +288,45 @@ pub fn rows(
         ViewId::RichRules => rich_rules_rows(snap, zone),
         ViewId::Interfaces => interfaces_rows(snap, config),
         ViewId::Sources => sources_rows(snap, config),
-        ViewId::IpSets => ipsets_rows(snap),
+        ViewId::IpSets => ipsets_rows(snap, config),
         ViewId::Direct => direct_rows(snap),
         // Logs rows come from the UI's ring buffer (`UiState::all_rows`).
         ViewId::Logs => Vec::new(),
     }
 }
 
-fn ipsets_rows(snap: &FirewallSnapshot) -> Vec<Vec<String>> {
-    snap.ipsets
-        .iter()
-        .map(|(name, info)| {
-            vec![
+fn ipsets_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<Vec<String>> {
+    let mut names: Vec<_> = snap
+        .ipsets
+        .runtime
+        .keys()
+        .chain(snap.ipsets.permanent.keys())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let runtime = snap.ipsets.runtime.get(name);
+            let permanent = snap.ipsets.permanent.get(name);
+            let info = if config == ConfigurationTarget::Permanent {
+                permanent.or(runtime)
+            } else {
+                runtime.or(permanent)
+            }?;
+            let scope = match (runtime, permanent) {
+                (Some(runtime), Some(permanent)) if runtime == permanent => Scope::Both,
+                (Some(_), Some(_)) => Scope::Drift,
+                (Some(_), None) => Scope::Runtime,
+                (None, Some(_)) => Scope::Permanent,
+                (None, None) => Scope::None,
+            };
+            Some(vec![
                 name.to_string(),
                 info.kind.clone(),
                 info.entries.len().to_string(),
-            ]
+                scope.as_str().to_owned(),
+            ])
         })
         .collect()
 }
@@ -558,6 +586,7 @@ mod tests {
         );
         assert_eq!(ipsets[0][0], "blocklist");
         assert_eq!(ipsets[0][2], "1");
+        assert_eq!(ipsets[0][3], "both");
         let direct = rows(
             ViewId::Direct,
             &snap,

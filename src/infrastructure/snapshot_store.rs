@@ -8,10 +8,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::domain::FirewallSnapshot;
+use crate::domain::{DegradedSection, FirewallSnapshot, SnapshotSection};
 
 /// Current snapshot-file schema. Bump on breaking envelope changes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The on-disk envelope around a saved snapshot: enough metadata to refuse a
 /// restore against the wrong host or an incompatible schema, and to tell the
@@ -165,10 +165,28 @@ pub fn load(name: &str) -> Result<FirewallSnapshot, String> {
                 envelope.host
             ));
         }
-        return Ok(envelope.snapshot);
+        let mut snapshot = envelope.snapshot;
+        if envelope.schema < SCHEMA_VERSION {
+            snapshot.degraded.push(DegradedSection::new(
+                SnapshotSection::LegacySnapshot,
+                None,
+                format!(
+                    "schema v{} stored ipsets and policies without separate runtime/permanent state",
+                    envelope.schema
+                ),
+            ));
+        }
+        return Ok(snapshot);
     }
     // Legacy bare snapshot (pre-envelope files).
-    serde_json::from_str(&raw).map_err(|err| err.to_string())
+    let mut snapshot: FirewallSnapshot =
+        serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+    snapshot.degraded.push(DegradedSection::new(
+        SnapshotSection::LegacySnapshot,
+        None,
+        "bare snapshot stored ipsets and policies without separate runtime/permanent state",
+    ));
+    Ok(snapshot)
 }
 
 /// Lists saved snapshots, newest first (filenames sort lexically by timestamp).
