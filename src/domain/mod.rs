@@ -3,6 +3,7 @@
 pub mod address;
 pub mod capability;
 pub mod dependency;
+pub mod direct_migration;
 pub mod explain;
 pub mod ids;
 #[cfg(test)]
@@ -21,6 +22,10 @@ pub mod zone;
 pub use address::{AddressFamily, IpSetEntry, SourceAddress};
 pub use capability::{FeatureSupport, FirewalldFeature};
 pub use dependency::{PolicyDependency, PolicyDependencyGraph, PolicyDependencyResource};
+pub use direct_migration::{
+    DirectChain, DirectMigrationError, DirectPolicyMigration, DirectRuleTranslation,
+    translate_direct_rule,
+};
 pub use ids::{
     IcmpType, InterfaceName, IpProtocol, IpSetName, PolicyName, PolicySetName, ServiceName,
     ValidationError, ZoneName,

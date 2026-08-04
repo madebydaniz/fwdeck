@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::domain::{ConfigurationTarget, FirewallOperation};
+use crate::domain::{ConfigurationTarget, DirectPolicyMigration, FirewallOperation};
 use crate::infrastructure::process::{CommandRequest, DEFAULT_TIMEOUT};
 
 /// The firewalld client binary (resolved from trusted dirs at spawn time).
@@ -337,6 +337,9 @@ pub fn plan_in(
         ),
         FirewallOperation::CreatePolicy { policy } => {
             permanent_op(&[&format!("--new-policy={policy}")], timeout)
+        }
+        FirewallOperation::MigrateDirectRule { migration } => {
+            direct_policy_migration(migration, timeout)
         }
         FirewallOperation::DeletePolicy { policy } => {
             permanent_op(&[&format!("--delete-policy={policy}")], timeout)
@@ -786,6 +789,48 @@ fn policy_set_op(
     )
 }
 
+/// Additive direct-rule migration: build the complete permanent policy while
+/// leaving the legacy rule in place for post-reload verification.
+fn direct_policy_migration(
+    migration: &DirectPolicyMigration,
+    timeout: Duration,
+) -> Vec<PlannedCommand> {
+    [
+        vec![format!("--new-policy={}", migration.policy())],
+        vec![
+            format!("--policy={}", migration.policy()),
+            format!("--add-ingress-zone={}", migration.ingress_zone()),
+        ],
+        vec![
+            format!("--policy={}", migration.policy()),
+            format!("--add-egress-zone={}", migration.egress_zone()),
+        ],
+        vec![
+            format!("--policy={}", migration.policy()),
+            format!("--add-rich-rule={}", migration.rich_rule().as_str()),
+        ],
+    ]
+    .into_iter()
+    .map(|args| PlannedCommand {
+        target: "permanent",
+        request: request_with_owned(PROGRAM, "--permanent", args, timeout),
+    })
+    .collect()
+}
+
+fn request_with_owned(
+    program: &'static str,
+    prefix: &str,
+    args: Vec<String>,
+    timeout: Duration,
+) -> CommandRequest {
+    CommandRequest {
+        program,
+        args: std::iter::once(prefix.to_owned()).chain(args).collect(),
+        timeout,
+    }
+}
+
 /// IP-set-scoped operation (`--ipset=<name> <argument>`).
 fn ipset_entry_op(
     name: &str,
@@ -800,7 +845,7 @@ fn ipset_entry_op(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::domain::{PolicySetName, ServiceName, ZoneName};
+    use crate::domain::{PolicyName, PolicySetName, ServiceName, ZoneName, translate_direct_rule};
     use crate::infrastructure::process::DEFAULT_TIMEOUT;
 
     fn args_of(planned: &[PlannedCommand]) -> Vec<Vec<String>> {
@@ -881,6 +926,42 @@ mod tests {
                 "--policy-set=gateway".to_owned(),
                 "--add-disable".to_owned(),
             ]]
+        );
+    }
+
+    #[test]
+    fn direct_migration_plans_complete_additive_policy() {
+        let migration = translate_direct_rule("ipv4 filter INPUT 9 -p tcp --dport 12345 -j ACCEPT")
+            .unwrap()
+            .into_migration(PolicyName::parse_user_created("direct-web").unwrap());
+        let operation = FirewallOperation::MigrateDirectRule { migration };
+        assert_eq!(
+            args_of(&plan(&operation, DEFAULT_TIMEOUT)),
+            vec![
+                vec![
+                    "--permanent".to_owned(),
+                    "--new-policy=direct-web".to_owned()
+                ],
+                vec![
+                    "--permanent".to_owned(),
+                    "--policy=direct-web".to_owned(),
+                    "--add-ingress-zone=ANY".to_owned(),
+                ],
+                vec![
+                    "--permanent".to_owned(),
+                    "--policy=direct-web".to_owned(),
+                    "--add-egress-zone=HOST".to_owned(),
+                ],
+                vec![
+                    "--permanent".to_owned(),
+                    "--policy=direct-web".to_owned(),
+                    concat!(
+                        "--add-rich-rule=rule priority=\"9\" family=\"ipv4\" ",
+                        "port port=\"12345\" protocol=\"tcp\" accept"
+                    )
+                    .to_owned(),
+                ],
+            ]
         );
     }
 

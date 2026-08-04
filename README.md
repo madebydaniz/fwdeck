@@ -118,6 +118,8 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
 - 🧭 Every firewalld object on one screen: zones, services, ports, source-ports, protocols, forwards, rich rules, interfaces, sources, ipsets, policies, direct rules — plus per-zone target, intra-zone forwarding, and icmp-block inversion.
 - ✅ A confirmation in front of every mutation: resource, zone, scope, connectivity risk.
 - 🧙 Guided rich-rule builder — assemble valid rich-language syntax step by step.
+- 🧭 Fail-closed direct-rule migration assistant — preview and create additive
+  policy candidates for a conservative subset; legacy rules are never removed automatically.
 - ↩️ Multi-level undo — every verified reversible change stacks; undo pops the most recent.
 - 📊 Live nftables rule-hit counters per chain (nftables backend).
 - ⌨️ Fuzzy command palette (`:`) with context-aware availability; live filtering (`/`); global search (`ctrl-f`) across every view at once.

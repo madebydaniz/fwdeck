@@ -6,7 +6,7 @@ use strum::IntoEnumIterator;
 
 use crate::domain::{
     ConfigurationTarget, FeatureSupport, FirewallOperation, FirewalldFeature, LogDenied,
-    SnapshotSection,
+    SnapshotSection, translate_direct_rule,
 };
 use crate::infrastructure::firewalld::command::ExportFormat;
 
@@ -14,7 +14,7 @@ use super::action::UiAction;
 use super::fuzzy;
 use super::overlays::FormKind;
 use super::state::UiState;
-use super::views::ViewId;
+use super::views::{RowId, ViewId};
 
 /// Grouping label shown next to each palette entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +155,29 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
     let row_bound = |required_view: ViewId, reason: &'static str| match mutable {
         Availability::Enabled if state.view == required_view && has_rows => Availability::Enabled,
         Availability::Enabled => Availability::Disabled(reason),
+        disabled @ Availability::Disabled(_) => disabled,
+    };
+    let direct_migration_mutable = match row_bound(
+        ViewId::Direct,
+        "select a supported migration candidate in the Direct view",
+    ) {
+        Availability::Enabled
+            if state.snapshot.as_deref().is_some_and(|snapshot| {
+                !snapshot
+                    .section_is_complete(SnapshotSection::DirectRules, ConfigurationTarget::Runtime)
+            }) =>
+        {
+            Availability::Disabled("direct-rule data incomplete")
+        }
+        Availability::Enabled => {
+            let rows = state.visible_rows();
+            match rows.get(state.view_state().selected).map(|row| &row.id) {
+                Some(RowId::Direct { rule, .. }) if translate_direct_rule(rule).is_ok() => {
+                    Availability::Enabled
+                }
+                _ => Availability::Disabled("selected rule requires manual migration"),
+            }
+        }
         disabled @ Availability::Disabled(_) => disabled,
     };
 
@@ -624,6 +647,22 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
             with_data,
         ),
         cmd(
+            UiAction::ShowDirectMigration,
+            "Direct-rule migration assistant",
+            "Classify direct rules and preview conservative policy candidates",
+            &["direct", "deprecated", "migrate", "policy", "legacy"],
+            Category::App,
+            with_data,
+        ),
+        cmd(
+            UiAction::OpenForm(FormKind::MigrateDirectRule),
+            "Migrate selected direct rule",
+            "Create an additive permanent policy replacement; keep the direct rule",
+            &["direct", "deprecated", "migrate", "replace", "policy"],
+            Category::Firewall,
+            direct_migration_mutable,
+        ),
+        cmd(
             UiAction::ShowDrift,
             "Drift workspace",
             "Every runtime vs permanent difference across all zones",
@@ -849,6 +888,32 @@ mod tests {
             .find(|command| command.action == UiAction::OpenForm(FormKind::SetPolicySetState))
             .expect("policy-set command");
         assert_eq!(command.availability, Availability::Enabled);
+    }
+
+    #[test]
+    fn direct_migration_is_enabled_only_for_supported_selected_rules() {
+        let mut state = state_with_palette("migrate direct");
+        state.view = ViewId::Direct;
+        state.snapshot = Some(std::sync::Arc::new(
+            crate::domain::mock::sample().expect("mock"),
+        ));
+        let command = catalog(&state)
+            .into_iter()
+            .find(|command| command.action == UiAction::OpenForm(FormKind::MigrateDirectRule))
+            .expect("migration command");
+        assert_eq!(command.availability, Availability::Enabled);
+
+        let mut snapshot = crate::domain::mock::sample().expect("mock");
+        snapshot.direct_rules = vec!["ipv4 nat PREROUTING 0 -j DNAT".to_owned()];
+        state.snapshot = Some(std::sync::Arc::new(snapshot));
+        let command = catalog(&state)
+            .into_iter()
+            .find(|command| command.action == UiAction::OpenForm(FormKind::MigrateDirectRule))
+            .expect("migration command");
+        assert_eq!(
+            command.availability,
+            Availability::Disabled("selected rule requires manual migration")
+        );
     }
 
     #[test]

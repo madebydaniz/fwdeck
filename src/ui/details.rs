@@ -6,6 +6,7 @@ use crate::application::ports::{FirewallError, OperationOutcome};
 use crate::domain::{
     ConfigurationTarget, FeatureSupport, FirewallOperation, FirewallSnapshot, FirewalldFeature,
     PolicyDependencyGraph, PolicyDependencyResource, PolicySetDetails, SnapshotSection, ZoneName,
+    translate_direct_rule,
 };
 
 use super::views::{RowId, ViewId, ViewRow};
@@ -301,20 +302,7 @@ pub fn for_row(
             };
             policy_details(snapshot, name)
         }
-        ViewId::Direct => Some(DetailsContent {
-            title: "Direct rule (deprecated)".to_owned(),
-            lines: vec![
-                line("family", cell(0)),
-                line("table", cell(1)),
-                line("chain", cell(2)),
-                line("priority", cell(3)),
-                line("args", cell(4)),
-                line(
-                    "note",
-                    "direct rules are deprecated in firewalld — prefer rich rules or policies",
-                ),
-            ],
-        }),
+        ViewId::Direct => direct_rule_details(row),
         ViewId::Logs => Some(DetailsContent {
             title: "Log entry".to_owned(),
             lines: vec![
@@ -328,6 +316,51 @@ pub fn for_row(
             ],
         }),
     }
+}
+
+fn direct_rule_details(row: &ViewRow) -> Option<DetailsContent> {
+    let cell = |index: usize| row.cells().get(index).map_or("", String::as_str);
+    let mut lines = vec![
+        line("family", cell(0)),
+        line("table", cell(1)),
+        line("chain", cell(2)),
+        line("priority", cell(3)),
+        line("args", cell(4)),
+        line(
+            "note",
+            "direct rules are deprecated in firewalld — prefer rich rules or policies",
+        ),
+    ];
+    let RowId::Direct { rule, .. } = &row.id else {
+        return None;
+    };
+    match translate_direct_rule(rule) {
+        Ok(translation) => {
+            lines.push(line("migration", "conservative policy candidate available"));
+            lines.push(line(
+                "direction",
+                format!(
+                    "{}: {} → {}",
+                    translation.chain.as_str(),
+                    translation.chain.ingress_zone(),
+                    translation.chain.egress_zone()
+                ),
+            ));
+            lines.push(line("rich rule", translation.rich_rule.as_str()));
+            lines.push(line(
+                "next",
+                "press `a` or use the palette; the direct rule remains until manual retirement",
+            ));
+        }
+        Err(err) => {
+            lines.push(line("migration", "manual review required"));
+            lines.push(line("reason", err.to_string()));
+        }
+    }
+    Some(DetailsContent {
+        title: "Direct rule (deprecated)".to_owned(),
+        lines,
+    })
 }
 
 fn policy_details(
@@ -670,6 +703,56 @@ pub fn policy_dependency_graph(snapshot: &FirewallSnapshot) -> DetailsContent {
     ));
     DetailsContent {
         title: format!("Policy dependency graph ({edge_count} scoped edges)"),
+        lines,
+    }
+}
+
+/// Lossless-vs-manual classification of every observed direct rule. This is
+/// read-only; creating a replacement remains an explicit row-scoped action.
+#[must_use]
+pub fn direct_migration(snapshot: &FirewallSnapshot) -> DetailsContent {
+    let complete =
+        snapshot.section_is_complete(SnapshotSection::DirectRules, ConfigurationTarget::Runtime);
+    let mut lines = vec![
+        line(
+            "safety",
+            "replacement policies are additive; FWDeck never removes direct rules",
+        ),
+        line(
+            "workflow",
+            "create permanent policy → reload → validate traffic → retire legacy rule manually",
+        ),
+        line("snapshot", if complete { "complete" } else { "incomplete" }),
+        (String::new(), String::new()),
+    ];
+    let mut eligible = 0usize;
+    for (index, rule) in snapshot.direct_rules.iter().enumerate() {
+        match translate_direct_rule(rule) {
+            Ok(translation) => {
+                eligible += 1;
+                lines.push((
+                    format!("#{index} eligible"),
+                    format!(
+                        "{} {} → {}",
+                        translation.chain.as_str(),
+                        translation.chain.ingress_zone(),
+                        translation.chain.egress_zone()
+                    ),
+                ));
+                lines.push(line("rich rule", translation.rich_rule.as_str()));
+            }
+            Err(err) => lines.push((format!("#{index} manual"), err.to_string())),
+        }
+        lines.push(line("source", rule));
+    }
+    if snapshot.direct_rules.is_empty() {
+        lines.push(line("rules", "none observed"));
+    }
+    DetailsContent {
+        title: format!(
+            "Direct migration assistant ({eligible}/{} eligible)",
+            snapshot.direct_rules.len()
+        ),
         lines,
     }
 }
@@ -1183,6 +1266,28 @@ mod tests {
                 .lines
                 .iter()
                 .any(|(key, value)| key == "  runtime" && value == "disabled")
+        );
+    }
+
+    #[test]
+    fn direct_migration_workspace_distinguishes_eligible_and_manual_rules() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot
+            .direct_rules
+            .push("ipv4 nat PREROUTING 0 -j DNAT".to_owned());
+        let content = direct_migration(&snapshot);
+        assert!(content.title.contains("1/2 eligible"));
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| key.contains("eligible") && value.contains("ANY → HOST"))
+        );
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| key.contains("manual") && value.contains("table `nat`"))
         );
     }
 }

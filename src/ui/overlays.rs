@@ -91,6 +91,8 @@ pub enum FormKind {
     AddPolicyService,
     /// Enable or disable a predefined policy set.
     SetPolicySetState,
+    /// Create a reviewed policy replacement for the selected direct rule.
+    MigrateDirectRule,
     /// Stage a plan restoring a saved snapshot.
     RestoreSnapshot,
     /// Show a read-only diff of the current state against a saved snapshot.
@@ -128,6 +130,7 @@ impl FormKind {
             Self::CreatePolicy => "Create policy",
             Self::AddPolicyService => "Add service to policy",
             Self::SetPolicySetState => "Set policy-set state",
+            Self::MigrateDirectRule => "Migrate selected direct rule",
             Self::RestoreSnapshot => "Restore snapshot (stages a plan)",
             Self::DiffSnapshot => "Diff against snapshot (read-only)",
             Self::ExplainTraffic => "Explain traffic",
@@ -162,9 +165,10 @@ impl FormKind {
             Self::CreateService => "service name (permanent-only; reload to activate)",
             Self::AddServicePort => "name port/proto (e.g. myapp 9200/tcp)",
             Self::RemoveServicePort => "name port/proto to remove (e.g. myapp 9200/tcp)",
-            Self::CreatePolicy => "policy name (permanent-only; reload to activate)",
+            Self::CreatePolicy => "policy name (max 17 chars; permanent-only)",
             Self::AddPolicyService => "policy service (e.g. mypolicy http)",
             Self::SetPolicySetState => "<set> <enable|disable>  e.g. gateway enable",
+            Self::MigrateDirectRule => "new policy name (max 17 chars; direct rule remains)",
             Self::RestoreSnapshot => "snapshot filename (see \"Browse saved snapshots\")",
             Self::DiffSnapshot => "snapshot filename to diff against current",
             Self::ExplainTraffic => "<source-ip> <port>/<proto>  e.g. 203.0.113.7 443/tcp",
