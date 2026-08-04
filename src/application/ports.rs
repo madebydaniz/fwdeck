@@ -95,6 +95,14 @@ pub enum FirewallError {
     /// Mutation rejected because the engine runs with `read_only` enforced.
     #[error("fwdeck is in read-only mode")]
     ReadOnlyMode,
+    /// The observed state changed after validation/confirmation but before the
+    /// engine reached the mutation boundary.
+    #[error("firewall state changed after confirmation — refreshed; review and retry")]
+    StaleSnapshot,
+    /// The engine's defense-in-depth validation rejected a request before any
+    /// backend command or rollback guard was started.
+    #[error("operation rejected by validation: {0}")]
+    Validation(String),
 }
 
 /// One executed step of an operation, with the exact invocation for
@@ -102,7 +110,8 @@ pub enum FirewallError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepReport {
     /// Which configuration the step touched: `"runtime"`, `"permanent"`,
-    /// `"global"`, `"offline"`, or `"policy"` (read-only rejection).
+    /// `"global"`, `"offline"`, `"policy"` (read-only rejection), or
+    /// `"precondition"` (no mutation was attempted).
     pub target: &'static str,
     /// Exact argv (CLI backend) or D-Bus method + args, for audit/display.
     pub invocation: Vec<String>,
@@ -199,6 +208,14 @@ pub trait FirewallBackend: Send + Sync + 'static {
 
     /// Full state in a handful of process calls, independent of zone count (ADR-2).
     fn snapshot(&self) -> impl Future<Output = Result<FirewallSnapshot, FirewallError>> + Send;
+
+    /// Reads state for a mutation precondition, bypassing any refresh cache.
+    /// Backends without a cache can use the default implementation.
+    fn snapshot_fresh(
+        &self,
+    ) -> impl Future<Output = Result<FirewallSnapshot, FirewallError>> + Send {
+        self.snapshot()
+    }
 
     /// Executes one operation (runtime step first, then permanent). Partial
     /// failure is an outcome, never an `Err` — callers must not lose it.

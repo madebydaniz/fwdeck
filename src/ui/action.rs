@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crate::application::ports::FirewallError;
+use crate::application::{MutationPlan, MutationRequest};
 use crate::domain::LogEntry;
 use crate::domain::{FirewallOperation, FirewallSnapshot};
 
@@ -119,11 +120,12 @@ pub enum UiAction {
     RichBuilderCommit,
     /// Validates and opens the confirmation modal for an operation.
     RequestOperation(FirewallOperation),
-    /// Dispatched by the confirmation modal: hands the operation to the engine.
-    ApplyOperation(FirewallOperation),
+    /// Dispatched by the confirmation modal with the snapshot reviewed by the
+    /// operator; hands the mutation request to the engine.
+    ApplyOperation(MutationRequest),
     /// Dispatched by the plan confirmation modal: arms the dead-man's switch for
     /// the batch, then hands the whole staged plan to the engine.
-    ApplyPlanConfirmed(Vec<FirewallOperation>),
+    ApplyPlanConfirmed(MutationPlan),
     /// The engine finished an operation; toast, audit, and maybe arm rollback.
     OperationFinished(Box<crate::application::api::OperationResult>),
     /// A staged plan finished; `remaining` are unexecuted operations to re-stage.
@@ -228,8 +230,8 @@ pub enum Effect {
     Quit,
     /// Ask the engine for a fresh snapshot.
     Refresh,
-    /// Hand a single operation to the engine for execution.
-    Apply(FirewallOperation),
+    /// Hand one reviewed mutation to the engine for preflight and execution.
+    Apply(MutationRequest),
     /// Execute an armed inverse. The engine applies first and only then
     /// attempts the bounded watchdog disarm.
     ApplyRollback {
@@ -257,8 +259,8 @@ pub enum Effect {
         crate::infrastructure::firewalld::command::ExportFormat,
         String,
     ),
-    /// Send a whole staged plan to the engine as one sequential transaction.
-    ApplyPlan(Vec<FirewallOperation>),
+    /// Send a reviewed staged plan to the engine as one sequential transaction.
+    ApplyPlan(MutationPlan),
     /// List the snapshot store (off the event-loop thread); result returns as
     /// `UiAction::SnapshotsListed`.
     ListSnapshots,

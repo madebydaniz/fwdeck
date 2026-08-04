@@ -5,7 +5,10 @@ pub mod api;
 pub mod engine;
 pub mod ports;
 
-pub use api::{EngineEvent, EngineHandle, EngineRequest, OperationResult, RollbackRegistration};
+pub use api::{
+    EngineEvent, EngineHandle, EngineRequest, MutationPlan, MutationRequest, OperationResult,
+    RollbackRegistration,
+};
 pub use ports::{
     FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardError,
     RollbackGuardId, StepReport,

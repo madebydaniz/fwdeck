@@ -6,6 +6,7 @@ mod lifecycle;
 mod plans;
 mod rows;
 
+use crate::application::MutationRequest;
 use crate::domain::{
     ConfigurationTarget, FirewallOperation, SnapshotSection, ZoneName, translate_direct_rule,
 };
@@ -196,10 +197,13 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::ConfirmStage => {
             if let Some(Overlay::Confirm(confirmation)) = state.overlays.pop()
-                && let UiAction::ApplyOperation(operation) = confirmation.on_confirm
+                && let UiAction::ApplyOperation(request) = confirmation.on_confirm
             {
-                state.toast(ToastKind::Info, format!("staged: {}", operation.describe()));
-                state.staged.push(operation);
+                state.toast(
+                    ToastKind::Info,
+                    format!("staged: {}", request.operation.describe()),
+                );
+                state.staged.push(request.operation);
             }
         }
         UiAction::KeepChanges => {
@@ -365,7 +369,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         UiAction::ApplyStagedPlan => return apply_staged_plan(state),
         // The confirmed apply of a staged plan (carried by the plan confirm's
         // on_confirm): arms the dead-man's switch, then dispatches the batch.
-        UiAction::ApplyPlanConfirmed(ops) => return apply_plan_now(state, ops),
+        UiAction::ApplyPlanConfirmed(plan) => return apply_plan_now(state, plan),
         UiAction::DiscardStagedPlan => {
             let count = state.staged.len();
             state.staged.clear();
@@ -505,12 +509,12 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::RichBuilderCommit => return rich_builder_commit(state),
         UiAction::RequestOperation(operation) => return request_operation(state, operation),
-        UiAction::ApplyOperation(operation) => {
+        UiAction::ApplyOperation(request) => {
             state.toast(
                 ToastKind::Info,
-                format!("applying: {}", operation.describe()),
+                format!("applying: {}", request.operation.describe()),
             );
-            return vec![Effect::Apply(operation)];
+            return vec![Effect::Apply(request)];
         }
         UiAction::OperationFinished(result) => {
             let result = *result;
@@ -875,7 +879,10 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
         return Vec::new();
     }
     if !state.confirm_destructive {
-        return update(state, UiAction::ApplyOperation(operation));
+        return update(
+            state,
+            UiAction::ApplyOperation(MutationRequest::new(operation, snapshot)),
+        );
     }
     let mut body = vec![
         operation.describe(),
@@ -930,7 +937,7 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
     state.overlays.push(Overlay::Confirm(Confirmation {
         title: "Confirm".to_owned(),
         body,
-        on_confirm: UiAction::ApplyOperation(operation),
+        on_confirm: UiAction::ApplyOperation(MutationRequest::new(operation, snapshot)),
     }));
     Vec::new()
 }
@@ -1077,6 +1084,10 @@ mod tests {
         let mut state = UiState::new(&Config::default(), "test".into(), false, None);
         state.snapshot = Some(std::sync::Arc::new(mock::sample().unwrap()));
         state
+    }
+
+    fn reviewed(operation: FirewallOperation) -> MutationRequest {
+        MutationRequest::new(operation, std::sync::Arc::new(mock::sample().unwrap()))
     }
 
     fn rollback(
@@ -1365,12 +1376,44 @@ mod tests {
         }
         let effects = update(&mut s, UiAction::ConfirmAccept);
         match &effects[..] {
-            [Effect::Apply(FirewallOperation::AddService { service, .. })] => {
+            [Effect::Apply(request)] => {
+                let FirewallOperation::AddService { service, .. } = &request.operation else {
+                    panic!("expected AddService, got {:?}", request.operation);
+                };
                 assert_eq!(service.as_str(), "mdns");
             }
             other => panic!("expected apply effect, got {other:?}"),
         }
         assert!(s.overlays.is_empty());
+    }
+
+    #[test]
+    fn confirmation_keeps_the_snapshot_that_was_reviewed() {
+        let mut s = state();
+        let reviewed_snapshot = s.snapshot.clone().unwrap();
+        update(
+            &mut s,
+            UiAction::RequestOperation(FirewallOperation::AddService {
+                zone: ZoneName::parse("public").unwrap(),
+                service: ServiceName::parse("mdns").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            }),
+        );
+        assert!(matches!(s.overlays.last(), Some(Overlay::Confirm(_))));
+
+        let mut changed = (*reviewed_snapshot).clone();
+        changed.status.panic_mode = !changed.status.panic_mode;
+        s.snapshot = Some(std::sync::Arc::new(changed));
+
+        let effects = update(&mut s, UiAction::ConfirmAccept);
+        let [Effect::Apply(request)] = effects.as_slice() else {
+            panic!("expected one apply request, got {effects:?}");
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            &request.expected,
+            &reviewed_snapshot
+        ));
+        assert_ne!(request.expected, s.snapshot.clone().unwrap());
     }
 
     #[test]
@@ -1511,8 +1554,9 @@ mod tests {
         update(&mut s, UiAction::ToggleForwardRequested);
         match s.overlays.last() {
             Some(Overlay::Confirm(c)) => assert!(matches!(
-                c.on_confirm,
-                UiAction::ApplyOperation(FirewallOperation::SetForward { .. })
+                &c.on_confirm,
+                UiAction::ApplyOperation(request)
+                    if matches!(request.operation, FirewallOperation::SetForward { .. })
             )),
             other => panic!("expected a SetForward confirmation, got {other:?}"),
         }
@@ -1528,8 +1572,9 @@ mod tests {
         update(&mut s, UiAction::FormSubmit);
         match s.overlays.last() {
             Some(Overlay::Confirm(c)) => assert!(matches!(
-                c.on_confirm,
-                UiAction::ApplyOperation(FirewallOperation::SetZoneTarget { .. })
+                &c.on_confirm,
+                UiAction::ApplyOperation(request)
+                    if matches!(request.operation, FirewallOperation::SetZoneTarget { .. })
             )),
             other => panic!("expected a SetZoneTarget confirmation, got {other:?}"),
         }
@@ -1546,13 +1591,16 @@ mod tests {
         update(&mut s, UiAction::DeleteEntry);
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => {
+                let UiAction::ApplyOperation(request) = &confirmation.on_confirm else {
+                    panic!("expected apply operation");
+                };
                 assert_eq!(
-                    confirmation.on_confirm,
-                    UiAction::ApplyOperation(FirewallOperation::RemoveService {
+                    request.operation,
+                    FirewallOperation::RemoveService {
                         zone: ZoneName::parse("public").unwrap(),
                         service: ServiceName::parse("http").unwrap(),
                         target: ConfigurationTarget::Runtime,
-                    })
+                    }
                 );
                 assert!(confirmation.body.iter().any(|l| l.contains("⚠")));
             }
@@ -1590,7 +1638,7 @@ mod tests {
         let effects = update(&mut s, UiAction::ReloadRequested);
         assert!(matches!(
             &effects[..],
-            [Effect::Apply(FirewallOperation::Reload)]
+            [Effect::Apply(request)] if request.operation == FirewallOperation::Reload
         ));
         assert!(s.overlays.is_empty());
     }
@@ -1756,10 +1804,11 @@ mod tests {
         let Some(Overlay::Confirm(confirm)) = s.overlays.last() else {
             panic!("expected a confirmation overlay");
         };
-        let UiAction::ApplyOperation(FirewallOperation::AddRichRule { zone, rule, .. }) =
-            &confirm.on_confirm
-        else {
+        let UiAction::ApplyOperation(request) = &confirm.on_confirm else {
             panic!("expected AddRichRule, got {:?}", confirm.on_confirm);
+        };
+        let FirewallOperation::AddRichRule { zone, rule, .. } = &request.operation else {
+            panic!("expected AddRichRule, got {:?}", request.operation);
         };
         // Zone resolved from the ingress interface, not the (spoofable) source.
         assert_eq!(zone.as_str(), "public");
@@ -1910,7 +1959,7 @@ mod tests {
             target: ConfigurationTarget::Runtime,
         };
         // Pre-armed at apply time; the successful outcome keeps it armed.
-        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        update(&mut s, UiAction::ApplyOperation(reviewed(op.clone())));
         update(
             &mut s,
             finished(
@@ -1956,8 +2005,8 @@ mod tests {
             port: "8080/tcp".parse().unwrap(),
             target: ConfigurationTarget::Runtime,
         };
-        update(&mut s, UiAction::ApplyOperation(a.clone()));
-        update(&mut s, UiAction::ApplyOperation(b.clone()));
+        update(&mut s, UiAction::ApplyOperation(reviewed(a.clone())));
+        update(&mut s, UiAction::ApplyOperation(reviewed(b.clone())));
         for (id, operation) in [(1, a.clone()), (2, b.clone())] {
             update(
                 &mut s,
@@ -2173,7 +2222,11 @@ mod tests {
 
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => match &confirmation.on_confirm {
-                UiAction::ApplyOperation(FirewallOperation::MigrateDirectRule { migration }) => {
+                UiAction::ApplyOperation(request) => {
+                    let FirewallOperation::MigrateDirectRule { migration } = &request.operation
+                    else {
+                        panic!("expected migration operation, got {:?}", request.operation);
+                    };
                     assert_eq!(migration.policy().as_str(), "direct-web");
                     assert_eq!(migration.ingress_zone(), "ANY");
                     assert_eq!(migration.egress_zone(), "HOST");
@@ -2221,12 +2274,17 @@ mod tests {
         update(&mut s, UiAction::DeleteEntry);
 
         match s.overlays.last() {
-            Some(Overlay::Confirm(confirmation)) => assert_eq!(
-                confirmation.on_confirm,
-                UiAction::ApplyOperation(FirewallOperation::DeletePolicy {
-                    policy: crate::domain::PolicyName::parse("mypolicy").unwrap(),
-                })
-            ),
+            Some(Overlay::Confirm(confirmation)) => {
+                let UiAction::ApplyOperation(request) = &confirmation.on_confirm else {
+                    panic!("expected policy delete operation");
+                };
+                assert_eq!(
+                    request.operation,
+                    FirewallOperation::DeletePolicy {
+                        policy: crate::domain::PolicyName::parse("mypolicy").unwrap(),
+                    }
+                );
+            }
             other => panic!("expected policy delete confirmation, got {other:?}"),
         }
     }
@@ -2238,7 +2296,11 @@ mod tests {
         update(&mut s, UiAction::DeleteEntry);
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => match &confirmation.on_confirm {
-                UiAction::ApplyOperation(FirewallOperation::RemoveInterface { target, .. }) => {
+                UiAction::ApplyOperation(request) => {
+                    let FirewallOperation::RemoveInterface { target, .. } = &request.operation
+                    else {
+                        panic!("unexpected operation: {:?}", request.operation);
+                    };
                     assert_eq!(*target, ConfigurationTarget::Runtime);
                 }
                 other => panic!("unexpected operation: {other:?}"),
@@ -2271,11 +2333,14 @@ mod tests {
         update(&mut s, UiAction::FormSubmit);
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => {
+                let UiAction::ApplyOperation(request) = &confirmation.on_confirm else {
+                    panic!("expected create-zone operation");
+                };
                 assert_eq!(
-                    confirmation.on_confirm,
-                    UiAction::ApplyOperation(FirewallOperation::CreateZone {
+                    request.operation,
+                    FirewallOperation::CreateZone {
                         zone: ZoneName::parse("staging").unwrap(),
-                    })
+                    }
                 );
             }
             other => panic!("expected confirmation, got {other:?}"),
@@ -2297,7 +2362,10 @@ mod tests {
         update(&mut s, UiAction::FormSubmit);
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => match &confirmation.on_confirm {
-                UiAction::ApplyOperation(FirewallOperation::AddIpSetEntry { name, .. }) => {
+                UiAction::ApplyOperation(request) => {
+                    let FirewallOperation::AddIpSetEntry { name, .. } = &request.operation else {
+                        panic!("unexpected operation: {:?}", request.operation);
+                    };
                     assert_eq!(name.as_str(), "blocklist");
                 }
                 other => panic!("unexpected operation: {other:?}"),
@@ -2340,7 +2408,11 @@ mod tests {
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => {
                 match &confirmation.on_confirm {
-                    UiAction::ApplyOperation(FirewallOperation::AddService { target, .. }) => {
+                    UiAction::ApplyOperation(request) => {
+                        let FirewallOperation::AddService { target, .. } = &request.operation
+                        else {
+                            panic!("unexpected operation: {:?}", request.operation);
+                        };
                         assert_eq!(*target, ConfigurationTarget::Permanent, "must narrow");
                     }
                     other => panic!("unexpected operation: {other:?}"),
@@ -2487,7 +2559,10 @@ mod tests {
         };
         // The execution layer owns pre-arming; the reducer registers the
         // rollback only after it receives the successful outcome.
-        update(&mut s, UiAction::ApplyOperation(operation.clone()));
+        update(
+            &mut s,
+            UiAction::ApplyOperation(reviewed(operation.clone())),
+        );
         assert!(
             s.pending_rollback.is_empty(),
             "the reducer must not invent an armed guard before execution"
@@ -2526,7 +2601,10 @@ mod tests {
             service: ServiceName::parse("http").unwrap(),
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
-        update(&mut s, UiAction::ApplyOperation(operation.clone()));
+        update(
+            &mut s,
+            UiAction::ApplyOperation(reviewed(operation.clone())),
+        );
         assert!(s.pending_rollback.is_empty());
         // The engine retracts the pre-armed guard before emitting a clean
         // failure, so the UI must not receive or create a rollback entry.
@@ -2567,7 +2645,7 @@ mod tests {
             target: ConfigurationTarget::Runtime,
         };
         // Apply arms the rollback (its countdown is not started yet)...
-        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        update(&mut s, UiAction::ApplyOperation(reviewed(op.clone())));
         // ...the applied outcome lands, which starts the countdown from now...
         update(
             &mut s,
@@ -2606,7 +2684,7 @@ mod tests {
             port: "8080/tcp".parse().unwrap(),
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
-        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        update(&mut s, UiAction::ApplyOperation(reviewed(op.clone())));
         assert!(s.pending_rollback.is_empty());
         update(
             &mut s,
@@ -2634,7 +2712,7 @@ mod tests {
             port: "8080/tcp".parse().unwrap(),
             target: ConfigurationTarget::Runtime,
         };
-        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        update(&mut s, UiAction::ApplyOperation(reviewed(op.clone())));
         update(
             &mut s,
             finished(
@@ -2658,11 +2736,11 @@ mod tests {
         s.rollback_ticks = 40;
         let effects = update(
             &mut s,
-            UiAction::ApplyOperation(FirewallOperation::RemovePort {
+            UiAction::ApplyOperation(reviewed(FirewallOperation::RemovePort {
                 zone: ZoneName::parse("public").unwrap(),
                 port: "8080/tcp".parse().unwrap(),
                 target: ConfigurationTarget::Runtime,
-            }),
+            })),
         );
         assert!(matches!(effects.as_slice(), [Effect::Apply(_)]));
         assert!(s.pending_rollback.is_empty());
@@ -2674,11 +2752,11 @@ mod tests {
         s.rollback_ticks = 120;
         update(
             &mut s,
-            UiAction::ApplyOperation(FirewallOperation::AddService {
+            UiAction::ApplyOperation(reviewed(FirewallOperation::AddService {
                 zone: ZoneName::parse("public").unwrap(),
                 service: ServiceName::parse("mdns").unwrap(),
                 target: ConfigurationTarget::RuntimeAndPermanent,
-            }),
+            })),
         );
         assert!(
             s.pending_rollback.is_empty(),

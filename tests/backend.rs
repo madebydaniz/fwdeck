@@ -294,6 +294,46 @@ async fn service_mutation_invalidates_definition_cache() {
 }
 
 #[tokio::test]
+async fn mutation_preflight_snapshot_bypasses_the_heavy_section_cache() {
+    let runner = FakeRunner::default();
+    let push_full_snapshot = |runner: &FakeRunner| {
+        runner.push_ok("running\n");
+        runner.push_ok("2.3.2\n");
+        runner.push_ok("off\n");
+        runner.push(Ok(output(Some(1), "no\n", "")));
+        runner.push_ok("public\n");
+        runner.push_ok(ACTIVE_ZONES);
+        runner.push_ok(LIST_ALL_RUNTIME);
+        runner.push_ok(LIST_ALL_PERMANENT);
+        runner.push_ok("\n");
+        runner.push_ok("\n");
+        runner.push_ok(DIRECT_RULES);
+        runner.push_ok("ssh http https\n");
+        runner.push_ok("\n");
+        runner.push_ok("\n");
+        for _ in 0..7 {
+            runner.push_ok(INFO_SERVICE);
+        }
+    };
+    push_full_snapshot(&runner);
+    push_full_snapshot(&runner);
+
+    let backend = CliBackend::new(runner.clone());
+    backend.snapshot().await.unwrap();
+    backend.snapshot_fresh().await.unwrap();
+
+    let direct_reads = runner
+        .seen_args()
+        .iter()
+        .filter(|args| args.as_slice() == ["--direct", "--get-all-rules"])
+        .count();
+    assert_eq!(
+        direct_reads, 2,
+        "mutation preflight must not reuse a cached heavy section"
+    );
+}
+
+#[tokio::test]
 async fn daemon_down_is_a_status_for_probe_and_an_error_for_snapshot() {
     let runner = FakeRunner::default();
     runner.push(Ok(output(Some(252), "not running\n", "")));

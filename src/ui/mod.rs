@@ -209,10 +209,10 @@ async fn execute_effect(
             // A full queue already guarantees a refresh is coming.
             let _ = engine.requests.try_send(EngineRequest::Refresh);
         }
-        Effect::Apply(operation) => {
+        Effect::Apply(request) => {
             // Reserving-send drains events while it waits, so a momentarily full
             // queue can't drop a mutation (rollbacks especially) or deadlock.
-            if !send_request(engine, pending, EngineRequest::Apply(operation)).await {
+            if !send_request(engine, pending, EngineRequest::Apply(request)).await {
                 state.toast(state::ToastKind::Error, "engine is gone — operation lost");
             }
         }
@@ -238,8 +238,8 @@ async fn execute_effect(
                 );
             }
         }
-        Effect::ApplyPlan(operations) => {
-            if !send_request(engine, pending, EngineRequest::ApplyPlan(operations)).await {
+        Effect::ApplyPlan(plan) => {
+            if !send_request(engine, pending, EngineRequest::ApplyPlan(plan)).await {
                 state.toast(state::ToastKind::Error, "engine is gone — plan not sent");
             }
         }

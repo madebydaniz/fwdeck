@@ -105,6 +105,9 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
   a reload.
 - 📋 **Staged plans** — batch changes, review once, apply once; or export as a
   `firewall-cmd` script, JSON, or Ansible playbook.
+- 🧷 **Stale-state guard** — every mutation carries the exact snapshot reviewed
+  at confirmation. The engine bypasses refresh caches, revalidates, and fails
+  closed if firewalld changed before execution.
 - 🚨 **SSH-aware** — warns precisely when a change targets the zone your session
   depends on.
 - 📸 **Snapshots** with diff-based restore (staged, never automatic), read-only
@@ -126,6 +129,8 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
 - 🗑️ Multi-select bulk delete with one reviewed confirmation.
 - 📜 Live kernel/netfilter log tail with a denied-packet counter.
 - 🪪 Honest results: partial failures reported as partial failures, with per-step diagnostics and a private, rotated JSONL audit trail.
+- 🧱 Concurrent-change protection: stale single operations and whole staged
+  plans are rejected before commands or rollback guards start.
 - 🧹 Configurable local-state retention with safe defaults, dry-run/apply CLI,
   pinned snapshots, strict filename matching, and symlink refusal.
 - 🔌 Two backends behind one trait: `firewall-cmd` (default, full-featured) and native D-Bus (reads + runtime edits; refuses what it can't do fully).

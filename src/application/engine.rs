@@ -9,7 +9,12 @@ use tokio::sync::mpsc;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::api::{EngineEvent, EngineRequest, OperationResult, RollbackRegistration};
+use crate::domain::FirewallSnapshot;
+
+use super::api::{
+    EngineEvent, EngineRequest, MutationPlan, MutationRequest, OperationResult,
+    RollbackRegistration,
+};
 use super::ports::{
     FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId, StepReport,
 };
@@ -106,12 +111,12 @@ async fn execute_request<B: FirewallBackend, G: RollbackGuard>(
 ) -> Result<(), ()> {
     match request {
         EngineRequest::Refresh => Ok(()),
-        EngineRequest::Apply(operation) => {
+        EngineRequest::Apply(request) => {
             apply(
                 backend,
                 rollback_guard,
                 events,
-                operation,
+                request,
                 read_only,
                 rollback_timeout,
             )
@@ -133,12 +138,12 @@ async fn execute_request<B: FirewallBackend, G: RollbackGuard>(
             )
             .await
         }
-        EngineRequest::ApplyPlan(operations) => {
+        EngineRequest::ApplyPlan(plan) => {
             apply_plan(
                 backend,
                 rollback_guard,
                 events,
-                operations,
+                plan,
                 read_only,
                 rollback_timeout,
             )
@@ -156,11 +161,32 @@ async fn apply_plan<B: FirewallBackend, G: RollbackGuard>(
     backend: &B,
     rollback_guard: &G,
     events: &mpsc::Sender<EngineEvent>,
-    operations: Vec<crate::domain::FirewallOperation>,
+    plan: MutationPlan,
     read_only: bool,
     rollback_timeout: Duration,
 ) -> Result<(), ()> {
+    let MutationPlan {
+        operations,
+        expected,
+    } = plan;
     let total = operations.len();
+    if !read_only {
+        let observed = match mutation_precondition(backend, &expected).await {
+            Ok(observed) => observed,
+            Err(error) => return reject_plan_preflight(events, operations, error).await,
+        };
+        if let Some(error) = operations
+            .iter()
+            .find_map(|operation| operation.validate(&observed).err())
+        {
+            return reject_plan_preflight(
+                events,
+                operations,
+                FirewallError::Validation(error.to_string()),
+            )
+            .await;
+        }
+    }
     let mut iter = operations.into_iter();
     let mut applied = 0usize;
     let mut halted = false;
@@ -208,19 +234,45 @@ async fn apply<B: FirewallBackend, G: RollbackGuard>(
     backend: &B,
     rollback_guard: &G,
     events: &mpsc::Sender<EngineEvent>,
-    operation: crate::domain::FirewallOperation,
+    request: MutationRequest,
     read_only: bool,
     rollback_timeout: Duration,
 ) -> Result<(), ()> {
-    let (op_id, outcome, rollback, guard_warning) = execute_operation(
-        backend,
-        rollback_guard,
+    let MutationRequest {
         operation,
-        read_only,
-        rollback_timeout,
-        false,
-    )
-    .await;
+        expected,
+    } = request;
+    let (op_id, outcome, rollback, guard_warning) = if read_only {
+        execute_operation(
+            backend,
+            rollback_guard,
+            operation,
+            true,
+            rollback_timeout,
+            false,
+        )
+        .await
+    } else {
+        match mutation_precondition(backend, &expected).await {
+            Ok(observed) => match operation.validate(&observed) {
+                Ok(()) => {
+                    execute_operation(
+                        backend,
+                        rollback_guard,
+                        operation,
+                        false,
+                        rollback_timeout,
+                        false,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    rejected_operation(operation, FirewallError::Validation(error.to_string()))
+                }
+            },
+            Err(error) => rejected_operation(operation, error),
+        }
+    };
     match &outcome {
         OperationOutcome::Applied { .. } => {
             tracing::info!(operation = %outcome.operation().describe(), "operation applied");
@@ -239,6 +291,79 @@ async fn apply<B: FirewallBackend, G: RollbackGuard>(
             guard_warning,
             completed_rollback: None,
         })))
+        .await
+        .map_err(|_| ())
+}
+
+/// Re-reads every backend section at the mutation boundary and compares it to
+/// the state reviewed by the operator. Returning the fresh snapshot also lets
+/// the caller repeat domain validation without a third read.
+async fn mutation_precondition<B: FirewallBackend>(
+    backend: &B,
+    expected: &FirewallSnapshot,
+) -> Result<FirewallSnapshot, FirewallError> {
+    let observed = backend.snapshot_fresh().await?;
+    if observed == *expected {
+        Ok(observed)
+    } else {
+        Err(FirewallError::StaleSnapshot)
+    }
+}
+
+fn rejected_operation(
+    operation: crate::domain::FirewallOperation,
+    error: FirewallError,
+) -> (
+    u64,
+    OperationOutcome,
+    Option<RollbackRegistration>,
+    Option<String>,
+) {
+    (
+        next_op_id(),
+        OperationOutcome::Failed {
+            operation,
+            steps: vec![StepReport {
+                target: "precondition",
+                invocation: Vec::new(),
+                result: Err(error),
+            }],
+        },
+        None,
+        None,
+    )
+}
+
+async fn reject_plan_preflight(
+    events: &mpsc::Sender<EngineEvent>,
+    operations: Vec<crate::domain::FirewallOperation>,
+    error: FirewallError,
+) -> Result<(), ()> {
+    let Some(first) = operations.first().cloned() else {
+        return events
+            .send(EngineEvent::PlanFinished {
+                applied: 0,
+                remaining: Vec::new(),
+            })
+            .await
+            .map_err(|_| ());
+    };
+    let (op_id, outcome, rollback, guard_warning) = rejected_operation(first, error);
+    events
+        .send(EngineEvent::OperationFinished(Box::new(OperationResult {
+            op_id,
+            outcome,
+            rollback,
+            guard_warning,
+            completed_rollback: None,
+        })))
+        .await
+        .map_err(|_| ())?;
+    events
+        .send(EngineEvent::PlanFinished {
+            applied: 0,
+            remaining: operations,
+        })
         .await
         .map_err(|_| ())
 }
@@ -551,6 +676,46 @@ mod tests {
         }
     }
 
+    struct DriftingBackend {
+        snapshot_calls: Arc<AtomicUsize>,
+        apply_calls: Arc<AtomicUsize>,
+    }
+
+    impl FirewallBackend for DriftingBackend {
+        async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
+            Err(FirewallError::DaemonNotRunning)
+        }
+
+        async fn snapshot(&self) -> Result<FirewallSnapshot, FirewallError> {
+            let call = self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            let mut snapshot = mock::sample().map_err(|e| FirewallError::Parse(e.to_string()))?;
+            if call > 0 {
+                snapshot.status.panic_mode = !snapshot.status.panic_mode;
+            }
+            Ok(snapshot)
+        }
+
+        async fn apply(&self, operation: &FirewallOperation) -> OperationOutcome {
+            self.apply_calls.fetch_add(1, Ordering::SeqCst);
+            OperationOutcome::Applied {
+                operation: operation.clone(),
+                steps: vec![StepReport {
+                    target: "runtime",
+                    invocation: vec!["--fake".to_owned()],
+                    result: Ok(()),
+                }],
+            }
+        }
+    }
+
+    fn reviewed(operation: FirewallOperation) -> MutationRequest {
+        MutationRequest::new(operation, Arc::new(mock::sample().unwrap()))
+    }
+
+    fn reviewed_plan(operations: Vec<FirewallOperation>) -> MutationPlan {
+        MutationPlan::new(operations, Arc::new(mock::sample().unwrap()))
+    }
+
     #[tokio::test]
     async fn initial_refresh_happens_without_a_request() {
         let (_request_tx, request_rx) = mpsc::channel(8);
@@ -628,7 +793,7 @@ mod tests {
         event_rx.recv().await.unwrap();
 
         request_tx
-            .send(EngineRequest::Apply(FirewallOperation::Reload))
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
             .await
             .unwrap();
         assert!(matches!(
@@ -641,6 +806,107 @@ mod tests {
             event_rx.recv().await.unwrap(),
             EngineEvent::RefreshStarted
         ));
+    }
+
+    #[tokio::test]
+    async fn stale_single_operation_is_rejected_before_apply_or_rollback_arm() {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let guard = RecordingRollbackGuard::default();
+        let guard_log = Arc::clone(&guard.log);
+        tokio::spawn(run(
+            DriftingBackend {
+                snapshot_calls: Arc::clone(&snapshot_calls),
+                apply_calls: Arc::clone(&apply_calls),
+            },
+            guard,
+            request_rx,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        event_rx.recv().await.unwrap();
+        let expected = match event_rx.recv().await.unwrap() {
+            EngineEvent::RefreshFinished(Ok(snapshot)) => snapshot,
+            other => panic!("expected initial snapshot, got {other:?}"),
+        };
+        let operation = FirewallOperation::RemovePort {
+            zone: crate::domain::ZoneName::parse("public").unwrap(),
+            port: "8080/tcp".parse().unwrap(),
+            target: crate::domain::ConfigurationTarget::Runtime,
+        };
+        request_tx
+            .send(EngineRequest::Apply(MutationRequest::new(
+                operation, expected,
+            )))
+            .await
+            .unwrap();
+
+        match event_rx.recv().await.unwrap() {
+            EngineEvent::OperationFinished(result) => {
+                assert_eq!(
+                    result.outcome.first_error(),
+                    Some(&FirewallError::StaleSnapshot)
+                );
+                assert!(result.rollback.is_none());
+            }
+            other => panic!("expected rejected operation, got {other:?}"),
+        }
+        assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
+        assert!(guard_log.lock().unwrap().armed.is_empty());
+        assert!(snapshot_calls.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn stale_plan_rejects_the_batch_and_returns_every_operation() {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(run(
+            DriftingBackend {
+                snapshot_calls,
+                apply_calls: Arc::clone(&apply_calls),
+            },
+            TestRollbackGuard,
+            request_rx,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        event_rx.recv().await.unwrap();
+        let expected = match event_rx.recv().await.unwrap() {
+            EngineEvent::RefreshFinished(Ok(snapshot)) => snapshot,
+            other => panic!("expected initial snapshot, got {other:?}"),
+        };
+        let operations = vec![FirewallOperation::Reload, FirewallOperation::Reload];
+        request_tx
+            .send(EngineRequest::ApplyPlan(MutationPlan::new(
+                operations.clone(),
+                expected,
+            )))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if result.outcome.first_error() == Some(&FirewallError::StaleSnapshot)
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::PlanFinished {
+                applied: 0,
+                remaining,
+            } if remaining == operations
+        ));
+        assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -664,7 +930,7 @@ mod tests {
         event_rx.recv().await.unwrap();
 
         request_tx
-            .send(EngineRequest::Apply(FirewallOperation::Reload))
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
             .await
             .unwrap();
         match event_rx.recv().await.unwrap() {
@@ -717,6 +983,40 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn engine_validation_rejects_a_forged_request_before_apply() {
+        let backend = CountingBackend {
+            apply_calls: AtomicUsize::new(0),
+            fail_at: 0,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let operation = FirewallOperation::AddService {
+            zone: crate::domain::ZoneName::parse("public").unwrap(),
+            service: crate::domain::ServiceName::parse("https").unwrap(),
+            target: crate::domain::ConfigurationTarget::RuntimeAndPermanent,
+        };
+
+        apply(
+            &backend,
+            &TestRollbackGuard,
+            &event_tx,
+            reviewed(operation),
+            false,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        match event_rx.recv().await.unwrap() {
+            EngineEvent::OperationFinished(result) => assert!(matches!(
+                result.outcome.first_error(),
+                Some(FirewallError::Validation(_))
+            )),
+            other => panic!("expected validation failure, got {other:?}"),
+        }
+        assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
+    }
+
     async fn drain_initial_refresh(rx: &mut mpsc::Receiver<EngineEvent>) {
         rx.recv().await.unwrap(); // RefreshStarted
         rx.recv().await.unwrap(); // RefreshFinished
@@ -748,7 +1048,7 @@ mod tests {
             FirewallOperation::Reload,
         ];
         request_tx
-            .send(EngineRequest::ApplyPlan(plan))
+            .send(EngineRequest::ApplyPlan(reviewed_plan(plan)))
             .await
             .unwrap();
 
@@ -803,11 +1103,11 @@ mod tests {
             target: crate::domain::ConfigurationTarget::Runtime,
         };
         request_tx
-            .send(EngineRequest::ApplyPlan(vec![
+            .send(EngineRequest::ApplyPlan(reviewed_plan(vec![
                 operation.clone(),
                 operation.clone(),
                 operation.clone(),
-            ]))
+            ])))
             .await
             .unwrap();
 
@@ -1018,7 +1318,7 @@ mod tests {
 
         let plan = vec![FirewallOperation::Reload, FirewallOperation::Reload];
         request_tx
-            .send(EngineRequest::ApplyPlan(plan))
+            .send(EngineRequest::ApplyPlan(reviewed_plan(plan)))
             .await
             .unwrap();
 
@@ -1061,7 +1361,7 @@ mod tests {
         // coalesce into one; the Apply must survive and execute exactly once.
         request_tx.send(EngineRequest::Refresh).await.unwrap();
         request_tx
-            .send(EngineRequest::Apply(FirewallOperation::Reload))
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
             .await
             .unwrap();
         request_tx.send(EngineRequest::Refresh).await.unwrap();
