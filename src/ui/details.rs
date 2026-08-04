@@ -1082,6 +1082,12 @@ fn recovery_hint(error: &FirewallError) -> &'static str {
             "inspect ~/.local/state/fwdeck/fwdeck.log for the full command context"
         }
         FirewallError::ReadOnlyMode => "restart fwdeck without --read-only to allow mutations",
+        FirewallError::StaleSnapshot => {
+            "review the refreshed state, then confirm the operation again"
+        }
+        FirewallError::Validation(_) => {
+            "review the operation and refreshed state before trying again"
+        }
     }
 }
 

@@ -13,6 +13,49 @@ use super::ports::{
     FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId,
 };
 
+/// One reviewed mutation together with the exact observed state it was
+/// validated and confirmed against. The engine re-reads firewalld immediately
+/// before execution and rejects the request if that state has changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MutationRequest {
+    /// Operation reviewed by the operator.
+    pub operation: FirewallOperation,
+    /// Snapshot visible when the operation was validated and confirmed.
+    pub expected: Arc<FirewallSnapshot>,
+}
+
+impl MutationRequest {
+    /// Couples an operation to the snapshot it was reviewed against.
+    #[must_use]
+    pub fn new(operation: FirewallOperation, expected: Arc<FirewallSnapshot>) -> Self {
+        Self {
+            operation,
+            expected,
+        }
+    }
+}
+
+/// A reviewed staged plan with one start-of-batch observed-state precondition.
+/// The engine owns the backend serially after the precondition succeeds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MutationPlan {
+    /// Operations to execute sequentially and fail-fast.
+    pub operations: Vec<FirewallOperation>,
+    /// Snapshot visible when the batch was validated and confirmed.
+    pub expected: Arc<FirewallSnapshot>,
+}
+
+impl MutationPlan {
+    /// Couples a staged plan to the snapshot it was reviewed against.
+    #[must_use]
+    pub fn new(operations: Vec<FirewallOperation>, expected: Arc<FirewallSnapshot>) -> Self {
+        Self {
+            operations,
+            expected,
+        }
+    }
+}
+
 /// A risky operation whose inverse must remain available until the operator
 /// keeps the change or the rollback countdown fires.
 #[derive(Debug, Clone, PartialEq)]
@@ -47,9 +90,9 @@ pub struct OperationResult {
 pub enum EngineRequest {
     /// Take a fresh snapshot now. Queued refreshes are coalesced into one pass.
     Refresh,
-    /// Execute one operation (runtime step first, then permanent — ADR-3),
-    /// followed by an automatic refresh.
-    Apply(FirewallOperation),
+    /// Verify the reviewed snapshot is still current, execute one operation
+    /// (runtime step first, then permanent — ADR-3), then refresh.
+    Apply(MutationRequest),
     /// Execute a previously armed inverse, then best-effort disarm its external
     /// watchdog. Applying the inverse never depends on disarm success.
     Rollback {
@@ -60,10 +103,11 @@ pub enum EngineRequest {
         /// External watchdog to stop after the inverse has run.
         watchdog_unit: Option<String>,
     },
-    /// Execute a staged plan as one sequential transaction: fail-fast on the
-    /// first non-applied outcome, one refresh at the end, unexecuted
-    /// operations returned via [`EngineEvent::PlanFinished`].
-    ApplyPlan(Vec<FirewallOperation>),
+    /// Verify the reviewed start state, then execute a staged plan as one
+    /// sequential transaction: fail-fast on the first non-applied outcome,
+    /// one refresh at the end, unexecuted operations returned via
+    /// [`EngineEvent::PlanFinished`].
+    ApplyPlan(MutationPlan),
 }
 
 /// Engine → UI notifications. Delivered in order over the bounded event channel.

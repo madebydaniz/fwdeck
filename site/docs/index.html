@@ -554,6 +554,11 @@ command turns it off.</p>
 input are rejected before any modal opens.</li>
 <li><strong>Confirmation modals</strong> — every mutation states the exact
 resource, zone, scope, and connectivity risk.</li>
+<li><strong>Stale-state guard</strong> — the exact observed snapshot reviewed at
+confirmation travels with the mutation. Immediately before execution the engine
+bypasses refresh caches, reads firewalld again, repeats validation, and rejects
+the operation or entire staged plan if state changed. No mutation command or
+rollback guard starts on that rejected path.</li>
 <li><strong>Dead-man's switch</strong> — risky changes auto-revert after
 <code>rollback_timeout_seconds</code>, on <kbd>u</kbd>, or when you quit inside
 the countdown, unless you confirm a working session. An out-of-process systemd

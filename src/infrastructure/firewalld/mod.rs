@@ -690,6 +690,16 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
         Ok(snapshot)
     }
 
+    async fn snapshot_fresh(&self) -> Result<FirewallSnapshot, FirewallError> {
+        // Mutation preconditions must observe every section now; reusing a
+        // tiered heavy-section cache could miss an external policy/ipset edit.
+        self.heavy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .age = None;
+        self.snapshot().await
+    }
+
     async fn apply(&self, operation: &FirewallOperation) -> OperationOutcome {
         // Any mutation invalidates the tiered heavy-section cache: the very
         // next refresh refetches ipsets/policies/direct rules.
