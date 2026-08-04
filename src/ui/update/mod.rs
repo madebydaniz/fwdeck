@@ -6,7 +6,9 @@ mod lifecycle;
 mod plans;
 mod rows;
 
-use crate::domain::{ConfigurationTarget, FirewallOperation, SnapshotSection, ZoneName};
+use crate::domain::{
+    ConfigurationTarget, FirewallOperation, SnapshotSection, ZoneName, translate_direct_rule,
+};
 
 use super::action::{Effect, UiAction};
 use super::details;
@@ -263,6 +265,15 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.toast(ToastKind::Info, "no data yet");
             }
         }
+        UiAction::ShowDirectMigration => {
+            if let Some(snapshot) = state.snapshot.clone() {
+                state
+                    .overlays
+                    .push(Overlay::Details(details::direct_migration(&snapshot)));
+            } else {
+                state.toast(ToastKind::Info, "no data yet");
+            }
+        }
         UiAction::ShowDrift => {
             if let Some(snapshot) = state.snapshot.clone() {
                 state
@@ -427,7 +438,18 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 return update(state, UiAction::OpenForm(FormKind::CreatePolicy));
             }
             ViewId::Direct => {
-                state.toast(ToastKind::Info, "no add action on this view");
+                let Some(RowId::Direct { rule, .. }) = selected_row_id(state) else {
+                    state.toast(ToastKind::Info, "select a direct-rule row first");
+                    return Vec::new();
+                };
+                if let Err(err) = translate_direct_rule(&rule) {
+                    state.toast(
+                        ToastKind::Warning,
+                        format!("manual migration required: {err}"),
+                    );
+                    return Vec::new();
+                }
+                return update(state, UiAction::OpenForm(FormKind::MigrateDirectRule));
             }
             // In the Logs view, `a` proposes an allow rule from the selected
             // denied flow (routed through the normal confirm/stage/apply path).
@@ -790,6 +812,16 @@ fn reload_ssh_lockout_warning(state: &UiState, operation: &FirewallOperation) ->
     ))
 }
 
+fn append_migration_context(body: &mut Vec<String>, operation: &FirewallOperation) {
+    if let FirewallOperation::MigrateDirectRule { migration } = operation {
+        body.push(format!("source direct rule: {}", migration.source_rule()));
+        body.push(
+            "candidate only: reload and validate real traffic before manually retiring the direct rule"
+                .to_owned(),
+        );
+    }
+}
+
 /// Central mutation gate: read-only check, snapshot validation, then the
 /// confirmation modal (or direct dispatch when confirmations are disabled).
 fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<Effect> {
@@ -849,6 +881,7 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
         operation.describe(),
         format!("target: {}", operation.target().label()),
     ];
+    append_migration_context(&mut body, &operation);
     if permanent_only_note {
         body.push(
             "zone is not active yet — applying to permanent; reload (ctrl-r) to activate"
@@ -2121,6 +2154,63 @@ mod tests {
                 assert_eq!(form.buffer, "mypolicy ");
             }
             other => panic!("expected prefilled policy form, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_rule_add_flow_builds_reviewed_migration_operation() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Direct));
+        update(&mut s, UiAction::AddEntry);
+        assert!(matches!(
+            s.overlays.last(),
+            Some(Overlay::Form(form)) if form.kind == FormKind::MigrateDirectRule
+        ));
+        for ch in "direct-web".chars() {
+            update(&mut s, UiAction::FormInput(ch));
+        }
+        update(&mut s, UiAction::FormSubmit);
+
+        match s.overlays.last() {
+            Some(Overlay::Confirm(confirmation)) => match &confirmation.on_confirm {
+                UiAction::ApplyOperation(FirewallOperation::MigrateDirectRule { migration }) => {
+                    assert_eq!(migration.policy().as_str(), "direct-web");
+                    assert_eq!(migration.ingress_zone(), "ANY");
+                    assert_eq!(migration.egress_zone(), "HOST");
+                    assert!(migration.rich_rule().as_str().contains("port=\"12345\""));
+                }
+                other => panic!("expected migration operation, got {other:?}"),
+            },
+            other => panic!("expected migration confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_rule_add_flow_rejects_manual_only_rule_before_form() {
+        let mut s = state();
+        let mut snapshot = mock::sample().unwrap();
+        snapshot.direct_rules = vec!["ipv4 nat PREROUTING 0 -j DNAT".to_owned()];
+        s.snapshot = Some(std::sync::Arc::new(snapshot));
+        update(&mut s, UiAction::SwitchView(ViewId::Direct));
+        update(&mut s, UiAction::AddEntry);
+        assert!(s.overlays.is_empty());
+        assert!(
+            s.toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("manual migration required"))
+        );
+    }
+
+    #[test]
+    fn direct_migration_assistant_opens_classification_workspace() {
+        let mut s = state();
+        update(&mut s, UiAction::ShowDirectMigration);
+        match s.overlays.last() {
+            Some(Overlay::Details(content)) => {
+                assert!(content.title.contains("Direct migration assistant"));
+                assert!(content.title.contains("1/1 eligible"));
+            }
+            other => panic!("expected migration details, got {other:?}"),
         }
     }
 

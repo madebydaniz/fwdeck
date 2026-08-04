@@ -415,7 +415,8 @@ const fn add_hint(view: ViewId) -> Option<&'static str> {
         ViewId::Sources => Some("+ bind source (a)"),
         ViewId::IpSets => Some("+ add entry / create ipset (a)"),
         ViewId::Policies => Some("+ add service / create policy (a)"),
-        ViewId::Direct | ViewId::Logs => None,
+        ViewId::Direct => Some("+ migrate eligible rule (a)"),
+        ViewId::Logs => None,
     }
 }
 

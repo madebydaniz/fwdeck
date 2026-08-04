@@ -4,15 +4,16 @@
 use crate::domain::{
     ConfigurationTarget, FirewallOperation, ForwardPort, IcmpType, InterfaceName, IpProtocol,
     IpSetEntry, IpSetName, PolicyName, PolicySetName, PortSpec, RichRule, ServiceName,
-    SourceAddress, ZoneName, ZoneTarget,
+    SourceAddress, ZoneName, ZoneTarget, translate_direct_rule,
 };
 use crate::ui::action::Effect;
 use crate::ui::overlays::{DetailsContent, FormKind, Overlay};
 use crate::ui::state::{ToastKind, UiState};
+use crate::ui::views::RowId;
 
 use super::plans::restore_snapshot;
-use super::request_operation;
 use super::rows::selected_ipset;
+use super::{request_operation, selected_row};
 
 #[allow(clippy::too_many_lines)] // one arm per builder step
 /// Advances the rich-rule builder; on the final step, validates the assembled
@@ -157,9 +158,10 @@ pub(super) fn form_submit(state: &mut UiState) -> Vec<Effect> {
         FormKind::CreateService => ServiceName::parse(&input)
             .map(|service| FirewallOperation::CreateService { service })
             .map_err(|e| err_string(&e)),
-        FormKind::CreatePolicy => PolicyName::parse(&input)
+        FormKind::CreatePolicy => PolicyName::parse_user_created(&input)
             .map(|policy| FirewallOperation::CreatePolicy { policy })
             .map_err(|e| err_string(&e)),
+        FormKind::MigrateDirectRule => parse_direct_migration_form(state, &input),
         FormKind::CreateIpSet => {
             let mut parts = input.split_whitespace();
             let raw_name = parts.next().unwrap_or_default();
@@ -187,6 +189,20 @@ pub(super) fn form_submit(state: &mut UiState) -> Vec<Effect> {
     };
     state.overlays.pop(); // the confirmation replaces the form
     request_operation(state, operation)
+}
+
+fn parse_direct_migration_form(state: &UiState, input: &str) -> Result<FirewallOperation, String> {
+    let Some(row) = selected_row(state) else {
+        return Err("select a direct-rule row first".to_owned());
+    };
+    let RowId::Direct { rule, .. } = row.id else {
+        return Err("select a row in the Direct view first".to_owned());
+    };
+    let policy = PolicyName::parse_user_created(input).map_err(|err| err.to_string())?;
+    let migration = translate_direct_rule(&rule)
+        .map_err(|err| format!("direct rule needs manual migration: {err}"))?
+        .into_migration(policy);
+    Ok(FirewallOperation::MigrateDirectRule { migration })
 }
 
 /// Parses `<policy-set> <enable|disable>` into the documented administrative

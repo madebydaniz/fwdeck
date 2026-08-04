@@ -5,6 +5,7 @@
 use super::address::{IpSetEntry, SourceAddress};
 use super::capability::{FeatureSupport, FirewalldFeature};
 use super::dependency::{PolicyDependencyGraph, PolicyDependencyResource};
+use super::direct_migration::{DirectPolicyMigration, translate_direct_rule};
 use super::ids::IpProtocol;
 use super::ids::{
     IcmpType, InterfaceName, IpSetName, PolicyName, PolicySetName, ServiceName, ZoneName,
@@ -264,6 +265,12 @@ pub enum FirewallOperation {
     CreatePolicy {
         /// Name for the new policy.
         policy: PolicyName,
+    },
+    /// Create and populate a permanent policy replacement for one conservatively
+    /// translated direct rule. The legacy rule is deliberately left untouched.
+    MigrateDirectRule {
+        /// Reviewed source-to-policy translation.
+        migration: DirectPolicyMigration,
     },
     /// Delete a policy object (permanent-only; reload applies).
     DeletePolicy {
@@ -540,6 +547,10 @@ impl FirewallOperation {
                 format!("unblock ICMP `{icmp}` in zone `{zone}`")
             }
             Self::CreatePolicy { policy } => format!("create policy `{policy}` (permanent)"),
+            Self::MigrateDirectRule { migration } => format!(
+                "create policy `{}` as a reviewed replacement for one direct rule",
+                migration.policy()
+            ),
             Self::DeletePolicy { policy } => format!("delete policy `{policy}` (permanent)"),
             Self::SetPolicyTarget {
                 policy,
@@ -762,6 +773,10 @@ impl FirewallOperation {
             Self::CreatePolicy { policy } => {
                 format!("policy `{policy}` created (permanent) — reload (ctrl-r) to activate")
             }
+            Self::MigrateDirectRule { migration } => format!(
+                "policy `{}` created (permanent) — reload and verify before retiring the direct rule",
+                migration.policy()
+            ),
             Self::DeletePolicy { policy } => {
                 format!("policy `{policy}` deleted (permanent) — reload (ctrl-r) to apply")
             }
@@ -1043,6 +1058,19 @@ impl FirewallOperation {
         let permanent = |policy: &PolicyName| snapshot.policies.permanent.get(policy);
         let result = match self {
             Self::CreatePolicy { policy } => complete.then(|| permanent(policy).is_some()),
+            Self::MigrateDirectRule { migration } => complete.then(|| {
+                permanent(migration.policy()).is_some_and(|policy| {
+                    policy
+                        .ingress_zones
+                        .iter()
+                        .any(|zone| zone == migration.ingress_zone())
+                        && policy
+                            .egress_zones
+                            .iter()
+                            .any(|zone| zone == migration.egress_zone())
+                        && policy.rich_rules.contains(migration.rich_rule())
+                })
+            }),
             Self::DeletePolicy { policy } => complete.then(|| permanent(policy).is_none()),
             Self::SetPolicyTarget {
                 policy,
@@ -1279,6 +1307,7 @@ impl FirewallOperation {
             | Self::AddServicePort { .. }
             | Self::RemoveServicePort { .. }
             | Self::CreatePolicy { .. }
+            | Self::MigrateDirectRule { .. }
             | Self::DeletePolicy { .. }
             | Self::SetPolicyTarget { .. }
             | Self::AddPolicyIngressZone { .. }
@@ -1371,6 +1400,7 @@ impl FirewallOperation {
             | Self::AddIpSetEntry { .. }
             | Self::RemoveIpSetEntry { .. } => Some(SnapshotSection::IpSets),
             Self::CreatePolicy { .. }
+            | Self::MigrateDirectRule { .. }
             | Self::DeletePolicy { .. }
             | Self::SetPolicyTarget { .. }
             | Self::AddPolicyIngressZone { .. }
@@ -1675,10 +1705,55 @@ impl FirewallOperation {
                 }
             }
             Self::CreatePolicy { policy } => {
+                if !policy.is_user_creatable() {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{policy}` exceeds firewalld's 17-character creation limit"
+                    )));
+                }
                 if snapshot.policies.permanent.contains_key(policy) {
                     return Err(OperationError::Invalid(format!(
                         "policy `{policy}` already exists"
                     )));
+                }
+            }
+            Self::MigrateDirectRule { migration } => {
+                if !snapshot
+                    .section_is_complete(SnapshotSection::DirectRules, ConfigurationTarget::Runtime)
+                {
+                    return Err(OperationError::Invalid(
+                        "cannot migrate from an incomplete direct-rule snapshot".to_owned(),
+                    ));
+                }
+                if !snapshot
+                    .direct_rules
+                    .iter()
+                    .any(|rule| rule == migration.source_rule())
+                {
+                    return Err(OperationError::Invalid(
+                        "the source direct rule is no longer present; refresh and review again"
+                            .to_owned(),
+                    ));
+                }
+                if !migration.policy().is_user_creatable() {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{}` exceeds firewalld's 17-character creation limit",
+                        migration.policy()
+                    )));
+                }
+                if snapshot.policies.permanent.contains_key(migration.policy()) {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{}` already exists",
+                        migration.policy()
+                    )));
+                }
+                let verified = translate_direct_rule(migration.source_rule())
+                    .map_err(|err| OperationError::Invalid(err.to_string()))?
+                    .into_migration(migration.policy().clone());
+                if &verified != migration {
+                    return Err(OperationError::Invalid(
+                        "direct-rule translation no longer matches the verified migration subset"
+                            .to_owned(),
+                    ));
                 }
             }
             Self::DeletePolicy { policy } => {
@@ -2248,6 +2323,9 @@ impl FirewallOperation {
                 policy_set: policy_set.clone(),
                 enabled: !enabled,
                 target: runtime,
+            }),
+            Self::MigrateDirectRule { migration } => Some(Self::DeletePolicy {
+                policy: migration.policy().clone(),
             }),
             Self::RemoveServicePort { service, port } => Some(Self::AddServicePort {
                 service: service.clone(),
@@ -2928,6 +3006,74 @@ mod tests {
         };
         assert!(runtime.validate(&snapshot).is_ok());
         assert_eq!(permanent.postcondition_holds(&snapshot), None);
+    }
+
+    #[test]
+    fn direct_migration_validates_source_and_verifies_complete_policy() {
+        let mut snapshot = mock::sample().unwrap();
+        let policy = PolicyName::parse_user_created("direct-web").unwrap();
+        let migration = translate_direct_rule(&snapshot.direct_rules[0])
+            .unwrap()
+            .into_migration(policy.clone());
+        let operation = FirewallOperation::MigrateDirectRule {
+            migration: migration.clone(),
+        };
+        assert!(operation.validate(&snapshot).is_ok());
+        assert_eq!(operation.target(), ConfigurationTarget::Permanent);
+        assert_eq!(
+            operation.inverse(),
+            Some(FirewallOperation::DeletePolicy {
+                policy: policy.clone()
+            })
+        );
+        assert_eq!(operation.postcondition_holds(&snapshot), Some(false));
+
+        let mut details = super::super::PolicyDetails::empty(policy.clone());
+        details
+            .ingress_zones
+            .push(migration.ingress_zone().to_owned());
+        details
+            .egress_zones
+            .push(migration.egress_zone().to_owned());
+        details.rich_rules.push(migration.rich_rule().clone());
+        snapshot.policies.permanent.insert(policy, details);
+        assert_eq!(operation.postcondition_holds(&snapshot), Some(true));
+    }
+
+    #[test]
+    fn direct_migration_fails_closed_on_stale_or_incomplete_input() {
+        let mut snapshot = mock::sample().unwrap();
+        let migration = translate_direct_rule(&snapshot.direct_rules[0])
+            .unwrap()
+            .into_migration(PolicyName::parse_user_created("direct-web").unwrap());
+        let operation = FirewallOperation::MigrateDirectRule { migration };
+        snapshot.direct_rules.clear();
+        assert!(matches!(
+            operation.validate(&snapshot),
+            Err(OperationError::Invalid(message)) if message.contains("no longer present")
+        ));
+
+        snapshot.degraded.push(super::super::DegradedSection::new(
+            SnapshotSection::DirectRules,
+            Some(ConfigurationTarget::Runtime),
+            "permission denied",
+        ));
+        assert!(matches!(
+            operation.validate(&snapshot),
+            Err(OperationError::Invalid(message)) if message.contains("incomplete direct-rule")
+        ));
+    }
+
+    #[test]
+    fn create_policy_rejects_long_observed_only_names() {
+        let snapshot = mock::sample().unwrap();
+        let operation = FirewallOperation::CreatePolicy {
+            policy: PolicyName::parse("gateway-lan-to-world").unwrap(),
+        };
+        assert!(matches!(
+            operation.validate(&snapshot),
+            Err(OperationError::Invalid(message)) if message.contains("17-character")
+        ));
     }
 
     #[test]

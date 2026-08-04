@@ -429,10 +429,19 @@ entry</em> → <code>203.0.113.9</code>.</li>
 <img class="shot" src="../assets/direct.png" alt="Direct rules view">
 <p><strong>What you see</strong> — firewalld's legacy direct (raw
 iptables/nftables passthrough) rules, with a deprecation warning.</p>
-<p><strong>What you can do here</strong> — this view is <strong>read-only</strong>.
-Direct rules bypass firewalld's model; FWDeck surfaces them for visibility but
-deliberately does not edit them. Manage them with <code>firewall-cmd
---direct</code> if you must, and prefer rich rules or policies instead.</p>
+<p><strong>What you can do here</strong> — the legacy rule itself stays
+<strong>read-only</strong>. Press <kbd>enter</kbd> to see whether FWDeck has a
+conservative policy candidate, or open <kbd>:</kbd> → <em>Direct-rule migration
+assistant</em> to classify every rule. The assistant fails closed: only
+IPv4/IPv6 filter rules on INPUT, OUTPUT, or FORWARD with supported address,
+protocol, port, and ACCEPT/DROP/REJECT matches are translated.</p>
+<p><strong>Safe migration</strong> — highlight an eligible rule and press
+<kbd>a</kbd> (or choose <em>Migrate selected direct rule</em>), then provide a
+new policy name. FWDeck creates an additive permanent policy with the mapped
+ANY/HOST direction and a reviewed rich rule. It never removes the direct rule:
+reload, validate real traffic, then retire the legacy rule manually with
+<code>firewall-cmd --direct</code>. Unsupported tables, custom chains, match
+modules, negation, NAT, and ambiguous expressions stay manual.</p>
 
 <h3>9 · Logs</h3>
 <img class="shot" src="../assets/logs.png" alt="Logs view">

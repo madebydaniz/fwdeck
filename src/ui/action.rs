@@ -147,6 +147,8 @@ pub enum UiAction {
     BrowsePolicySets,
     /// Open the scoped policy-to-zone/service dependency graph.
     ShowPolicyDependencies,
+    /// Analyze direct rules and show conservative policy migration candidates.
+    ShowDirectMigration,
     /// Open the drift workspace: every runtime vs permanent difference
     /// across all zones.
     ShowDrift,

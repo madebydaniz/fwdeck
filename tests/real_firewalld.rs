@@ -246,6 +246,67 @@ async fn policy_round_trip() {
 }
 
 #[tokio::test]
+#[ignore = "MUTATES firewalld — dev container only"]
+async fn direct_rule_migration_creates_additive_policy_replacement() {
+    let _serial = FIREWALL_LOCK.lock().await;
+
+    use fwdeck::application::ports::OperationOutcome;
+    use fwdeck::domain::{FirewallOperation, PolicyName, translate_direct_rule};
+
+    let backend = CliBackend::new(TokioRunner);
+    let snapshot = backend.snapshot().await.unwrap();
+    let source_rule = "ipv4 filter INPUT 9 -p tcp --dport 12345 -j ACCEPT";
+    assert!(snapshot.direct_rules.iter().any(|rule| rule == source_rule));
+
+    let policy = PolicyName::parse_user_created("fwdeck-it-mig").unwrap();
+    let migration = translate_direct_rule(source_rule)
+        .unwrap()
+        .into_migration(policy.clone());
+    let outcome = backend
+        .apply(&FirewallOperation::MigrateDirectRule {
+            migration: migration.clone(),
+        })
+        .await;
+    let migrated_snapshot = backend.snapshot().await;
+    let cleanup = backend
+        .apply(&FirewallOperation::DeletePolicy {
+            policy: policy.clone(),
+        })
+        .await;
+
+    assert!(
+        matches!(outcome, OperationOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+    let migrated_snapshot = migrated_snapshot.unwrap();
+    let replacement = &migrated_snapshot.policies.permanent[&policy];
+    assert!(
+        replacement
+            .ingress_zones
+            .iter()
+            .any(|zone| zone == migration.ingress_zone())
+    );
+    assert!(
+        replacement
+            .egress_zones
+            .iter()
+            .any(|zone| zone == migration.egress_zone())
+    );
+    assert!(replacement.rich_rules.contains(migration.rich_rule()));
+    assert!(
+        migrated_snapshot
+            .direct_rules
+            .iter()
+            .any(|rule| rule == source_rule),
+        "migration must never remove the legacy rule"
+    );
+    assert!(
+        matches!(cleanup, OperationOutcome::Applied { .. }),
+        "{cleanup:?}"
+    );
+}
+
+#[tokio::test]
 #[ignore = "MUTATES firewalld policy sets — dev container only"]
 async fn policy_set_gateway_enable_disable_round_trip() {
     let _serial = FIREWALL_LOCK.lock().await;
