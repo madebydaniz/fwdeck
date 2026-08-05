@@ -44,7 +44,7 @@ installing:
 ```bash
 cosign verify-blob \
   --bundle checksums.txt.bundle \
-  --certificate-identity-regexp "^https://github.com/madebydaniz/fwdeck/\\.github/workflows/release-binaries\\.yml@refs/(heads/main|tags/.+)$" \
+  --certificate-identity-regexp "^https://github.com/madebydaniz/fwdeck/\\.github/workflows/release-binaries\\.yml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   checksums.txt
 sha256sum -c checksums.txt --ignore-missing
@@ -53,3 +53,10 @@ sha256sum -c checksums.txt --ignore-missing
 The certificate identity pins the artifact to this repository's release
 workflow — a signature from any other source fails verification. The install
 script (`scripts/install.sh`) performs both checks automatically.
+
+Manual recovery builds must run from the exact release tag so they produce the
+same certificate identity as an automatic release:
+
+```bash
+gh workflow run release-binaries.yml --ref vX.Y.Z -f release_tag=vX.Y.Z
+```

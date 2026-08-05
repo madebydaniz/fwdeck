@@ -7,11 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Release tag to build assets for (for example v0.1.0)
+        description: Existing release tag to rebuild (run this workflow from the same tag)
         required: true
         type: string
 
-# Least privilege by default; jobs opt into the writes they actually need.
 permissions:
   contents: read
 
@@ -20,143 +19,58 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    if: startsWith(github.event.inputs.release_tag || github.event.release.tag_name, 'v')
-    name: build-${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-
+  validate-release:
+    name: Validate release identity
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.release.outputs.tag }}
     steps:
-      - name: Checkout release tag
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
-          persist-credentials: false
-
-      - name: Validate release tag
+      - id: release
+        name: Require an exact SemVer tag ref
         shell: bash
         env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
           RELEASE_TAG: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${RELEASE_TAG}"
-          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::unexpected release tag '${TAG}' for release-binaries"
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected release tag '${RELEASE_TAG}'"
             exit 1
           fi
+          if [[ "${REF_TYPE}" != "tag" || "${REF_NAME}" != "${RELEASE_TAG}" ]]; then
+            echo "::error::release signing must run from refs/tags/${RELEASE_TAG}"
+            echo "For manual recovery: gh workflow run release-binaries.yml --ref ${RELEASE_TAG} -f release_tag=${RELEASE_TAG}"
+            exit 1
+          fi
+          echo "tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
 
-      - name: Install musl toolchain
-        if: endsWith(matrix.target, '-musl')
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          # Pinned for reproducible release builds (matches the tested MSRV).
-          toolchain: "1.88"
-          targets: ${{ matrix.target }}
-
-      # No build cache on the release path: signed, published binaries must be
-      # built from scratch so a poisoned cache can never reach a release.
-      - name: Build fwdeck
-        # The dbus feature ships in release binaries so `--backend dbus` works
-        # out of the box.
-        run: cargo build --release --locked --features dbus --target ${{ matrix.target }}
-
-      - name: Package archive
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
-        run: |
-          set -euo pipefail
-          TAG="${RELEASE_TAG}"
-          TARGET="${{ matrix.target }}"
-          NAME="fwdeck-${TAG}-${TARGET}"
-          BIN="target/${TARGET}/release/fwdeck"
-          mkdir -p "${NAME}/completions"
-          cp "${BIN}" "${NAME}/"
-          cp README.md LICENSE CHANGELOG.md "${NAME}/"
-          # Both gnu and musl binaries run natively on their build runner.
-          for shell in bash zsh fish; do
-            "${BIN}" completions "${shell}" > "${NAME}/completions/fwdeck.${shell}"
-          done
-          "${BIN}" manpage > "${NAME}/fwdeck.1"
-          mkdir -p dist
-          tar -czf "dist/${NAME}.tar.gz" "${NAME}"
-
-      - name: Build RPM and DEB packages
-        # Only the glibc builds ship as distro packages; musl stays tar.gz-only.
-        if: endsWith(matrix.target, '-gnu')
-        shell: bash
-        env:
-          RELEASE_TAG: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
-          # Multi-arch image (amd64 + arm64), pinned by index digest.
-          NFPM_IMAGE: ghcr.io/goreleaser/nfpm@sha256:a662cb167d7b6d3a83920c83d76b12d02b8ac5dd2c13e5c62c15270b23f6df0c # v2.47.0
-        run: |
-          set -euo pipefail
-          TAG="${RELEASE_TAG}"
-          TARGET="${{ matrix.target }}"
-          NAME="fwdeck-${TAG}-${TARGET}"
-          case "${TARGET}" in
-            x86_64-*)  ARCH=amd64 ;;
-            aarch64-*) ARCH=arm64 ;;
-            *) echo "::error::no package arch mapping for ${TARGET}"; exit 1 ;;
-          esac
-          # nfpm does not compress man pages; gzip it here (-n for reproducibility).
-          gzip -9 -n -c "${NAME}/fwdeck.1" > "${NAME}/fwdeck.1.gz"
-          # nfpm does not expand env vars in content paths — render a concrete
-          # config for this target instead.
-          sed -e "s|\${NFPM_ARCH}|${ARCH}|g" \
-              -e "s|\${NFPM_VERSION}|${TAG#v}|g" \
-              -e "s|\${NFPM_STAGING}|${NAME}|g" \
-              packaging/nfpm.yaml > nfpm.rendered.yaml
-          for packager in rpm deb; do
-            docker run --rm \
-              --volume "${PWD}:/work" \
-              --workdir /work \
-              "${NFPM_IMAGE}" package \
-              --config nfpm.rendered.yaml \
-              --packager "${packager}" \
-              --target dist/
-          done
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: fwdeck-${{ matrix.target }}
-          path: |
-            dist/*.tar.gz
-            dist/*.rpm
-            dist/*.deb
-          if-no-files-found: error
+  build:
+    name: Build and package release artifacts
+    needs: validate-release
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-build.yml
+    with:
+      release_tag: ${{ needs.validate-release.outputs.release_tag }}
+      checkout_ref: ${{ needs.validate-release.outputs.release_tag }}
 
   sign-and-publish:
-    if: startsWith(github.event.inputs.release_tag || github.event.release.tag_name, 'v')
-    name: sign-and-publish
+    name: Sign and publish
     runs-on: ubuntu-latest
     needs:
+      - validate-release
       - build
     permissions:
-      contents: write # upload release assets
-      id-token: write # cosign keyless + SLSA provenance
-      attestations: write # attest-build-provenance
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
+          ref: ${{ needs.validate-release.outputs.release_tag }}
           persist-credentials: false
 
       - name: Download all build artifacts
@@ -187,14 +101,14 @@ jobs:
             --bundle dist/checksums.txt.bundle \
             dist/checksums.txt
 
-      - name: Verify checksums signature with cosign
+      - name: Verify tag-bound signing identity
         shell: bash
         run: |
           set -euo pipefail
           cosign verify-blob \
             --bundle dist/checksums.txt.bundle \
-            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/\\.github/workflows/release-binaries\\.yml@refs/tags/.+$" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp '^https://github.com/${{ github.repository }}/\.github/workflows/release-binaries\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
             dist/checksums.txt
 
       - name: Generate SBOM (SPDX)
@@ -221,7 +135,7 @@ jobs:
         # upload + overwrite that a plain `gh release` script would reimplement.
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          tag_name: ${{ github.event.inputs.release_tag || github.event.release.tag_name }}
+          tag_name: ${{ needs.validate-release.outputs.release_tag }}
           overwrite_files: true
           files: |
             dist/*.tar.gz
@@ -234,26 +148,20 @@ jobs:
             dist/fwdeck.spdx.json
 
   publish-crate:
-    # Publish the source crate to crates.io via OIDC Trusted Publishing — no
-    # long-lived token. Only on a real published release (never on
-    # workflow_dispatch rebuilds, which would hit an already-published version).
-    # Independent of the binary/signing jobs.
-    if: github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')
-    name: publish-crate
+    if: github.event_name == 'release'
+    name: Publish crate
     runs-on: ubuntu-latest
-    # Must match the Trusted Publisher configured on crates.io (owner
-    # madebydaniz, repo fwdeck, workflow release-binaries.yml, environment
-    # release); the OIDC token's environment claim is verified against it.
+    needs: validate-release
     environment: release
     permissions:
       contents: read
-      id-token: write # OIDC exchange for a short-lived crates.io token
+      id-token: write
 
     steps:
       - name: Checkout release tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ needs.validate-release.outputs.release_tag }}
           persist-credentials: false
 
       - name: Install Rust
