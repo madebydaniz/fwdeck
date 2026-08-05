@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::application::ports::FirewallError;
 use crate::application::{MutationPlan, MutationRequest};
 use crate::domain::LogEntry;
-use crate::domain::{FirewallOperation, FirewallSnapshot};
+use crate::domain::{FirewallOperation, FirewallSnapshot, RefreshObservation};
 
 use super::overlays::FormKind;
 use super::views::ViewId;
@@ -213,7 +213,12 @@ pub enum UiAction {
     /// The engine started a refresh; show the spinner.
     RefreshStarted,
     /// The engine finished a refresh: a new snapshot or a backend error.
-    RefreshCompleted(Result<Arc<FirewallSnapshot>, FirewallError>),
+    RefreshCompleted {
+        /// Fresh snapshot, or the categorized backend failure.
+        result: Result<Arc<FirewallSnapshot>, FirewallError>,
+        /// Exact telemetry from the same refresh attempt.
+        observation: RefreshObservation,
+    },
     /// New kernel/netfilter log entries from the log tailer.
     LogsReceived(Vec<LogEntry>),
     /// Exit the application. Asks first when quitting would fire an armed

@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use crate::application::api::{EngineEvent, EngineHandle, EngineRequest};
 use crate::application::ports::FirewallError;
 use crate::config::Config;
+use crate::domain::RefreshObservation;
 use crate::error::AppError;
 use std::ops::ControlFlow;
 
@@ -102,9 +103,12 @@ async fn event_loop(
                 Some(engine_event_action(event))
             } else {
                 engine_alive = false;
-                Some(UiAction::RefreshCompleted(Err(FirewallError::Process(
-                    "engine task stopped unexpectedly".to_owned(),
-                ))))
+                Some(UiAction::RefreshCompleted {
+                    result: Err(FirewallError::Process(
+                        "engine task stopped unexpectedly".to_owned(),
+                    )),
+                    observation: RefreshObservation::total_only(Duration::ZERO),
+                })
             },
             received = logs.recv_many(&mut log_batch, 64), if logs_alive => {
                 if received == 0 {
@@ -154,7 +158,13 @@ async fn event_loop(
 fn engine_event_action(event: EngineEvent) -> UiAction {
     match event {
         EngineEvent::RefreshStarted => UiAction::RefreshStarted,
-        EngineEvent::RefreshFinished(result) => UiAction::RefreshCompleted(result),
+        EngineEvent::RefreshFinished {
+            result,
+            observation,
+        } => UiAction::RefreshCompleted {
+            result,
+            observation,
+        },
         EngineEvent::OperationFinished(result) => UiAction::OperationFinished(result),
         EngineEvent::PlanFinished { applied, remaining } => {
             UiAction::PlanFinished { applied, remaining }

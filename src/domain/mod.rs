@@ -30,7 +30,10 @@ pub use ids::{
     IcmpType, InterfaceName, IpProtocol, IpSetName, PolicyName, PolicySetName, ServiceName,
     ValidationError, ZoneName,
 };
-pub use observation::{ChainCounter, LogAction, LogEntry};
+pub use observation::{
+    ChainCounter, LogAction, LogEntry, RefreshObservation, RefreshSection,
+    RefreshSectionObservation,
+};
 pub use operation::{FirewallOperation, OperationError};
 pub use policy::{PolicyDetails, PolicyTarget};
 pub use policy_set::{PolicySetDetails, PolicySetScope, PolicySetState};
