@@ -73,6 +73,10 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # Real-daemon tests are #[ignore]d; this suite never touches a firewall.
       - run: cargo test --locked
+      # Deterministic enterprise-scale budgets: 100 zones, 500 services,
+      # 100 ipsets, and 100 policies. Serialized to reduce runner variance.
+      - name: Performance budget
+        run: cargo test --locked --release performance_budget -- --test-threads=1
 
   msrv:
     name: MSRV (1.88)
@@ -179,14 +183,14 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      # Gated at a floor well below current (~72%) so a real coverage cliff
-      # reddens CI while normal fluctuation does not; also shown in the summary.
+      # Phase 5 floor: the full all-features suite must keep at least 75% line
+      # coverage. Critical-path thresholds are added as their focused suites land.
       - name: Coverage
         run: |
           {
             echo '## Coverage'
             echo '```'
-            cargo llvm-cov --locked --all-features --fail-under-lines 65 --summary-only
+            cargo llvm-cov --locked --all-features --fail-under-lines 75 --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

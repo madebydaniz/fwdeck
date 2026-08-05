@@ -10,15 +10,20 @@ pub mod errors;
 pub mod parse;
 
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::application::ports::{FirewallBackend, FirewallError, OperationOutcome, StepReport};
+use crate::application::ports::{
+    FirewallBackend, FirewallError, OperationOutcome, SnapshotRead, StepReport,
+};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::domain::{
     ActiveZone, ConfigurationTarget, DegradedSection, FirewallOperation, FirewallSnapshot,
     FirewallStatus, IpSetInfo, IpSetName, LogDenied, NetfilterBackend, PolicyDetails, PolicyName,
-    Scoped, ServiceDefinition, ServiceName, SnapshotSection, ZoneDetails, ZoneName,
+    RefreshObservation, RefreshSection, RefreshSectionObservation, Scoped, ServiceDefinition,
+    ServiceName, SnapshotSection, ZoneDetails, ZoneName,
 };
 
 /// Fallback so the browse overlay is never empty if `--get-services` fails.
@@ -47,6 +52,76 @@ struct HeavySections {
 /// Heavy sections are refetched on every Nth refresh (they change rarely and
 /// cost one process per object); mutations invalidate the cache immediately.
 const HEAVY_SECTION_EVERY: u32 = 3;
+
+tokio::task_local! {
+    static REFRESH_RECORDER: Arc<RefreshRecorder>;
+    static REFRESH_SECTION: RefreshSection;
+}
+
+#[derive(Debug, Default)]
+struct RefreshSectionStats {
+    elapsed: Duration,
+    process_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct RefreshRecorder {
+    process_count: AtomicU64,
+    sections: std::sync::Mutex<BTreeMap<RefreshSection, RefreshSectionStats>>,
+}
+
+impl RefreshRecorder {
+    fn record_process(&self, section: Option<RefreshSection>) {
+        self.process_count.fetch_add(1, Ordering::Relaxed);
+        let Some(section) = section else {
+            return;
+        };
+        let mut sections = self
+            .sections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sections.entry(section).or_default().process_count += 1;
+    }
+
+    fn record_section(&self, section: RefreshSection, elapsed: Duration) {
+        let mut sections = self
+            .sections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sections.entry(section).or_default().elapsed += elapsed;
+    }
+
+    fn finish(&self, elapsed: Duration) -> RefreshObservation {
+        let sections = self
+            .sections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(section, stats)| RefreshSectionObservation {
+                section: *section,
+                elapsed: stats.elapsed,
+                process_count: stats.process_count,
+            })
+            .collect();
+        RefreshObservation::new(
+            elapsed,
+            self.process_count.load(Ordering::Relaxed),
+            sections,
+        )
+    }
+}
+
+async fn observe_section<T>(
+    section: RefreshSection,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let started = Instant::now();
+    let output = REFRESH_SECTION.scope(section, future).await;
+    let _ = REFRESH_RECORDER.try_with(|recorder| {
+        recorder.record_section(section, started.elapsed());
+    });
+    output
+}
 
 type ZoneSections = (
     BTreeMap<ZoneName, ActiveZone>,
@@ -161,6 +236,10 @@ impl<R: CommandRunner> CliBackend<R> {
     }
 
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, FirewallError> {
+        let _ = REFRESH_RECORDER.try_with(|recorder| {
+            let section = REFRESH_SECTION.try_with(|section| *section).ok();
+            recorder.record_process(section);
+        });
         self.runner
             .run(request)
             .await
@@ -202,10 +281,13 @@ impl<R: CommandRunner> CliBackend<R> {
         Vec<ServiceName>,
         Option<DegradedSection>,
     ) {
-        let (ipsets, mut degraded) = self.ipsets().await;
-        let (direct_rules, direct_err) = self.direct_rules().await;
-        let (available_services, services_err) = self.available_services().await;
-        let (policies, policy_degraded) = self.policies().await;
+        let (ipsets, mut degraded) = observe_section(RefreshSection::IpSets, self.ipsets()).await;
+        let (direct_rules, direct_err) =
+            observe_section(RefreshSection::DirectRules, self.direct_rules()).await;
+        let (available_services, services_err) =
+            observe_section(RefreshSection::Services, self.available_services()).await;
+        let (policies, policy_degraded) =
+            observe_section(RefreshSection::Policies, self.policies()).await;
         degraded.extend(direct_err);
         degraded.extend(policy_degraded);
         let mut heavy = self
@@ -622,15 +704,19 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
     }
 
     async fn snapshot(&self) -> Result<FirewallSnapshot, FirewallError> {
-        let status = self.probe().await?;
+        let status = observe_section(RefreshSection::Status, self.probe()).await?;
         if !status.daemon_running && !self.is_offline() {
             return Err(FirewallError::DaemonNotRunning);
         }
 
-        let default_zone = self.run_ok(self.request(&["--get-default-zone"])).await?;
-        let default_zone = parse::parse_default_zone(&default_zone)?;
-
-        let (active, runtime, permanent, zone_degraded) = self.zone_sections().await?;
+        let (default_zone, active, runtime, permanent, zone_degraded) =
+            observe_section(RefreshSection::Zones, async {
+                let default_zone = self.run_ok(self.request(&["--get-default-zone"])).await?;
+                let default_zone = parse::parse_default_zone(&default_zone)?;
+                let (active, runtime, permanent, zone_degraded) = self.zone_sections().await?;
+                Ok::<_, FirewallError>((default_zone, active, runtime, permanent, zone_degraded))
+            })
+            .await?;
         // Tiered refresh: the per-object sections (one subprocess each) are
         // reused for a few refreshes; mutations invalidate the cache.
         let cached = {
@@ -654,7 +740,8 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
         };
         let (ipsets, policies, direct_rules, mut degraded, available_services, services_err) =
             if let Some((ipsets, policies, direct_rules, degraded)) = cached {
-                let (available_services, services_err) = self.available_services().await;
+                let (available_services, services_err) =
+                    observe_section(RefreshSection::Services, self.available_services()).await;
                 (
                     ipsets,
                     policies,
@@ -682,12 +769,26 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
             direct_rules,
             degraded,
         };
-        let (definitions, definition_degraded) = self
-            .service_definitions(snapshot.referenced_services())
-            .await;
+        let (definitions, definition_degraded) = observe_section(
+            RefreshSection::Services,
+            self.service_definitions(snapshot.referenced_services()),
+        )
+        .await;
         snapshot.service_definitions = definitions;
         snapshot.degraded.extend(definition_degraded);
         Ok(snapshot)
+    }
+
+    async fn snapshot_observed(&self) -> SnapshotRead {
+        let recorder = Arc::new(RefreshRecorder::default());
+        let started = Instant::now();
+        let result = REFRESH_RECORDER
+            .scope(Arc::clone(&recorder), self.snapshot())
+            .await;
+        SnapshotRead {
+            result,
+            observation: recorder.finish(started.elapsed()),
+        }
     }
 
     async fn snapshot_fresh(&self) -> Result<FirewallSnapshot, FirewallError> {

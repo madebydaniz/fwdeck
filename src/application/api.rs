@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
-use crate::domain::{FirewallOperation, FirewallSnapshot};
+use crate::domain::{FirewallOperation, FirewallSnapshot, RefreshObservation};
 
 use super::engine;
 use super::ports::{
@@ -117,7 +117,12 @@ pub enum EngineEvent {
     RefreshStarted,
     /// The snapshot pass ended. `Arc` because the UI keeps the previous
     /// snapshot alive while diffing against the new one.
-    RefreshFinished(Result<Arc<FirewallSnapshot>, FirewallError>),
+    RefreshFinished {
+        /// Fresh snapshot, or the categorized backend failure.
+        result: Result<Arc<FirewallSnapshot>, FirewallError>,
+        /// Exact telemetry for this snapshot attempt.
+        observation: RefreshObservation,
+    },
     /// One operation completed with its honest [`OperationOutcome`]
     /// (applied / partially applied / failed — never a swallowed partial),
     /// plus the correlation id shared with tracing and the audit line.
