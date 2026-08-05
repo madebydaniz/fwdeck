@@ -32,6 +32,13 @@ cargo test --test real_firewalld -- --ignored   # container only
 
 All four must pass. `cargo test` must never touch the host firewall.
 
+Pull requests target `develop`. Pushes to `develop` and `main` run the full CI
+and CodeQL suites. Changes to release, packaging, dependency, or shell files
+also run the release canary: it builds a real tar/RPM/DEB set, transfers the
+artifacts between jobs, generates an SBOM, and exercises Cosign. Trusted
+keyless signing and provenance run only after the change lands on a protected
+repository branch.
+
 The `make` targets wrap these (`make help` lists them). If Docker's DNS is flaky
 (common on macOS), run `make warm` once — it fetches dependencies into a shared
 cached volume — after which `make run` and the container build fully offline.

@@ -4,7 +4,7 @@ set -euo pipefail
 OWNER="madebydaniz"
 REPO="fwdeck"
 BINARY_NAME="fwdeck"
-WORKFLOW_IDENTITY_REGEX='^https://github.com/madebydaniz/fwdeck/\.github/workflows/release-binaries\.yml@refs/tags/.+$'
+WORKFLOW_IDENTITY_REGEX='^https://github.com/madebydaniz/fwdeck/\.github/workflows/release-binaries\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$'
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 VERSION=""

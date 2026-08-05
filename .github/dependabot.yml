@@ -2,6 +2,7 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
+    target-branch: develop
     schedule:
       interval: monthly
     # Wait a week after a version is published before proposing it, so a
@@ -14,11 +15,14 @@ updates:
         update-types: ["minor", "patch"]
   - package-ecosystem: github-actions
     directory: /
+    target-branch: develop
     schedule:
       interval: monthly
     cooldown:
       default-days: 7
-    # All action bumps in a single PR — keeps the noise to one review.
+    # Keep routine bumps together, but isolate majors so release-critical
+    # actions can be behaviorally reviewed and reverted independently.
     groups:
-      actions:
+      actions-minor-and-patch:
         patterns: ["*"]
+        update-types: ["minor", "patch"]

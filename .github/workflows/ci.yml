@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [develop, main, master]
   pull_request:
 
 permissions:
@@ -106,6 +106,18 @@ jobs:
         with:
           persist-credentials: false
       - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y shellcheck
+      - name: Check shell scripts
+        run: shellcheck scripts/install.sh scripts/preview-site.sh
 
   zizmor:
     name: Zizmor (Actions security)

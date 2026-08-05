@@ -164,7 +164,7 @@ curl -fsSLO "https://github.com/madebydaniz/fwdeck/releases/download/${VERSION}/
 
 cosign verify-blob \
   --bundle checksums.txt.bundle \
-  --certificate-identity-regexp "^https://github.com/madebydaniz/fwdeck/\.github/workflows/release-binaries\.yml@refs/(heads/main|tags/.+)$" \
+  --certificate-identity-regexp "^https://github.com/madebydaniz/fwdeck/\.github/workflows/release-binaries\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   checksums.txt
 
