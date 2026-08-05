@@ -4,7 +4,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus};
+use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus, RefreshObservation};
 
 /// Stable identity for one rollback guard. It is assigned immediately before
 /// the matching operation runs, so duplicate operations never share lifecycle
@@ -200,6 +200,16 @@ impl OperationOutcome {
     }
 }
 
+/// One snapshot attempt together with operational telemetry from the same
+/// backend boundary. The observation is available even when the read fails.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotRead {
+    /// Fresh firewall state, or the categorized backend failure.
+    pub result: Result<FirewallSnapshot, FirewallError>,
+    /// Exact latency plus adapter-specific process/section measurements.
+    pub observation: RefreshObservation,
+}
+
 /// The firewalld backend: reads (`probe`, `snapshot`) and mutations (`apply`,
 /// `reload`). Native async-fn-in-trait with explicit `Send` bounds (ADR-1).
 pub trait FirewallBackend: Send + Sync + 'static {
@@ -208,6 +218,19 @@ pub trait FirewallBackend: Send + Sync + 'static {
 
     /// Full state in a handful of process calls, independent of zone count (ADR-2).
     fn snapshot(&self) -> impl Future<Output = Result<FirewallSnapshot, FirewallError>> + Send;
+
+    /// Full state plus refresh telemetry. Adapters can override this to report
+    /// subprocess and per-section metrics; the default remains total-only.
+    fn snapshot_observed(&self) -> impl Future<Output = SnapshotRead> + Send {
+        async move {
+            let started = std::time::Instant::now();
+            let result = self.snapshot().await;
+            SnapshotRead {
+                result,
+                observation: RefreshObservation::total_only(started.elapsed()),
+            }
+        }
+    }
 
     /// Reads state for a mutation precondition, bypassing any refresh cache.
     /// Backends without a cache can use the default implementation.

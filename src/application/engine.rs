@@ -538,18 +538,28 @@ async fn refresh<B: FirewallBackend>(
         .send(EngineEvent::RefreshStarted)
         .await
         .map_err(|_| ())?;
-    let started = std::time::Instant::now();
-    let result = backend.snapshot().await.map(Arc::new);
+    let read = backend.snapshot_observed().await;
+    let result = read.result.map(Arc::new);
+    let observation = read.observation;
     match &result {
         Ok(snapshot) => tracing::debug!(
             zones = snapshot.runtime.len(),
-            elapsed_ms = started.elapsed().as_millis(),
+            elapsed_ms = observation.elapsed.as_millis(),
+            process_count = observation.process_count,
             "refresh finished"
         ),
-        Err(err) => tracing::warn!(error = %err, "refresh failed"),
+        Err(err) => tracing::warn!(
+            error = %err,
+            elapsed_ms = observation.elapsed.as_millis(),
+            process_count = observation.process_count,
+            "refresh failed"
+        ),
     }
     events
-        .send(EngineEvent::RefreshFinished(result))
+        .send(EngineEvent::RefreshFinished {
+            result,
+            observation,
+        })
         .await
         .map_err(|_| ())
 }
@@ -676,6 +686,27 @@ mod tests {
         }
     }
 
+    struct LargeBackend;
+
+    impl FirewallBackend for LargeBackend {
+        async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
+            mock::sample()
+                .map(|snapshot| snapshot.status)
+                .map_err(|error| FirewallError::Parse(error.to_string()))
+        }
+
+        async fn snapshot(&self) -> Result<FirewallSnapshot, FirewallError> {
+            mock::large().map_err(|error| FirewallError::Parse(error.to_string()))
+        }
+
+        async fn apply(&self, operation: &FirewallOperation) -> OperationOutcome {
+            OperationOutcome::Applied {
+                operation: operation.clone(),
+                steps: Vec::new(),
+            }
+        }
+    }
+
     struct DriftingBackend {
         snapshot_calls: Arc<AtomicUsize>,
         apply_calls: Arc<AtomicUsize>,
@@ -739,8 +770,13 @@ mod tests {
             EngineEvent::RefreshStarted
         ));
         match event_rx.recv().await.unwrap() {
-            EngineEvent::RefreshFinished(Ok(snapshot)) => {
+            EngineEvent::RefreshFinished {
+                result: Ok(snapshot),
+                observation,
+            } => {
                 assert_eq!(snapshot.default_zone.as_str(), "public");
+                assert_eq!(observation.process_count, None);
+                assert!(observation.sections.is_empty());
             }
             other => panic!("expected successful refresh, got {other:?}"),
         }
@@ -767,7 +803,10 @@ mod tests {
         event_rx.recv().await.unwrap(); // started
         assert!(matches!(
             event_rx.recv().await.unwrap(),
-            EngineEvent::RefreshFinished(Err(FirewallError::DaemonNotRunning))
+            EngineEvent::RefreshFinished {
+                result: Err(FirewallError::DaemonNotRunning),
+                ..
+            }
         ));
     }
 
@@ -831,7 +870,10 @@ mod tests {
 
         event_rx.recv().await.unwrap();
         let expected = match event_rx.recv().await.unwrap() {
-            EngineEvent::RefreshFinished(Ok(snapshot)) => snapshot,
+            EngineEvent::RefreshFinished {
+                result: Ok(snapshot),
+                ..
+            } => snapshot,
             other => panic!("expected initial snapshot, got {other:?}"),
         };
         let operation = FirewallOperation::RemovePort {
@@ -882,7 +924,10 @@ mod tests {
 
         event_rx.recv().await.unwrap();
         let expected = match event_rx.recv().await.unwrap() {
-            EngineEvent::RefreshFinished(Ok(snapshot)) => snapshot,
+            EngineEvent::RefreshFinished {
+                result: Ok(snapshot),
+                ..
+            } => snapshot,
             other => panic!("expected initial snapshot, got {other:?}"),
         };
         let operations = vec![FirewallOperation::Reload, FirewallOperation::Reload];
@@ -1409,7 +1454,42 @@ mod tests {
         ));
         assert!(matches!(
             event_rx.recv().await.unwrap(),
-            EngineEvent::RefreshFinished(Ok(_))
+            EngineEvent::RefreshFinished { result: Ok(_), .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn performance_budget_large_snapshot_refresh_stays_under_two_seconds() {
+        let (_request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let started = std::time::Instant::now();
+        tokio::spawn(run(
+            LargeBackend,
+            TestRollbackGuard,
+            request_rx,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(matches!(
+                event_rx.recv().await.unwrap(),
+                EngineEvent::RefreshStarted
+            ));
+            event_rx.recv().await.unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            EngineEvent::RefreshFinished {
+                result: Ok(snapshot),
+                ..
+            } if snapshot.zone_names().len() == 100
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

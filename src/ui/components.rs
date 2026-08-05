@@ -154,9 +154,19 @@ fn render_brand_block(f: &mut Frame, area: Rect, state: &UiState, theme: &Theme)
             Span::styled(format!("{denied} "), theme.danger()),
         ]),
         Line::from(Span::styled(
-            state.last_refresh_ms.map_or_else(
+            state.last_refresh.as_ref().map_or_else(
                 || "refresh: — ".to_owned(),
-                |ms| format!("refresh: {ms}ms "),
+                |observation| {
+                    observation.process_count.map_or_else(
+                        || format!("refresh: {}ms ", observation.elapsed.as_millis()),
+                        |count| {
+                            format!(
+                                "refresh: {}ms · {count} cmd ",
+                                observation.elapsed.as_millis()
+                            )
+                        },
+                    )
+                },
             ),
             theme.muted(),
         )),

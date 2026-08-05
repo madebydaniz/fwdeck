@@ -1087,4 +1087,34 @@ mod tests {
             vec!["zone `ghost-zone`".to_owned()]
         );
     }
+
+    #[test]
+    fn performance_budget_large_snapshot_rows_stay_under_fifty_milliseconds() {
+        let snap = mock::large().unwrap();
+        let started = std::time::Instant::now();
+        let row_count = [
+            ViewId::Zones,
+            ViewId::Services,
+            ViewId::IpSets,
+            ViewId::Policies,
+        ]
+        .into_iter()
+        .map(|view| {
+            rows(
+                view,
+                &snap,
+                &snap.default_zone,
+                ConfigurationTarget::Runtime,
+            )
+            .len()
+        })
+        .sum::<usize>();
+
+        assert_eq!(row_count, 800);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "large snapshot row projection exceeded 50 ms: {:?}",
+            started.elapsed()
+        );
+    }
 }

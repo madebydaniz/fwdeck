@@ -414,7 +414,9 @@ async fn run_doctor(config: &Config) {
     }
     println!("log denied:    {}", status.log_denied.as_str());
 
-    match backend.snapshot().await {
+    let read = backend.snapshot_observed().await;
+    print_refresh_observation(&read.observation);
+    match read.result {
         Ok(snapshot) => {
             println!("default zone:  {}", snapshot.default_zone);
             println!(
@@ -447,6 +449,27 @@ async fn run_doctor(config: &Config) {
         Err(err) => println!("read access:   FAILED — {err}"),
     }
     preflight(&backend).await;
+}
+
+fn print_refresh_observation(observation: &fwdeck::domain::RefreshObservation) {
+    match observation.process_count {
+        Some(process_count) => println!(
+            "refresh:       {} ms / {process_count} command(s)",
+            observation.elapsed.as_millis()
+        ),
+        None => println!(
+            "refresh:       {} ms (total only)",
+            observation.elapsed.as_millis()
+        ),
+    }
+    for section in &observation.sections {
+        println!(
+            "fetch {:<12} {} ms / {} command(s)",
+            format!("{}:", section.section.as_str()),
+            section.elapsed.as_millis(),
+            section.process_count
+        );
+    }
 }
 
 fn print_retention_policy(config: &Config) {
