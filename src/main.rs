@@ -67,20 +67,24 @@ async fn main() -> anyhow::Result<()> {
 
     // Advisory instance lock: a second FWDeck on the same host degrades to
     // read-only instead of racing the first one's mutations.
-    let holds_lock = match bootstrap::acquire_instance_lock() {
-        Ok(()) => true,
-        Err(holder) => {
-            let who =
-                holder.map_or_else(|| "another process".to_owned(), |pid| format!("PID {pid}"));
-            eprintln!("warning: fwdeck already running ({who}) — starting read-only");
-            tracing::warn!(holder = %who, "instance lock held; forcing read-only");
-            config.read_only = true;
-            config.read_only_reason = Some("another instance is running".to_owned());
-            false
+    let instance_lock = if config.read_only {
+        None
+    } else {
+        match bootstrap::acquire_instance_lock() {
+            Ok(lock) => Some(lock),
+            Err(holder) => {
+                let who =
+                    holder.map_or_else(|| "another process".to_owned(), |pid| format!("PID {pid}"));
+                eprintln!("warning: fwdeck already running ({who}) — starting read-only");
+                tracing::warn!(holder = %who, "instance lock held; forcing read-only");
+                config.read_only = true;
+                config.read_only_reason = Some("another instance is running".to_owned());
+                None
+            }
         }
     };
 
-    if holds_lock {
+    if instance_lock.is_some() {
         enforce_startup_retention(config.retention).await;
     }
 
@@ -119,31 +123,25 @@ async fn main() -> anyhow::Result<()> {
         log_rx,
     )
     .await;
-    if holds_lock {
-        bootstrap::release_instance_lock();
-    }
+    drop(instance_lock);
     result?;
     Ok(())
 }
 
-struct StateMutationLock;
+struct StateMutationLock {
+    _guard: bootstrap::InstanceLock,
+}
 
 impl StateMutationLock {
     fn acquire() -> anyhow::Result<Self> {
         match bootstrap::acquire_instance_lock() {
-            Ok(()) => Ok(Self),
+            Ok(guard) => Ok(Self { _guard: guard }),
             Err(holder) => {
                 let who =
                     holder.map_or_else(|| "another process".to_owned(), |pid| format!("PID {pid}"));
                 anyhow::bail!("fwdeck is already running ({who}); refusing local-state mutation")
             }
         }
-    }
-}
-
-impl Drop for StateMutationLock {
-    fn drop(&mut self) {
-        bootstrap::release_instance_lock();
     }
 }
 
@@ -535,9 +533,10 @@ async fn preflight(backend: &CliBackend<TokioRunner>) {
                 }
             );
         }
-        let lock = dir.join("fwdeck.lock");
-        if let Ok(pid) = std::fs::read_to_string(&lock) {
-            println!("instance lock: held by PID {}", pid.trim());
+        match bootstrap::instance_lock_holder() {
+            Ok(Some(pid)) => println!("instance lock: held by PID {pid}"),
+            Ok(None) => println!("instance lock: available"),
+            Err(error) => println!("instance lock: unavailable — {error}"),
         }
     }
 

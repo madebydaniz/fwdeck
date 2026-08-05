@@ -303,9 +303,7 @@ async fn execute_effect(
             });
         }
         Effect::LoadCounters => {
-            let result = tokio::task::spawn_blocking(crate::infrastructure::counters::read)
-                .await
-                .unwrap_or_else(|join| Err(format!("counter task failed: {join}")));
+            let result = crate::infrastructure::counters::read().await;
             pending.push_back(UiAction::CountersLoaded(result));
         }
         Effect::RecordAudit { op_id, outcome } => {

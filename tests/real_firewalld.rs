@@ -529,13 +529,13 @@ async fn offline_backend_reads_and_writes_permanent_config() {
 /// Verifies the nft-counter parser against **real** `nft -j list ruleset`
 /// output (the fixture the JSON parser is really tested against — the unit
 /// test's sample only pins the shape). Read-only.
-#[test]
+#[tokio::test]
 #[ignore = "requires nftables + root (use the dev container)"]
-fn nft_counters_parse_against_real_ruleset() {
+async fn nft_counters_parse_against_real_ruleset() {
     // Reads via the real `nft` binary; on the nftables backend this must return
     // Ok (possibly empty — firewalld counters only some rules), never a parse
     // error, which would mean the libnftables JSON shape drifted.
-    match fwdeck::infrastructure::counters::read() {
+    match fwdeck::infrastructure::counters::read().await {
         Ok(counters) => {
             // If the daemon has any countered rules, they are firewalld chains.
             for c in &counters {

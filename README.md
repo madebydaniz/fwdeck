@@ -131,6 +131,10 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
 - 🪪 Honest results: partial failures reported as partial failures, with per-step diagnostics and a private, rotated JSONL audit trail.
 - 🧱 Concurrent-change protection: stale single operations and whole staged
   plans are rejected before commands or rollback guards start.
+- 🔒 One mutation session at a time through an OS-backed RAII lock; crashes
+  release ownership automatically, while read-only sessions remain concurrent.
+- 🧰 Bounded operational I/O: external commands time out, and interactive
+  mutation fields have explicit byte limits before validation.
 - 🧹 Configurable local-state retention with safe defaults, dry-run/apply CLI,
   pinned snapshots, strict filename matching, and symlink refusal.
 - 🔌 Two backends behind one trait: `firewall-cmd` (default, full-featured) and native D-Bus (reads + runtime edits; refuses what it can't do fully).
