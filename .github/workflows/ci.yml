@@ -121,7 +121,9 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y shellcheck
       - name: Check shell scripts
-        run: shellcheck docker/entrypoint.sh scripts/install.sh scripts/preview-site.sh
+        run: >-
+          shellcheck docker/entrypoint.sh scripts/install.sh
+          scripts/preview-site.sh scripts/check-critical-coverage.sh
 
   zizmor:
     name: Zizmor (Actions security)
@@ -187,10 +189,13 @@ jobs:
       # coverage. Critical-path thresholds are added as their focused suites land.
       - name: Coverage
         run: |
+          cargo llvm-cov --locked --all-features --fail-under-lines 75 \
+            --json --summary-only --output-path target/coverage-summary.json
+          ./scripts/check-critical-coverage.sh target/coverage-summary.json
           {
             echo '## Coverage'
             echo '```'
-            cargo llvm-cov --locked --all-features --fail-under-lines 75 --summary-only
+            cargo llvm-cov report --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
