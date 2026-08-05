@@ -117,7 +117,7 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install --no-install-recommends -y shellcheck
       - name: Check shell scripts
-        run: shellcheck scripts/install.sh scripts/preview-site.sh
+        run: shellcheck docker/entrypoint.sh scripts/install.sh scripts/preview-site.sh
 
   zizmor:
     name: Zizmor (Actions security)
