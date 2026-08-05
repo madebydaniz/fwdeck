@@ -376,6 +376,7 @@ async fn policy_set_gateway_enable_disable_round_trip() {
 async fn dbus_backend_agrees_with_cli_on_read_path() {
     let _serial = FIREWALL_LOCK.lock().await;
 
+    use fwdeck::domain::SnapshotSection;
     use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
 
     let cli = CliBackend::new(TokioRunner);
@@ -407,8 +408,22 @@ async fn dbus_backend_agrees_with_cli_on_read_path() {
     cli_services.sort();
     dbus_services.sort();
     assert_eq!(cli_services, dbus_services, "runtime services must match");
-    // Both must see the seeded runtime/permanent drift identically.
-    assert_eq!(cli_snap.all_synced(), dbus_snap.all_synced());
+    // The D-Bus adapter intentionally omits these resource families. Its
+    // aggregate drift value is therefore not comparable to the full CLI
+    // snapshot, but the missing capabilities must be reported honestly.
+    for section in [
+        SnapshotSection::IpSets,
+        SnapshotSection::Policies,
+        SnapshotSection::DirectRules,
+    ] {
+        assert!(
+            dbus_snap
+                .degraded
+                .iter()
+                .any(|degraded| degraded.section == section),
+            "{section:?} must be marked degraded"
+        );
+    }
 }
 
 #[cfg(feature = "dbus")]
@@ -484,7 +499,7 @@ async fn offline_backend_reads_and_writes_permanent_config() {
     let _serial = FIREWALL_LOCK.lock().await;
 
     use fwdeck::application::ports::OperationOutcome;
-    use fwdeck::domain::{ConfigurationTarget, FirewallOperation};
+    use fwdeck::domain::{ConfigurationTarget, FirewallOperation, SnapshotSection};
 
     // Offline backend works even though the container's daemon IS running —
     // firewall-offline-cmd edits the permanent config directly.
@@ -495,9 +510,12 @@ async fn offline_backend_reads_and_writes_permanent_config() {
     assert!(status.version.is_some());
 
     let snapshot = backend.snapshot().await.unwrap();
-    assert!(!snapshot.runtime.is_empty());
-    // Offline has a single config mirrored into both maps → no drift possible.
-    assert!(snapshot.all_synced());
+    assert!(snapshot.runtime.is_empty());
+    assert!(!snapshot.permanent.is_empty());
+    assert!(snapshot.degraded.iter().any(|degraded| {
+        degraded.section == SnapshotSection::Zones
+            && degraded.target == Some(ConfigurationTarget::Runtime)
+    }));
 
     let zone = snapshot.default_zone.clone();
     let service = ServiceName::parse("imap").unwrap();
