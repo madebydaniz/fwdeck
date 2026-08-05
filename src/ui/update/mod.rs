@@ -579,15 +579,14 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::RefreshStarted => {
             state.refreshing = true;
-            state.refresh_started_tick = Some(state.tick);
         }
-        UiAction::RefreshCompleted(result) => {
+        UiAction::RefreshCompleted {
+            result,
+            observation,
+        } => {
             let selected = selected_row_id(state);
             state.refreshing = false;
-            // 250 ms tick granularity is plenty for a health metric.
-            if let Some(started) = state.refresh_started_tick.take() {
-                state.last_refresh_ms = Some(state.tick.saturating_sub(started) * 250);
-            }
+            state.last_refresh = Some(observation);
             match result {
                 Ok(snapshot) => {
                     state.backend_error = None;
@@ -1373,7 +1372,12 @@ mod tests {
         assert!(s.refreshing);
         update(
             &mut s,
-            UiAction::RefreshCompleted(Err(FirewallError::DaemonNotRunning)),
+            UiAction::RefreshCompleted {
+                result: Err(FirewallError::DaemonNotRunning),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::ZERO,
+                ),
+            },
         );
         assert!(!s.refreshing);
         assert!(s.snapshot.is_some(), "stale data must survive an error");
@@ -1383,11 +1387,22 @@ mod tests {
     #[test]
     fn successful_refresh_clears_error_and_swaps_snapshot() {
         use crate::application::ports::FirewallError;
+        use crate::domain::RefreshObservation;
+        use std::time::Duration;
+
         let mut s = state();
         s.backend_error = Some(FirewallError::DaemonNotRunning);
         let snapshot = std::sync::Arc::new(mock::sample().unwrap());
-        update(&mut s, UiAction::RefreshCompleted(Ok(snapshot)));
+        let observation = RefreshObservation::total_only(Duration::from_millis(42));
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                result: Ok(snapshot),
+                observation: observation.clone(),
+            },
+        );
         assert!(s.backend_error.is_none());
+        assert_eq!(s.last_refresh, Some(observation));
     }
 
     #[test]
@@ -1597,7 +1612,12 @@ mod tests {
             .push(ServiceName::parse("aardvark").unwrap());
         update(
             &mut s,
-            UiAction::RefreshCompleted(Ok(std::sync::Arc::new(refreshed))),
+            UiAction::RefreshCompleted {
+                result: Ok(std::sync::Arc::new(refreshed)),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::ZERO,
+                ),
+            },
         );
 
         assert_eq!(selected_row_id(&s), Some(selected));
@@ -2070,7 +2090,15 @@ mod tests {
         assert!(!s.pending_rollback.is_empty(), "risky op arms rollback");
         // A refresh must NOT promote an armed op to undoable.
         let snap = std::sync::Arc::new(mock::sample().unwrap());
-        update(&mut s, UiAction::RefreshCompleted(Ok(snap)));
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                result: Ok(snap),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::ZERO,
+                ),
+            },
+        );
         assert!(
             s.undo_stack.is_empty(),
             "armed op must not also be undoable"

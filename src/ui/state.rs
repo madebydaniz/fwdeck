@@ -9,7 +9,8 @@ use crate::application::ports::FirewallError;
 use crate::config::Config;
 use crate::domain::LogEntry;
 use crate::domain::{
-    ConfigurationTarget, FirewallOperation, FirewallSnapshot, InterfaceName, ZoneName,
+    ConfigurationTarget, FirewallOperation, FirewallSnapshot, InterfaceName, RefreshObservation,
+    ZoneName,
 };
 
 use super::overlays::Overlay;
@@ -155,10 +156,8 @@ pub struct UiState {
     pub audit: Vec<AuditEntry>,
     /// Operations staged via `s` in the confirmation modal.
     pub staged: Vec<FirewallOperation>,
-    /// Tick at which the in-flight refresh started (for the duration metric).
-    pub refresh_started_tick: Option<u64>,
-    /// Duration of the last completed refresh, in milliseconds (tick-derived).
-    pub last_refresh_ms: Option<u64>,
+    /// Exact telemetry for the last completed refresh attempt.
+    pub last_refresh: Option<RefreshObservation>,
     /// Stack of applied-and-verified reversible operations, oldest first. Undo
     /// pops the most recent; capped by [`UiState::push_undo`] so it can't grow
     /// without bound.
@@ -235,8 +234,7 @@ impl UiState {
             audit: Vec::new(),
             staged: Vec::new(),
             undo_stack: Vec::new(),
-            refresh_started_tick: None,
-            last_refresh_ms: None,
+            last_refresh: None,
             verify_next_refresh: Vec::new(),
             pending_rollback: Vec::new(),
             rollback_ticks: config.rollback_timeout.as_secs() * 4, // 250 ms ticks

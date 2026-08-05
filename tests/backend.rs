@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use fwdeck::application::ports::{FirewallBackend, FirewallError, OperationOutcome};
 use fwdeck::domain::{
-    ConfigurationTarget, FirewallOperation, ServiceName, SnapshotSection, ZoneName,
+    ConfigurationTarget, FirewallOperation, RefreshSection, ServiceName, SnapshotSection, ZoneName,
 };
 use fwdeck::infrastructure::firewalld::CliBackend;
 use fwdeck::infrastructure::process::{
@@ -100,7 +100,8 @@ async fn snapshot_issues_exact_commands_in_order() {
     }
 
     let backend = CliBackend::new(runner.clone());
-    let snapshot = backend.snapshot().await.unwrap();
+    let read = backend.snapshot_observed().await;
+    let snapshot = read.result.unwrap();
 
     assert_eq!(
         runner.seen_args(),
@@ -160,6 +161,21 @@ async fn snapshot_issues_exact_commands_in_order() {
     assert_eq!(snapshot.direct_rules.len(), 1);
     assert_eq!(snapshot.service_definitions.len(), 7);
     assert_eq!(snapshot.available_services.len(), 3);
+
+    assert_eq!(read.observation.process_count, Some(25));
+    let section_count = |section| {
+        read.observation
+            .sections
+            .iter()
+            .find(|entry| entry.section == section)
+            .map(|entry| entry.process_count)
+    };
+    assert_eq!(section_count(RefreshSection::Status), Some(4));
+    assert_eq!(section_count(RefreshSection::Zones), Some(4));
+    assert_eq!(section_count(RefreshSection::IpSets), Some(4));
+    assert_eq!(section_count(RefreshSection::Services), Some(8));
+    assert_eq!(section_count(RefreshSection::Policies), Some(4));
+    assert_eq!(section_count(RefreshSection::DirectRules), Some(1));
 }
 
 #[tokio::test]
@@ -345,10 +361,10 @@ async fn daemon_down_is_a_status_for_probe_and_an_error_for_snapshot() {
 
     runner.push(Ok(output(Some(252), "not running\n", "")));
     runner.push_ok("2.3.2\n");
-    assert_eq!(
-        backend.snapshot().await.unwrap_err(),
-        FirewallError::DaemonNotRunning
-    );
+    let read = backend.snapshot_observed().await;
+    assert_eq!(read.result.unwrap_err(), FirewallError::DaemonNotRunning);
+    assert_eq!(read.observation.process_count, Some(2));
+    assert_eq!(read.observation.sections[0].section, RefreshSection::Status);
 }
 
 #[tokio::test]

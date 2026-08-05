@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::address::SourceAddress;
-use super::ids::{InterfaceName, IpSetName, ServiceName, ValidationError, ZoneName};
+use super::ids::{InterfaceName, IpSetName, PolicyName, ServiceName, ValidationError, ZoneName};
+use super::policy::PolicyDetails;
 use super::port::{ForwardPort, Protocol};
 use super::rich_rule::RichRule;
 use super::snapshot::{
@@ -191,6 +192,76 @@ pub fn sample() -> Result<FirewallSnapshot, ValidationError> {
     })
 }
 
+/// Generated enterprise-scale snapshot used by deterministic performance
+/// tests. It exercises domain/UI structures without inventing firewalld text.
+pub fn large() -> Result<FirewallSnapshot, ValidationError> {
+    let mut snapshot = sample()?;
+    let service_names = (0..500)
+        .map(|index| ServiceName::parse(&format!("svc-{index:04}")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut zones = BTreeMap::new();
+    let mut active = BTreeMap::new();
+    for index in 0..100 {
+        let name = ZoneName::parse(&format!("zone-{index:03}"))?;
+        let mut details = ZoneDetails::empty(name.clone());
+        if index == 0 {
+            details.services.clone_from(&service_names);
+        } else {
+            let first = index * 5;
+            details.services = service_names[first..first + 5].to_vec();
+        }
+        zones.insert(name.clone(), details);
+        active.insert(name, ActiveZone::default());
+    }
+    let default_zone = ZoneName::parse("zone-000")?;
+    snapshot.default_zone = default_zone;
+    snapshot.active = active;
+    snapshot.runtime = zones.clone();
+    snapshot.permanent = zones;
+
+    snapshot.service_definitions = service_names
+        .iter()
+        .cloned()
+        .map(|name| (name, ServiceDefinition::default()))
+        .collect();
+    snapshot.available_services.clone_from(&service_names);
+
+    let ipsets = (0..100)
+        .map(|index| {
+            Ok((
+                IpSetName::parse(&format!("set-{index:03}"))?,
+                IpSetInfo {
+                    kind: "hash:ip".to_owned(),
+                    entries: vec![format!("192.0.2.{index}")],
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ValidationError>>()?;
+    snapshot.ipsets = Scoped {
+        runtime: ipsets.clone(),
+        permanent: ipsets,
+    };
+
+    let policies = (0..100)
+        .map(|index| {
+            let name = PolicyName::parse(&format!("policy-{index:03}"))?;
+            let mut details = PolicyDetails::empty(name.clone());
+            details.ingress_zones = vec![format!("zone-{:03}", index % 100)];
+            details.egress_zones = vec!["ANY".to_owned()];
+            details.services = vec![service_names[index % service_names.len()].clone()];
+            Ok((name, details))
+        })
+        .collect::<Result<BTreeMap<_, _>, ValidationError>>()?;
+    snapshot.policies = Scoped {
+        runtime: policies.clone(),
+        permanent: policies,
+    };
+    snapshot.direct_rules.clear();
+    snapshot.degraded.clear();
+    Ok(snapshot)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -203,5 +274,16 @@ mod tests {
         assert!(snap.is_active(&snap.default_zone.clone()));
         assert!(!snap.all_synced());
         assert!(snap.zone_names().len() >= 9);
+    }
+
+    #[test]
+    fn large_snapshot_matches_the_performance_fixture_shape() {
+        let snap = large().unwrap();
+
+        assert_eq!(snap.zone_names().len(), 100);
+        assert_eq!(snap.service_definitions.len(), 500);
+        assert_eq!(snap.ipsets.runtime.len(), 100);
+        assert_eq!(snap.policies.runtime.len(), 100);
+        assert_eq!(snap.runtime[&snap.default_zone].services.len(), 500);
     }
 }
