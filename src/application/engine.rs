@@ -1062,6 +1062,157 @@ mod tests {
         assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn plan_validation_rejects_the_whole_forged_batch_before_apply_or_arm() {
+        let backend = CountingBackend {
+            apply_calls: AtomicUsize::new(0),
+            fail_at: 0,
+        };
+        let guard = RecordingRollbackGuard::default();
+        let guard_log = Arc::clone(&guard.log);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let invalid = FirewallOperation::AddService {
+            zone: crate::domain::ZoneName::parse("public").unwrap(),
+            service: crate::domain::ServiceName::parse("https").unwrap(),
+            target: crate::domain::ConfigurationTarget::RuntimeAndPermanent,
+        };
+
+        apply_plan(
+            &backend,
+            &guard,
+            &event_tx,
+            reviewed_plan(vec![invalid, FirewallOperation::Reload]),
+            false,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if matches!(result.outcome.first_error(), Some(FirewallError::Validation(_)))
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::PlanFinished {
+                applied: 0,
+                ref remaining,
+            } if remaining.len() == 2
+        ));
+        assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
+        assert!(guard_log.lock().unwrap().armed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_plan_with_failed_preflight_reports_an_empty_completion() {
+        let backend = FakeBackend {
+            calls: AtomicUsize::new(0),
+            fail: true,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+
+        apply_plan(
+            &backend,
+            &TestRollbackGuard,
+            &event_tx,
+            MutationPlan::new(Vec::new(), Arc::new(mock::sample().unwrap())),
+            false,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::PlanFinished {
+                applied: 0,
+                ref remaining,
+            } if remaining.is_empty()
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn read_only_plan_fails_fast_without_apply_or_watchdog_arm() {
+        let backend = CountingBackend {
+            apply_calls: AtomicUsize::new(0),
+            fail_at: 0,
+        };
+        let guard = RecordingRollbackGuard::default();
+        let guard_log = Arc::clone(&guard.log);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+
+        apply_plan(
+            &backend,
+            &guard,
+            &event_tx,
+            reviewed_plan(vec![FirewallOperation::Reload, FirewallOperation::Reload]),
+            true,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if result.outcome.first_error() == Some(&FirewallError::ReadOnlyMode)
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::PlanFinished {
+                applied: 0,
+                ref remaining,
+            } if remaining == &[FirewallOperation::Reload]
+        ));
+        assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
+        assert!(guard_log.lock().unwrap().armed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_only_rollback_keeps_the_watchdog_armed_without_backend_apply() {
+        let backend = CountingBackend {
+            apply_calls: AtomicUsize::new(0),
+            fail_at: 0,
+        };
+        let guard = RecordingRollbackGuard::default();
+        let guard_log = Arc::clone(&guard.log);
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let rollback_id = RollbackGuardId::new(44);
+
+        apply_rollback(
+            &backend,
+            &guard,
+            &event_tx,
+            rollback_id,
+            FirewallOperation::Reload,
+            Some("fwdeck-rollback-test".to_owned()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        match event_rx.recv().await.unwrap() {
+            EngineEvent::OperationFinished(result) => {
+                assert_eq!(result.completed_rollback, Some(rollback_id));
+                assert_eq!(
+                    result.outcome.first_error(),
+                    Some(&FirewallError::ReadOnlyMode)
+                );
+                assert!(
+                    result
+                        .guard_warning
+                        .as_deref()
+                        .is_some_and(|warning| warning.contains("remains armed"))
+                );
+            }
+            other => panic!("expected rollback completion, got {other:?}"),
+        }
+        assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
+        assert!(guard_log.lock().unwrap().disarmed.is_empty());
+    }
+
     async fn drain_initial_refresh(rx: &mut mpsc::Receiver<EngineEvent>) {
         rx.recv().await.unwrap(); // RefreshStarted
         rx.recv().await.unwrap(); // RefreshFinished
