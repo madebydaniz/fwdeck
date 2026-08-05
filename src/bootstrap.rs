@@ -177,7 +177,15 @@ pub fn hostname() -> String {
 /// unlink/recreate races can never create two independently locked inodes.
 #[derive(Debug)]
 pub struct InstanceLock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Closing the file also releases the lock, but an explicit unlock makes
+        // guard-drop behavior deterministic before the descriptor is closed.
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
 }
 
 /// Acquires the advisory single-instance lock. Two `fwdeck` processes mutating
@@ -228,7 +236,7 @@ fn acquire_instance_lock_at(path: &Path) -> Result<InstanceLock, Option<u32>> {
     if write_lock_pid(&mut file).is_err() {
         return Err(None);
     }
-    Ok(InstanceLock { _file: file })
+    Ok(InstanceLock { file })
 }
 
 fn instance_lock_holder_at(path: &Path) -> std::io::Result<Option<u32>> {
@@ -238,7 +246,10 @@ fn instance_lock_holder_at(path: &Path) -> std::io::Result<Option<u32>> {
         Err(error) => return Err(error),
     };
     match fs2::FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(None),
+        Ok(()) => {
+            fs2::FileExt::unlock(&file)?;
+            Ok(None)
+        }
         Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
             Ok(read_lock_pid(&mut file))
         }
