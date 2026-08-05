@@ -14,36 +14,43 @@
 use std::collections::BTreeMap;
 
 use crate::domain::ChainCounter;
+use crate::infrastructure::process::{
+    CommandRequest, CommandRunner, DEFAULT_TIMEOUT, TokioRunner, resolve_trusted,
+};
 
 /// Runs `nft -j list ruleset` and returns per-chain counters, busiest first.
 ///
 /// # Errors
 /// Returns an error string when `nft` is missing, not permitted, or emits
 /// output that is not valid libnftables JSON.
-pub fn read() -> Result<Vec<ChainCounter>, String> {
+pub async fn read() -> Result<Vec<ChainCounter>, String> {
     // Resolve `nft` from trusted dirs with a cleared environment — this may run
     // as root, so a poisoned PATH must not choose the binary.
-    let nft = crate::infrastructure::process::resolve_trusted("nft");
+    let nft = resolve_trusted("nft");
     if !nft.is_absolute() {
         return Err("nft not found in a trusted directory".to_owned());
     }
-    #[allow(clippy::disallowed_methods)] // resolve_trusted + env_clear: sanctioned nft probe
-    let output = std::process::Command::new(nft)
-        .args(["-j", "list", "ruleset"])
-        .env_clear()
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|err| format!("nft unavailable: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
+    read_with(&TokioRunner).await
+}
+
+async fn read_with<R: CommandRunner>(runner: &R) -> Result<Vec<ChainCounter>, String> {
+    let output = runner
+        .run(CommandRequest {
+            program: "nft",
+            args: vec!["-j".to_owned(), "list".to_owned(), "ruleset".to_owned()],
+            timeout: DEFAULT_TIMEOUT,
+        })
+        .await
+        .map_err(|error| format!("nft unavailable: {error}"))?;
+    if output.exit_code != Some(0) {
+        let stderr = output.stderr.trim();
         return Err(if stderr.is_empty() {
             "nft failed (need root and the nftables backend)".to_owned()
         } else {
             format!("nft failed: {stderr}")
         });
     }
-    parse(&String::from_utf8_lossy(&output.stdout))
+    parse(&output.stdout)
 }
 
 /// Parses libnftables JSON and aggregates `counter` statements by chain, for
@@ -109,6 +116,29 @@ pub fn parse(json: &str) -> Result<Vec<ChainCounter>, String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::infrastructure::process::{CommandOutput, ProcessError};
+    use std::sync::Mutex;
+
+    struct FakeRunner {
+        response: Mutex<Option<Result<CommandOutput, ProcessError>>>,
+        seen: Mutex<Vec<CommandRequest>>,
+    }
+
+    impl FakeRunner {
+        fn new(response: Result<CommandOutput, ProcessError>) -> Self {
+            Self {
+                response: Mutex::new(Some(response)),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        async fn run(&self, request: CommandRequest) -> Result<CommandOutput, ProcessError> {
+            self.seen.lock().unwrap().push(request);
+            self.response.lock().unwrap().take().unwrap()
+        }
+    }
 
     // Mirrors the libnftables JSON schema (`nft -j list ruleset`). The real
     // fixture is captured in the dev container by the real_firewalld suite;
@@ -128,6 +158,35 @@ mod tests {
             "expr": [ { "counter": { "packets": 999, "bytes": 999 } } ] } }
       ]
     }"#;
+
+    #[tokio::test]
+    async fn counter_read_uses_the_bounded_process_runner() {
+        let runner = FakeRunner::new(Ok(CommandOutput {
+            exit_code: Some(0),
+            stdout: SAMPLE.to_owned(),
+            stderr: String::new(),
+            duration: std::time::Duration::ZERO,
+        }));
+
+        let counters = read_with(&runner).await.unwrap();
+
+        assert!(!counters.is_empty());
+        assert_eq!(
+            runner.seen.lock().unwrap().as_slice(),
+            [CommandRequest {
+                program: "nft",
+                args: vec!["-j".to_owned(), "list".to_owned(), "ruleset".to_owned()],
+                timeout: DEFAULT_TIMEOUT,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn counter_timeout_is_reported_without_parsing() {
+        let runner = FakeRunner::new(Err(ProcessError::Timeout(DEFAULT_TIMEOUT)));
+        let error = read_with(&runner).await.unwrap_err();
+        assert!(error.contains("timed out"));
+    }
 
     #[test]
     fn aggregates_counters_per_firewalld_chain_busiest_first() {

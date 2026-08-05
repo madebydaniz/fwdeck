@@ -29,6 +29,9 @@ use rows::{
 
 // fixed page size; wire to the rendered table height if it ever matters.
 const PAGE_JUMP: i32 = 10;
+/// Hard cap per interactive field. This bounds memory and argv size even when
+/// a terminal pastes megabytes before validation gets a chance to run.
+const MAX_INTERACTIVE_INPUT_BYTES: usize = 4096;
 
 /// Applies one [`UiAction`] to the state and returns the side effects the
 /// shell must execute (engine requests, clipboard, file writes). This is the
@@ -472,14 +475,30 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }));
         }
         UiAction::OpenFormPrefilled(kind, buffer) => {
-            state
-                .overlays
-                .push(Overlay::Form(FormState { kind, buffer }));
+            if buffer.len() > MAX_INTERACTIVE_INPUT_BYTES {
+                state.toast(
+                    ToastKind::Warning,
+                    format!(
+                        "prefilled value exceeds the {MAX_INTERACTIVE_INPUT_BYTES}-byte input limit"
+                    ),
+                );
+            } else {
+                state
+                    .overlays
+                    .push(Overlay::Form(FormState { kind, buffer }));
+            }
         }
         UiAction::CloneEntry => return clone_entry(state),
         UiAction::FormInput(c) => {
-            if let Some(Overlay::Form(form)) = state.overlays.last_mut() {
-                form.buffer.push(c);
+            let rejected = match state.overlays.last_mut() {
+                Some(Overlay::Form(form)) => !push_bounded_input(&mut form.buffer, c),
+                _ => false,
+            };
+            if rejected {
+                state.toast(
+                    ToastKind::Warning,
+                    format!("input limit reached ({MAX_INTERACTIVE_INPUT_BYTES} bytes)"),
+                );
             }
         }
         UiAction::FormBackspace => {
@@ -498,8 +517,15 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }
         }
         UiAction::RichBuilderInput(c) => {
-            if let Some(Overlay::RichBuilder(builder)) = state.overlays.last_mut() {
-                builder.buffer.push(c);
+            let rejected = match state.overlays.last_mut() {
+                Some(Overlay::RichBuilder(builder)) => !push_bounded_input(&mut builder.buffer, c),
+                _ => false,
+            };
+            if rejected {
+                state.toast(
+                    ToastKind::Warning,
+                    format!("input limit reached ({MAX_INTERACTIVE_INPUT_BYTES} bytes)"),
+                );
             }
         }
         UiAction::RichBuilderBackspace => {
@@ -608,6 +634,14 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
     }
     Vec::new()
+}
+
+fn push_bounded_input(buffer: &mut String, character: char) -> bool {
+    if buffer.len().saturating_add(character.len_utf8()) > MAX_INTERACTIVE_INPUT_BYTES {
+        return false;
+    }
+    buffer.push(character);
+    true
 }
 
 /// Jumps to the selected global-search hit: switches to its view, clears that
@@ -1427,6 +1461,64 @@ mod tests {
         update(&mut s, UiAction::FormSubmit);
         assert!(matches!(s.overlays.last(), Some(Overlay::Form(_))));
         assert_eq!(s.toasts.back().map(|t| t.kind), Some(ToastKind::Warning));
+    }
+
+    #[test]
+    fn interactive_form_input_is_bounded_by_utf8_bytes() {
+        let mut s = state();
+        update(&mut s, UiAction::OpenForm(FormKind::AddRichRule));
+        let Some(Overlay::Form(form)) = s.overlays.last_mut() else {
+            panic!("expected form overlay");
+        };
+        form.buffer = "x".repeat(MAX_INTERACTIVE_INPUT_BYTES - 1);
+
+        update(&mut s, UiAction::FormInput('é'));
+
+        let Some(Overlay::Form(form)) = s.overlays.last() else {
+            panic!("expected form overlay");
+        };
+        assert_eq!(form.buffer.len(), MAX_INTERACTIVE_INPUT_BYTES - 1);
+        assert!(s.toasts.back().is_some_and(|toast| {
+            toast.kind == ToastKind::Warning && toast.text.contains("input limit")
+        }));
+    }
+
+    #[test]
+    fn rich_builder_input_is_bounded() {
+        let mut s = state();
+        update(&mut s, UiAction::OpenRichBuilder);
+        let Some(Overlay::RichBuilder(builder)) = s.overlays.last_mut() else {
+            panic!("expected rich-rule builder");
+        };
+        builder.buffer = "x".repeat(MAX_INTERACTIVE_INPUT_BYTES);
+
+        update(&mut s, UiAction::RichBuilderInput('x'));
+
+        let Some(Overlay::RichBuilder(builder)) = s.overlays.last() else {
+            panic!("expected rich-rule builder");
+        };
+        assert_eq!(builder.buffer.len(), MAX_INTERACTIVE_INPUT_BYTES);
+        assert!(s.toasts.back().is_some_and(|toast| {
+            toast.kind == ToastKind::Warning && toast.text.contains("input limit")
+        }));
+    }
+
+    #[test]
+    fn oversized_prefilled_form_value_is_rejected() {
+        let mut s = state();
+
+        update(
+            &mut s,
+            UiAction::OpenFormPrefilled(
+                FormKind::AddRichRule,
+                "x".repeat(MAX_INTERACTIVE_INPUT_BYTES + 1),
+            ),
+        );
+
+        assert!(s.overlays.is_empty());
+        assert!(s.toasts.back().is_some_and(|toast| {
+            toast.kind == ToastKind::Warning && toast.text.contains("prefilled value")
+        }));
     }
 
     #[test]

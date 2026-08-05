@@ -574,6 +574,12 @@ under <code>~/.local/state/fwdeck/</code> with its exact invocations. It is an
 <em>advisory, append-only</em> record (files are <code>0600</code>), not a
 cryptographically tamper-evident log — treat it as an operational history, and
 ship it to a central log store if you need integrity guarantees.</li>
+<li><strong>Single mutation owner</strong> — an OS-backed lock permits only one
+writer at a time and releases ownership automatically when that process exits.
+Read-only sessions do not claim the mutation lock.</li>
+<li><strong>Bounded inputs and probes</strong> — interactive mutation fields have
+an explicit byte cap, and external probes such as nftables counters run behind
+a hard timeout.</li>
 <li><strong>Read-only mode</strong> — <code>--read-only</code> disables mutations
 in the engine, not just the UI.</li>
 </ul>

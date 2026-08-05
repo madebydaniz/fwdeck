@@ -223,6 +223,7 @@ footer a:hover{color:var(--fg)}
       <li><strong>SSH awareness</strong> — FWDeck knows which interface your session uses and warns precisely when a change targets its zone.</li>
       <li><strong>Honest partial failures</strong> — runtime-applied / permanent-failed is reported as exactly that, with per-step details and a rollback hint.</li>
       <li><strong>Audit trail</strong> — every applied operation recorded as JSONL with its exact invocations.</li>
+      <li><strong>Single mutation owner</strong> — an OS-backed lock prevents concurrent writers and is released automatically if FWDeck exits.</li>
       <li><strong>Read-only mode</strong> — <code>--read-only</code> disables mutations in the engine, not just the buttons.</li>
       <li><strong>Offline mode</strong> — fix the permanent config from rescue/chroot with <code>--offline</code>, no daemon needed.</li>
     </ul>
