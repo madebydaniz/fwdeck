@@ -28,7 +28,6 @@ use tokio::sync::mpsc;
 use crate::application::api::{EngineEvent, EngineHandle, EngineRequest};
 use crate::application::ports::FirewallError;
 use crate::config::Config;
-use crate::domain::RefreshObservation;
 use crate::error::AppError;
 use std::ops::ControlFlow;
 
@@ -103,12 +102,9 @@ async fn event_loop(
                 Some(engine_event_action(event))
             } else {
                 engine_alive = false;
-                Some(UiAction::RefreshCompleted {
-                    result: Err(FirewallError::Process(
-                        "engine task stopped unexpectedly".to_owned(),
-                    )),
-                    observation: RefreshObservation::total_only(Duration::ZERO),
-                })
+                Some(UiAction::EngineStopped(FirewallError::Process(
+                    "engine task stopped unexpectedly".to_owned(),
+                )))
             },
             received = logs.recv_many(&mut log_batch, 64), if logs_alive => {
                 if received == 0 {
@@ -157,13 +153,24 @@ async fn event_loop(
 /// Maps an engine event to the UI action that handles it.
 fn engine_event_action(event: EngineEvent) -> UiAction {
     match event {
-        EngineEvent::RefreshStarted => UiAction::RefreshStarted,
+        EngineEvent::RefreshStarted { id, trigger } => UiAction::RefreshStarted { id, trigger },
         EngineEvent::RefreshFinished {
+            schedule,
             result,
             observation,
         } => UiAction::RefreshCompleted {
+            schedule,
             result,
             observation,
+        },
+        EngineEvent::RefreshCancelled {
+            schedule,
+            reason,
+            elapsed,
+        } => UiAction::RefreshCancelled {
+            schedule,
+            reason,
+            elapsed,
         },
         EngineEvent::OperationFinished(result) => UiAction::OperationFinished(result),
         EngineEvent::PlanFinished { applied, remaining } => {
@@ -217,7 +224,7 @@ async fn execute_effect(
         Effect::Quit => return ControlFlow::Break(()),
         Effect::Refresh => {
             // A full queue already guarantees a refresh is coming.
-            let _ = engine.requests.try_send(EngineRequest::Refresh);
+            let _ = engine.requests.try_send(EngineRequest::ManualRefresh);
         }
         Effect::Apply(request) => {
             // Reserving-send drains events while it waits, so a momentarily full

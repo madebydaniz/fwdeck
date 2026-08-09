@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -13,11 +14,13 @@ use crate::domain::FirewallSnapshot;
 
 use super::api::{
     EngineEvent, EngineRequest, MutationPlan, MutationRequest, OperationResult,
-    RollbackRegistration,
+    RefreshCancellationReason, RefreshScheduleObservation, RefreshTrigger, RollbackRegistration,
 };
 use super::ports::{
-    FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId, StepReport,
+    FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId, SnapshotRead,
+    StepReport,
 };
+use super::refresh_scheduler::{RefreshCompletion, RefreshDemand, RefreshScheduler, RefreshStart};
 
 /// Process-wide operation counter. The id it mints is logged via tracing and
 /// written to the audit line for the same operation, so `fwdeck.log` and
@@ -30,6 +33,16 @@ pub fn next_op_id() -> u64 {
     OP_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+enum OrdinaryRefreshOutcome {
+    Completed(SnapshotRead),
+    Preempted {
+        request: EngineRequest,
+        schedule: RefreshScheduleObservation,
+        elapsed: Duration,
+    },
+    RequestsClosed,
+}
+
 pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
     backend: B,
     rollback_guard: G,
@@ -39,66 +52,200 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
     read_only: bool,
     rollback_timeout: Duration,
 ) {
-    let mut interval = tokio::time::interval(refresh_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut scheduler = RefreshScheduler::new();
+    let timer = tokio::time::sleep(refresh_interval);
+    tokio::pin!(timer);
+    let mut next_trigger = Some(RefreshTrigger::Initial);
+    let mut pending_mutation = None;
+
+    loop {
+        if let Some(request) = pending_mutation.take() {
+            if execute_request(
+                &backend,
+                &rollback_guard,
+                &events,
+                request,
+                read_only,
+                rollback_timeout,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+
+            if run_post_mutation_refresh(&backend, &events, &mut scheduler)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            timer.as_mut().reset(Instant::now() + refresh_interval);
+            continue;
+        }
+
+        let trigger = if let Some(trigger) = next_trigger.take() {
+            trigger
+        } else {
+            tokio::select! {
+                request = requests.recv() => match request {
+                    None => return, // UI dropped the handle: shut down
+                    Some(EngineRequest::ManualRefresh) => {
+                        if scheduler.record_manual() != RefreshDemand::StartNow {
+                            tracing::error!("idle scheduler rejected manual refresh");
+                            return;
+                        }
+                        RefreshTrigger::Manual
+                    }
+                    Some(request) => {
+                        pending_mutation = Some(request);
+                        continue;
+                    }
+                },
+                () = &mut timer => {
+                    if scheduler.record_periodic() != RefreshDemand::StartNow {
+                        tracing::error!("idle scheduler rejected periodic refresh");
+                        return;
+                    }
+                    RefreshTrigger::Periodic
+                }
+            }
+        };
+
+        let Some(start) = scheduler.start(trigger) else {
+            tracing::error!(?trigger, "ordinary refresh could not start");
+            return;
+        };
+        if send_refresh_started(&events, start).await.is_err() {
+            return;
+        }
+
+        match drive_ordinary_refresh(&backend, &mut requests, &mut scheduler, start).await {
+            OrdinaryRefreshOutcome::Completed(read) => {
+                let Some(completion) = scheduler.finish(start.id) else {
+                    tracing::error!(refresh_id = start.id.get(), "refresh completion was lost");
+                    return;
+                };
+                let trailing_manual = completion.trailing_manual;
+                if send_refresh_finished(&events, completion, read)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if trailing_manual {
+                    next_trigger = Some(RefreshTrigger::Manual);
+                } else {
+                    timer.as_mut().reset(Instant::now() + refresh_interval);
+                }
+            }
+            OrdinaryRefreshOutcome::Preempted {
+                request,
+                schedule,
+                elapsed,
+            } => {
+                if send_refresh_cancelled(&events, schedule, elapsed)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                pending_mutation = Some(request);
+            }
+            OrdinaryRefreshOutcome::RequestsClosed => return,
+        }
+    }
+}
+
+async fn drive_ordinary_refresh<B: FirewallBackend>(
+    backend: &B,
+    requests: &mut mpsc::Receiver<EngineRequest>,
+    scheduler: &mut RefreshScheduler,
+    _start: RefreshStart,
+) -> OrdinaryRefreshOutcome {
+    let started = Instant::now();
+    let snapshot = backend.snapshot_observed();
+    tokio::pin!(snapshot);
 
     loop {
         tokio::select! {
+            read = &mut snapshot => return OrdinaryRefreshOutcome::Completed(read),
             request = requests.recv() => match request {
-                None => break, // UI dropped the handle: shut down
-                Some(EngineRequest::Refresh) => {
-                    // Coalesce queued refreshes into one pass. Apply requests
-                    // are never coalesced away: try_recv only drops Refresh.
-                    while let Ok(queued) = requests.try_recv() {
-                        if execute_request(
-                            &backend,
-                            &rollback_guard,
-                            &events,
-                            queued,
-                            read_only,
-                            rollback_timeout,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    interval.reset();
-                    if refresh(&backend, &events).await.is_err() {
-                        break;
-                    }
+                None => return OrdinaryRefreshOutcome::RequestsClosed,
+                Some(EngineRequest::ManualRefresh) => {
+                    let _ = scheduler.record_manual();
                 }
                 Some(request) => {
-                    if execute_request(
-                        &backend,
-                        &rollback_guard,
-                        &events,
+                    let Some(schedule) = scheduler.cancel_for_mutation() else {
+                        tracing::error!("ordinary refresh was not preemptible");
+                        return OrdinaryRefreshOutcome::RequestsClosed;
+                    };
+                    return OrdinaryRefreshOutcome::Preempted {
                         request,
-                        read_only,
-                        rollback_timeout,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
-                    }
-                    // One post-mutation refresh even for a failure or a whole
-                    // plan: the daemon may have changed before reporting it.
-                    interval.reset();
-                    if refresh(&backend, &events).await.is_err() {
-                        break;
-                    }
-                }
-            },
-            // First tick fires immediately: the initial refresh needs no request.
-            _ = interval.tick() => {
-                if refresh(&backend, &events).await.is_err() {
-                    break;
+                        schedule,
+                        elapsed: started.elapsed(),
+                    };
                 }
             }
         }
     }
+}
+
+async fn drive_mandatory_refresh<B: FirewallBackend>(
+    backend: &B,
+    scheduler: &mut RefreshScheduler,
+    start: RefreshStart,
+) -> Option<(SnapshotRead, RefreshCompletion)> {
+    let read = backend.snapshot_observed().await;
+    let completion = scheduler.finish(start.id)?;
+    Some((read, completion))
+}
+
+async fn run_post_mutation_refresh<B: FirewallBackend>(
+    backend: &B,
+    events: &mpsc::Sender<EngineEvent>,
+    scheduler: &mut RefreshScheduler,
+) -> Result<(), ()> {
+    // The mandatory read is awaited directly, never selected against later
+    // requests, so the mutation postcondition is always observed.
+    let Some(start) = scheduler.start(RefreshTrigger::PostMutation) else {
+        tracing::error!("post-mutation refresh could not start");
+        return Err(());
+    };
+    send_refresh_started(events, start).await?;
+    let Some((read, completion)) = drive_mandatory_refresh(backend, scheduler, start).await else {
+        tracing::error!("post-mutation refresh lifecycle was lost");
+        return Err(());
+    };
+    send_refresh_finished(events, completion, read).await
+}
+
+async fn send_refresh_started(
+    events: &mpsc::Sender<EngineEvent>,
+    start: RefreshStart,
+) -> Result<(), ()> {
+    events
+        .send(EngineEvent::RefreshStarted {
+            id: start.id,
+            trigger: start.trigger,
+        })
+        .await
+        .map_err(|_| ())
+}
+
+async fn send_refresh_cancelled(
+    events: &mpsc::Sender<EngineEvent>,
+    schedule: RefreshScheduleObservation,
+    elapsed: Duration,
+) -> Result<(), ()> {
+    events
+        .send(EngineEvent::RefreshCancelled {
+            schedule,
+            reason: RefreshCancellationReason::MutationPreempted,
+            elapsed,
+        })
+        .await
+        .map_err(|_| ())
 }
 
 async fn execute_request<B: FirewallBackend, G: RollbackGuard>(
@@ -110,7 +257,7 @@ async fn execute_request<B: FirewallBackend, G: RollbackGuard>(
     rollback_timeout: Duration,
 ) -> Result<(), ()> {
     match request {
-        EngineRequest::Refresh => Ok(()),
+        EngineRequest::ManualRefresh => Ok(()),
         EngineRequest::Apply(request) => {
             apply(
                 backend,
@@ -530,15 +677,11 @@ fn append_warning(current: &mut Option<String>, warning: String) {
 }
 
 /// Returns `Err(())` when the event channel is closed (UI is gone).
-async fn refresh<B: FirewallBackend>(
-    backend: &B,
+async fn send_refresh_finished(
     events: &mpsc::Sender<EngineEvent>,
+    completion: RefreshCompletion,
+    read: SnapshotRead,
 ) -> Result<(), ()> {
-    events
-        .send(EngineEvent::RefreshStarted)
-        .await
-        .map_err(|_| ())?;
-    let read = backend.snapshot_observed().await;
     let result = read.result.map(Arc::new);
     let observation = read.observation;
     match &result {
@@ -557,6 +700,7 @@ async fn refresh<B: FirewallBackend>(
     }
     events
         .send(EngineEvent::RefreshFinished {
+            schedule: completion.schedule,
             result,
             observation,
         })
@@ -569,11 +713,13 @@ async fn refresh<B: FirewallBackend>(
 mod tests {
     use super::*;
     use crate::application::ports::{
-        FirewallBackend, FirewallError, RollbackGuardError, RollbackGuardId,
+        FirewallBackend, FirewallError, RollbackGuardError, RollbackGuardId, SnapshotRead,
     };
+    use crate::application::{RefreshCancellationReason, RefreshTrigger};
     use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus, mock};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use tokio::sync::Semaphore;
 
     #[derive(Default)]
     struct TestRollbackGuard;
@@ -686,6 +832,92 @@ mod tests {
         }
     }
 
+    struct ActiveSnapshotGuard {
+        active: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ActiveSnapshotGuard {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledSnapshotBackend {
+        active_snapshots: Arc<AtomicUsize>,
+        max_active_snapshots: Arc<AtomicUsize>,
+        snapshot_calls: Arc<AtomicUsize>,
+        snapshot_started: Arc<Semaphore>,
+        snapshot_release: Arc<Semaphore>,
+        apply_observed_zero_active: Arc<AtomicBool>,
+    }
+
+    impl ControlledSnapshotBackend {
+        fn new() -> Self {
+            Self {
+                active_snapshots: Arc::new(AtomicUsize::new(0)),
+                max_active_snapshots: Arc::new(AtomicUsize::new(0)),
+                snapshot_calls: Arc::new(AtomicUsize::new(0)),
+                snapshot_started: Arc::new(Semaphore::new(0)),
+                snapshot_release: Arc::new(Semaphore::new(0)),
+                apply_observed_zero_active: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        async fn wait_for_snapshot_start(&self) {
+            self.snapshot_started.acquire().await.unwrap().forget();
+        }
+
+        fn release_snapshot(&self) {
+            self.snapshot_release.add_permits(1);
+        }
+    }
+
+    impl FirewallBackend for ControlledSnapshotBackend {
+        async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
+            Err(FirewallError::DaemonNotRunning)
+        }
+
+        async fn snapshot(&self) -> Result<FirewallSnapshot, FirewallError> {
+            mock::sample().map_err(|error| FirewallError::Parse(error.to_string()))
+        }
+
+        fn snapshot_observed(&self) -> impl std::future::Future<Output = SnapshotRead> + Send {
+            let active = Arc::clone(&self.active_snapshots);
+            let max_active = Arc::clone(&self.max_active_snapshots);
+            let calls = Arc::clone(&self.snapshot_calls);
+            let started = Arc::clone(&self.snapshot_started);
+            let release = Arc::clone(&self.snapshot_release);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(active_now, Ordering::SeqCst);
+                let _guard = ActiveSnapshotGuard { active };
+                started.add_permits(1);
+                release.acquire().await.unwrap().forget();
+                SnapshotRead {
+                    result: mock::sample().map_err(|error| FirewallError::Parse(error.to_string())),
+                    observation: crate::domain::RefreshObservation::total_only(Duration::ZERO),
+                }
+            }
+        }
+
+        async fn apply(&self, operation: &FirewallOperation) -> OperationOutcome {
+            self.apply_observed_zero_active.store(
+                self.active_snapshots.load(Ordering::SeqCst) == 0,
+                Ordering::SeqCst,
+            );
+            OperationOutcome::Applied {
+                operation: operation.clone(),
+                steps: vec![StepReport {
+                    target: "runtime",
+                    invocation: vec!["--fake".to_owned()],
+                    result: Ok(()),
+                }],
+            }
+        }
+    }
+
     struct LargeBackend;
 
     impl FirewallBackend for LargeBackend {
@@ -767,13 +999,18 @@ mod tests {
 
         assert!(matches!(
             event_rx.recv().await.unwrap(),
-            EngineEvent::RefreshStarted
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
         ));
         match event_rx.recv().await.unwrap() {
             EngineEvent::RefreshFinished {
+                schedule,
                 result: Ok(snapshot),
                 observation,
             } => {
+                assert_eq!(schedule.trigger, RefreshTrigger::Initial);
                 assert_eq!(snapshot.default_zone.as_str(), "public");
                 assert_eq!(observation.process_count, None);
                 assert!(observation.sections.is_empty());
@@ -843,7 +1080,10 @@ mod tests {
         // post-mutation refresh follows automatically
         assert!(matches!(
             event_rx.recv().await.unwrap(),
-            EngineEvent::RefreshStarted
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
         ));
     }
 
@@ -1219,6 +1459,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_drops_ordinary_refresh_before_apply() {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            request_rx,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        request_tx
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled {
+                reason: RefreshCancellationReason::MutationPreempted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(_)
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+
+        assert!(backend.apply_observed_zero_active.load(Ordering::SeqCst));
+        assert_eq!(backend.max_active_snapshots.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_burst_produces_one_trailing_refresh() {
+        const BURST: usize = 100;
+        let (request_tx, request_rx) = mpsc::channel(BURST + 1);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            request_rx,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        for _ in 0..BURST {
+            request_tx.send(EngineRequest::ManualRefresh).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while request_tx.capacity() != BURST + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(_),
+                ..
+            } if schedule.trigger == RefreshTrigger::Initial
+                && schedule.merged_manual_requests == BURST as u64
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Manual,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(_),
+                ..
+            } if schedule.trigger == RefreshTrigger::Manual
+                && schedule.merged_manual_requests == 0
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(backend.snapshot_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn periodic_refresh_uses_fixed_delay_after_completion() {
+        let (_request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            request_rx,
+            event_tx,
+            Duration::from_secs(10),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        tokio::time::advance(Duration::from_secs(25)).await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished { result: Ok(_), .. }
+        ));
+
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Periodic,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn plan_halts_on_first_failure_and_returns_the_remainder() {
         let (request_tx, request_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1555,12 +1960,12 @@ mod tests {
 
         // A burst with refreshes on both sides of an Apply. Queued refreshes may
         // coalesce into one; the Apply must survive and execute exactly once.
-        request_tx.send(EngineRequest::Refresh).await.unwrap();
+        request_tx.send(EngineRequest::ManualRefresh).await.unwrap();
         request_tx
             .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
             .await
             .unwrap();
-        request_tx.send(EngineRequest::Refresh).await.unwrap();
+        request_tx.send(EngineRequest::ManualRefresh).await.unwrap();
 
         // Bounded drain: a coalescing bug that swallowed the Apply would let this
         // loop finish without ever seeing the outcome.
@@ -1598,10 +2003,13 @@ mod tests {
         event_rx.recv().await.unwrap();
         event_rx.recv().await.unwrap();
 
-        request_tx.send(EngineRequest::Refresh).await.unwrap();
+        request_tx.send(EngineRequest::ManualRefresh).await.unwrap();
         assert!(matches!(
             event_rx.recv().await.unwrap(),
-            EngineEvent::RefreshStarted
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Manual,
+                ..
+            }
         ));
         assert!(matches!(
             event_rx.recv().await.unwrap(),
@@ -1627,7 +2035,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(2), async {
             assert!(matches!(
                 event_rx.recv().await.unwrap(),
-                EngineEvent::RefreshStarted
+                EngineEvent::RefreshStarted { .. }
             ));
             event_rx.recv().await.unwrap()
         })

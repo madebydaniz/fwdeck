@@ -131,8 +131,8 @@ pub enum RefreshCancellationReason {
 /// UI → engine commands. Sent over the bounded request channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineRequest {
-    /// Take a fresh snapshot now. Queued refreshes are coalesced into one pass.
-    Refresh,
+    /// Take a fresh snapshot now. Concurrent manual demand is coalesced.
+    ManualRefresh,
     /// Verify the reviewed snapshot is still current, execute one operation
     /// (runtime step first, then permanent — ADR-3), then refresh.
     Apply(MutationRequest),
@@ -156,15 +156,31 @@ pub enum EngineRequest {
 /// Engine → UI notifications. Delivered in order over the bounded event channel.
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    /// A snapshot pass began — lets the UI show a spinner immediately.
-    RefreshStarted,
+    /// A snapshot pass began — lets the UI track the exact active lifecycle.
+    RefreshStarted {
+        /// Monotonic process-local lifecycle identity.
+        id: RefreshId,
+        /// Demand that started this refresh.
+        trigger: RefreshTrigger,
+    },
     /// The snapshot pass ended. `Arc` because the UI keeps the previous
     /// snapshot alive while diffing against the new one.
     RefreshFinished {
+        /// Scheduler metadata for the completed lifecycle.
+        schedule: RefreshScheduleObservation,
         /// Fresh snapshot, or the categorized backend failure.
         result: Result<Arc<FirewallSnapshot>, FirewallError>,
         /// Exact telemetry for this snapshot attempt.
         observation: RefreshObservation,
+    },
+    /// An ordinary snapshot read was dropped so a queued mutation can run.
+    RefreshCancelled {
+        /// Scheduler metadata accumulated before cancellation.
+        schedule: RefreshScheduleObservation,
+        /// Why the lifecycle was cancelled.
+        reason: RefreshCancellationReason,
+        /// Deterministic Tokio-clock duration before cancellation.
+        elapsed: Duration,
     },
     /// One operation completed with its honest [`OperationOutcome`]
     /// (applied / partially applied / failed — never a swallowed partial),
