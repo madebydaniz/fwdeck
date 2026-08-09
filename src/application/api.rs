@@ -85,6 +85,49 @@ pub struct OperationResult {
     pub completed_rollback: Option<RollbackGuardId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RefreshId(u64);
+
+impl RefreshId {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshTrigger {
+    Initial,
+    Periodic,
+    Manual,
+    PostMutation,
+}
+
+impl RefreshTrigger {
+    #[must_use]
+    pub const fn is_preemptible(self) -> bool {
+        !matches!(self, Self::PostMutation)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshScheduleObservation {
+    pub id: RefreshId,
+    pub trigger: RefreshTrigger,
+    pub merged_manual_requests: u64,
+    pub coalesced_periodic_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshCancellationReason {
+    MutationPreempted,
+}
+
 /// UI → engine commands. Sent over the bounded request channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineRequest {
@@ -172,5 +215,27 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
     EngineHandle {
         requests: request_tx,
         events: event_rx,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_schedule_observation_preserves_identity_trigger_and_counts() {
+        let observation = RefreshScheduleObservation {
+            id: RefreshId::new(7),
+            trigger: RefreshTrigger::Manual,
+            merged_manual_requests: 4,
+            coalesced_periodic_ticks: 3,
+        };
+
+        assert_eq!(observation.id.get(), 7);
+        assert_eq!(observation.trigger, RefreshTrigger::Manual);
+        assert_eq!(observation.merged_manual_requests, 4);
+        assert_eq!(observation.coalesced_periodic_ticks, 3);
+        assert!(RefreshTrigger::Initial.is_preemptible());
+        assert!(!RefreshTrigger::PostMutation.is_preemptible());
     }
 }
