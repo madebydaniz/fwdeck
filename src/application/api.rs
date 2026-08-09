@@ -129,6 +129,7 @@ pub struct RefreshScheduleObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshCancellationReason {
     MutationPreempted,
+    RollbackPreempted,
 }
 
 /// UI → engine commands. Sent over the bounded request channel.
@@ -176,7 +177,7 @@ pub enum EngineEvent {
         /// Exact telemetry for this snapshot attempt.
         observation: RefreshObservation,
     },
-    /// An ordinary snapshot read was dropped so a queued mutation can run.
+    /// A snapshot read was dropped so a queued mutation or safety rollback can run.
     RefreshCancelled {
         /// Scheduler metadata accumulated before cancellation.
         schedule: RefreshScheduleObservation,

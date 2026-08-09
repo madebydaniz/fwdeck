@@ -22,12 +22,15 @@ already responding slowly.
 - Keep exactly one snapshot read active at a time.
 - Let a confirmed mutation or rollback cancel an ordinary in-progress refresh,
   execute with priority, and then complete one mandatory post-mutation refresh.
+- Let a safety rollback also cancel a blocked mandatory reconciliation, execute
+  immediately, and restart mandatory reconciliation afterward.
 - Merge any number of manual requests received during an ordinary active
   refresh into exactly one trailing manual refresh.
 - Drop periodic demand while a refresh is active instead of building a backlog.
 - Use fixed-delay periodic scheduling, measured from the end of a completed
   refresh attempt, so slow reads cannot cause back-to-back polling.
-- Preserve FIFO ordering and reliable delivery for mutations and rollbacks.
+- Preserve FIFO ordering and reliable delivery for normal mutations; a safety
+  rollback may overtake queued normal work but still executes exactly once.
 - Measure refresh triggers, cancellations, and coalescing with typed lifecycle
   metadata and structured tracing.
 - Preserve stale snapshot behavior, honest backend errors, bounded channels,
@@ -36,8 +39,8 @@ already responding slowly.
 ## Non-goals
 
 - Concurrent snapshot reads or concurrent read/mutation access to a backend.
-- Cancellation, reordering, or coalescing of a mutation, mutation plan, or
-  rollback request.
+- Cancellation or coalescing of a mutation, mutation plan, or rollback request;
+  only a safety rollback may reorder ahead of queued normal work.
 - Changing the snapshot schema, backend fetch algorithms, heavy-section cache,
   refresh interval configuration, or default interval.
 - Selected-zone priority or lazy service/policy detail loading; those remain a
@@ -93,9 +96,12 @@ Refresh triggers are application-layer values:
   may have changed or invalidated observed state.
 
 `Initial`, `Periodic`, and `Manual` refreshes are preemptible. A
-`PostMutation` refresh is mandatory and non-preemptible: later mutations remain
-FIFO-queued until it completes. Without this exception, a burst of mutations
-could repeatedly cancel reconciliation and violate the guarantee that every
+`PostMutation` refresh is mandatory and non-preemptible by normal mutations:
+later apply and apply-plan requests remain FIFO-queued until it completes. A
+rollback is the explicit safety exception. It drops a blocked reconciliation,
+executes immediately and exactly once, and then starts a fresh mandatory
+reconciliation. Without the normal-mutation rule, a burst of mutations could
+repeatedly cancel reconciliation and violate the guarantee that every normal
 mutation is followed by one complete fresh snapshot.
 
 ### Engine ownership
@@ -107,15 +113,18 @@ The engine never polls a snapshot and a mutation future concurrently.
 
 Rename the UI-originated `EngineRequest::Refresh` variant to
 `EngineRequest::ManualRefresh`. Periodic demand remains internal to the engine.
-All other engine requests retain FIFO order and are never discarded.
+Normal mutation requests retain FIFO order and are never discarded. Rollback
+is never discarded and may overtake queued normal work only as the documented
+safety exception.
 
 The engine maintains a small local FIFO for requests it has already removed
 from the bounded receiver. Immediately before a post-mutation refresh it may
 drain currently available requests into that FIFO. Manual requests already
-present are absorbed by the newer post-mutation snapshot; mutation and rollback
-requests are retained in their original order. Manual requests arriving after
-the post-mutation snapshot starts follow the normal rule and produce one
-trailing manual refresh.
+present are absorbed by the newer post-mutation snapshot; normal mutation
+requests retain their original order. A rollback already observed by the
+mandatory driver may overtake that normal work as the safety exception. Manual
+requests arriving after the post-mutation snapshot starts follow the normal
+rule and produce one trailing manual refresh.
 
 ### Fixed-delay timer
 
@@ -153,7 +162,8 @@ mechanism because scheduling is based on one explicit next deadline.
 4. Existing operation or plan events are emitted unchanged.
 5. Manual demand already queued before the post-mutation read is absorbed, and
    one mandatory `PostMutation` refresh runs to completion.
-6. Later mutations wait in FIFO order until that mandatory refresh completes.
+6. Later normal mutations wait in FIFO order until that mandatory refresh
+   completes. A rollback may cancel it, execute once, and restart reconciliation.
 
 Every engine request that currently receives a post-request refresh keeps that
 behavior, including validation failure, read-only rejection, partial outcome,
@@ -225,7 +235,8 @@ tests and logs without adding permanent header noise.
   the categorized error to the operator.
 - Cancellation is a scheduler outcome, never a backend failure.
 - A closed event channel stops the engine cleanly, as it does today.
-- Mutation, plan, and rollback requests continue using reliable bounded sends.
+- Mutation, plan, and rollback requests continue using reliable bounded sends;
+  an observed rollback receives safety priority inside mandatory reconciliation.
 - Manual refresh switches to the same deadlock-safe reserving send; engine
   events are drained while the UI waits for capacity.
 - The scheduler stores only booleans, counters, one active lifecycle, and a
@@ -244,7 +255,9 @@ Cover every state transition without Tokio time:
 - a burst of 100 manual requests still creates exactly one trailing refresh;
 - periodic demand during an active refresh creates no trailing work;
 - a mutation cancels each ordinary trigger;
-- a post-mutation refresh refuses cancellation and leaves the mutation queued;
+- a post-mutation refresh refuses normal-mutation cancellation and leaves that
+  mutation queued;
+- a rollback cancels a post-mutation refresh and allows fresh reconciliation;
 - manual demand queued before post-mutation refresh is absorbed;
 - manual demand received after post-mutation refresh starts creates one trailing
   refresh; and
@@ -259,7 +272,8 @@ barriers and a future drop guard. Assert that:
 - the active snapshot is dropped before `apply` begins;
 - event ordering is cancel, operation outcome, post-mutation start, and
   post-mutation finish;
-- mutations and rollbacks retain FIFO order and execute exactly once;
+- normal mutations retain FIFO order and execute exactly once while a safety
+  rollback may overtake them and still executes exactly once;
 - a mandatory post-mutation refresh cannot be starved by queued mutations;
 - a slow snapshot does not create an immediate periodic refresh storm;
 - a manual burst has a bounded snapshot-call count; and
@@ -297,15 +311,19 @@ No new configuration key, migration, snapshot format, or CLI flag is required.
 - Exactly one backend snapshot is active at any time.
 - A confirmed mutation or rollback cancels an ordinary blocked refresh and
   begins only after the refresh future has been dropped.
-- Every engine mutation request is followed by one complete, non-preemptible
-  post-mutation refresh before the next mutation executes.
+- A rollback may also cancel a blocked post-mutation refresh, begins only after
+  that future has been dropped, and is followed by fresh reconciliation.
+- Every normal engine mutation request is followed by one complete
+  post-mutation refresh before the next normal mutation executes, except that a
+  safety rollback may overtake it and restart the reconciliation.
 - Manual bursts during an active refresh produce exactly one trailing manual
   refresh; periodic demand produces none.
 - A slow refresh cannot generate an immediate fixed-rate refresh loop.
 - Refresh cancellation never becomes a backend error, toast, or loss of stale
   snapshot data.
-- Mutation and rollback requests remain reliable, FIFO, and exactly-once at the
-  engine boundary.
+- Normal mutations remain reliable, FIFO, and exactly-once at the engine
+  boundary; rollback remains reliable and exactly-once while retaining its
+  documented safety priority.
 - Scheduling lifecycle records expose trigger, identity, elapsed cancellation
   time, and aggregate coalescing counts.
 - The scheduler reaches at least 95% line coverage and engine coverage remains

@@ -44,7 +44,7 @@
 - Modify: `src/application/mod.rs:5-14`
 - Test: `src/application/api.rs`
 
-- [ ] **Step 1: Write the failing value-contract test.**
+- [x] **Step 1: Write the failing value-contract test.**
 
 Add a test module at the end of `api.rs`:
 
@@ -72,7 +72,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run RED.**
+- [x] **Step 2: Run RED.**
 
 Run:
 
@@ -82,7 +82,7 @@ rtk cargo test --locked application::api::tests
 
 Expected: compilation fails because the refresh lifecycle types do not exist.
 
-- [ ] **Step 3: Add the minimal application-layer types.**
+- [x] **Step 3: Add the minimal application-layer types.**
 
 Add above `EngineRequest`:
 
@@ -133,7 +133,7 @@ pub enum RefreshCancellationReason {
 
 Re-export all four types from `application::mod` beside the existing engine API types. Keep them in the application layer; do not add them to `domain::observation`.
 
-- [ ] **Step 4: Run GREEN and lint the touched target.**
+- [x] **Step 4: Run GREEN and lint the touched target.**
 
 ```bash
 rtk cargo test --locked application::api::tests
@@ -142,7 +142,7 @@ rtk cargo clippy --locked --lib -- -D warnings
 
 Expected: the new unit test passes and Clippy reports no warnings.
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 rtk git add src/application/api.rs src/application/mod.rs
@@ -156,7 +156,7 @@ rtk git commit -m "feat(refresh): define scheduler lifecycle metadata"
 - Create: `src/application/refresh_scheduler.rs`
 - Modify: `src/application/mod.rs:1-8`
 
-- [ ] **Step 1: Create the scheduler test module first.**
+- [x] **Step 1: Create the scheduler test module first.**
 
 Cover these exact transitions:
 
@@ -217,7 +217,7 @@ mod tests {
 
 Also add focused tests for idle `StartNow`, mismatched finish identity, monotonic IDs, and attempting to start while active.
 
-- [ ] **Step 2: Run RED.**
+- [x] **Step 2: Run RED.**
 
 ```bash
 rtk cargo test --locked application::refresh_scheduler::tests
@@ -225,7 +225,7 @@ rtk cargo test --locked application::refresh_scheduler::tests
 
 Expected: compilation fails because the module and scheduler types do not exist.
 
-- [ ] **Step 3: Implement only the pure state machine.**
+- [x] **Step 3: Implement only the pure state machine.**
 
 Use this complete pure implementation, followed by the tests from Step 1:
 
@@ -368,7 +368,7 @@ Rules:
 - `cancel_for_mutation` takes only a preemptible active lifecycle and clears its trailing flag.
 - `finish` ignores a mismatched ID without changing state.
 
-- [ ] **Step 4: Run GREEN, format, and lint.**
+- [x] **Step 4: Run GREEN, format, and lint.**
 
 ```bash
 rtk cargo test --locked application::refresh_scheduler::tests
@@ -376,7 +376,7 @@ rtk cargo fmt --all -- --check
 rtk cargo clippy --locked --lib -- -D warnings
 ```
 
-- [ ] **Step 5: Commit.**
+- [x] **Step 5: Commit.**
 
 ```bash
 rtk git add src/application/mod.rs src/application/refresh_scheduler.rs
@@ -394,7 +394,7 @@ rtk git commit -m "feat(refresh): add pure scheduling policy"
 - Modify: `src/ui/mod.rs:90-175`
 - Modify: `src/ui/update/mod.rs:575-635`
 
-- [ ] **Step 1: Add deterministic engine tests and a cancellation-aware fake backend.**
+- [x] **Step 1: Add deterministic engine tests and a cancellation-aware fake backend.**
 
 Add Tokio's test-only clock support without adding it to release builds:
 
@@ -426,7 +426,7 @@ assert!(matches!(event_rx.recv().await.unwrap(), EngineEvent::RefreshStarted {
 
 It must also assert `active_snapshots == 0` when `apply` begins and `max_active_snapshots == 1`.
 
-- [ ] **Step 2: Run RED.**
+- [x] **Step 2: Run RED.**
 
 ```bash
 rtk cargo test --locked application::engine::tests::mutation_drops_ordinary_refresh_before_apply
@@ -436,7 +436,7 @@ rtk cargo test --locked application::engine::tests::periodic_refresh_uses_fixed_
 
 Expected: compilation fails because lifecycle events and the cancellable driver do not exist.
 
-- [ ] **Step 3: Extend the engine protocol.**
+- [x] **Step 3: Extend the engine protocol.**
 
 Rename `EngineRequest::Refresh` to `EngineRequest::ManualRefresh`. Replace the two refresh event variants with:
 
@@ -459,7 +459,7 @@ RefreshCancelled {
 
 Temporarily map the new fields through `UiAction`; the reducer may still use a boolean until Task 5, but cancellation must clear it without setting an error or replacing `last_refresh`.
 
-- [ ] **Step 4: Replace the fixed-rate `run` loop with an explicit driver.**
+- [x] **Step 4: Replace the fixed-rate `run` loop with an explicit driver.**
 
 Introduce private outcomes with no backend types exposed through the public API:
 
@@ -516,14 +516,14 @@ Replace `tokio::time::interval` with one resettable `tokio::time::Sleep`. Arm it
 Use `tokio::time::Instant` for cancellation elapsed time so paused-clock tests
 remain deterministic; keep backend `RefreshObservation` timing unchanged.
 
-- [ ] **Step 5: Preserve existing event semantics and update call sites.**
+- [x] **Step 5: Preserve existing event semantics and update call sites.**
 
 Update all engine tests to match structured variants. Keep `RefreshObservation`
 from the same `SnapshotRead` and keep the existing refresh success/failure logs
 compiling with the structured event fields. Emit the cancellation event here;
 Task 6 adds the final aggregate tracing records after behavior is green.
 
-- [ ] **Step 6: Run GREEN and the complete engine target.**
+- [x] **Step 6: Run GREEN and the complete engine target.**
 
 ```bash
 rtk cargo test --locked application::engine::tests
@@ -533,7 +533,7 @@ rtk cargo clippy --locked --lib -- -D warnings
 
 Expected: all engine tests pass; no mutation begins before the snapshot drop guard runs.
 
-- [ ] **Step 7: Commit.**
+- [x] **Step 7: Commit.**
 
 ```bash
 rtk git add Cargo.toml Cargo.lock src/application/api.rs src/application/engine.rs src/ui/action.rs src/ui/mod.rs src/ui/update/mod.rs
@@ -549,7 +549,7 @@ If `Cargo.lock` is byte-identical after adding the dev feature, do not stage it.
 - Modify: `src/application/api.rs:135-175`
 - Modify: `src/application/engine.rs:33-170,574-900,1538-1700`
 
-- [ ] **Step 1: Add the failing mandatory-refresh and load tests.**
+- [x] **Step 1: Add the failing mandatory-refresh and load tests.**
 
 Add the exact scenarios
 `queued_mutation_cannot_cancel_post_mutation_refresh`,
@@ -568,7 +568,7 @@ The load test sequence is:
 8. release exactly one mandatory post-mutation snapshot; and
 9. assert snapshot calls are bounded, maximum concurrency is one, and no immediate periodic start appears.
 
-- [ ] **Step 2: Run RED.**
+- [x] **Step 2: Run RED.**
 
 ```bash
 rtk cargo test --locked application::engine::tests::queued_mutation_cannot_cancel_post_mutation_refresh
@@ -578,7 +578,7 @@ rtk cargo test --locked application::engine::tests::blocked_refresh_manual_burst
 
 Expected: at least the mandatory/FIFO assertions fail until queued-request handling is explicit.
 
-- [ ] **Step 3: Add one bounded pending-request FIFO.**
+- [x] **Step 3: Add one bounded pending-request FIFO.**
 
 Define the channel capacities once in `api.rs`:
 
@@ -599,11 +599,11 @@ Immediately after executing a preempting request:
 
 After the mandatory refresh completes, consume the local FIFO before receiving newer channel items. If the local FIFO is full, stop draining; never create a second queue or grow it beyond 32. A manual request not yet observed remains in the bounded channel and may legitimately become one later trailing refresh.
 
-- [ ] **Step 4: Make the mandatory boundary explicit.**
+- [x] **Step 4: Make the mandatory boundary explicit.**
 
 `drive_mandatory_refresh` must not accept a request receiver. Its signature is the proof that no later request can cancel a post-mutation snapshot. Add a comment at the call site explaining that later mutations wait because each engine mutation needs one complete observed-state reconciliation.
 
-- [ ] **Step 5: Run GREEN and regression tests.**
+- [x] **Step 5: Run GREEN and regression tests.**
 
 ```bash
 rtk cargo test --locked application::engine::tests
@@ -612,7 +612,7 @@ rtk cargo test --locked --release performance_budget -- --test-threads=1
 
 Expected: the new load/FIFO tests pass and the large snapshot budget remains below two seconds.
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 
 ```bash
 rtk git add src/application/api.rs src/application/engine.rs
@@ -629,7 +629,7 @@ rtk git commit -m "fix(refresh): guarantee bounded post-mutation reconciliation"
 - Modify: `src/ui/mod.rs:90-230,505-590`
 - Modify: `src/ui/components.rs:220-235`
 
-- [ ] **Step 1: Add failing reducer and delivery tests.**
+- [x] **Step 1: Add failing reducer and delivery tests.**
 
 Add reducer tests named
 `stale_refresh_completion_cannot_replace_newer_lifecycle`,
@@ -640,7 +640,7 @@ The matching-cancellation test seeds `snapshot`, `last_refresh`, and `backend_er
 
 In `ui::mod` add an async test with a capacity-one request channel. Fill the channel, begin the manual refresh effect, drain the first request, and assert the waiting effect reliably sends `EngineRequest::ManualRefresh` rather than returning early.
 
-- [ ] **Step 2: Run RED.**
+- [x] **Step 2: Run RED.**
 
 ```bash
 rtk cargo test --locked ui::update::tests::stale_refresh_completion_cannot_replace_newer_lifecycle
@@ -648,7 +648,7 @@ rtk cargo test --locked ui::update::tests::matching_cancellation_clears_spinner_
 rtk cargo test --locked ui::tests::manual_refresh_waits_for_bounded_channel_capacity
 ```
 
-- [ ] **Step 3: Replace the boolean with refresh identity.**
+- [x] **Step 3: Replace the boolean with refresh identity.**
 
 In `UiState` replace:
 
@@ -689,7 +689,7 @@ UiAction::EngineStopped(error) => {
 }
 ```
 
-- [ ] **Step 4: Use the reliable send path for manual refresh.**
+- [x] **Step 4: Use the reliable send path for manual refresh.**
 
 Replace the `try_send` arm with:
 
@@ -703,7 +703,7 @@ Effect::Refresh => {
 
 Keep `send_request`'s event-draining `reserve` loop unchanged. Do not add an unbounded channel or block without draining events.
 
-- [ ] **Step 5: Run GREEN and UI regression targets.**
+- [x] **Step 5: Run GREEN and UI regression targets.**
 
 ```bash
 rtk cargo test --locked ui::update::tests
@@ -711,7 +711,7 @@ rtk cargo test --locked ui::tests
 rtk cargo clippy --locked --lib -- -D warnings
 ```
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 
 ```bash
 rtk git add src/ui/action.rs src/ui/state.rs src/ui/update/mod.rs src/ui/mod.rs src/ui/components.rs
@@ -726,7 +726,7 @@ rtk git commit -m "fix(ui): track refresh lifecycles by identity"
 - Modify: `src/application/ports.rs:215-240`
 - Test: `src/application/engine.rs`
 
-- [ ] **Step 1: Strengthen lifecycle metadata assertions.**
+- [x] **Step 1: Strengthen lifecycle metadata assertions.**
 
 Extend engine tests to assert that:
 
@@ -735,7 +735,7 @@ Extend engine tests to assert that:
 - the post-mutation completion reports trigger `PostMutation`; and
 - cancellation produces no `RefreshFinished` for the cancelled ID.
 
-- [ ] **Step 2: Run RED against exact metadata.**
+- [x] **Step 2: Run RED against exact metadata.**
 
 ```bash
 rtk cargo test --locked application::engine::tests::manual_burst_produces_one_trailing_refresh
@@ -744,11 +744,11 @@ rtk cargo test --locked application::engine::tests::mutation_drops_ordinary_refr
 
 Expected: any missing trigger, count, elapsed, or event-order field fails explicitly.
 
-- [ ] **Step 3: Emit one aggregate lifecycle record.**
+- [x] **Step 3: Emit one aggregate lifecycle record.**
 
 For completion, include `refresh_id`, `trigger`, `merged_manual_requests`, `coalesced_periodic_ticks`, backend elapsed milliseconds, process count, and success/failure. For cancellation, emit the aggregate debug record from Task 3. Do not log each coalesced key press or timer race.
 
-- [ ] **Step 4: Document the port-level cancellation requirement.**
+- [x] **Step 4: Document the port-level cancellation requirement.**
 
 Extend `snapshot_observed` documentation with this exact contract:
 
@@ -760,7 +760,7 @@ Extend `snapshot_observed` documentation with this exact contract:
 
 Do not change `snapshot_fresh` or `apply`; mutation preflight and mutation futures are never scheduler-cancelled.
 
-- [ ] **Step 5: Run GREEN plus process/backend regressions.**
+- [x] **Step 5: Run GREEN plus process/backend regressions.**
 
 ```bash
 rtk cargo test --locked application::engine::tests
@@ -768,7 +768,7 @@ rtk cargo test --locked infrastructure::process::tests
 rtk cargo test --locked --test backend
 ```
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 
 ```bash
 rtk git add src/application/engine.rs src/application/ports.rs
@@ -782,7 +782,7 @@ rtk git commit -m "feat(observability): report refresh scheduling outcomes"
 - Modify: `scripts/check-critical-coverage.sh:35-45`
 - Modify: `site/docs/index.html:726-740`
 
-- [ ] **Step 1: Generate the current coverage report before changing the floor.**
+- [x] **Step 1: Generate the current coverage report before changing the floor.**
 
 ```bash
 rtk cargo llvm-cov --locked --all-features --json --summary-only --output-path target/coverage-summary.json
@@ -791,7 +791,7 @@ rtk proxy ./scripts/check-critical-coverage.sh target/coverage-summary.json
 
 Expected: existing overall and critical floors pass; scheduler coverage is present in the JSON but is not yet independently enforced.
 
-- [ ] **Step 2: Add the scheduler threshold.**
+- [x] **Step 2: Add the scheduler threshold.**
 
 Append beside the engine check:
 
@@ -801,7 +801,7 @@ check_file "/src/application/refresh_scheduler.rs" 95 "refresh scheduler"
 
 Do not lower the existing engine, rollback, snapshot-store, D-Bus, or overall thresholds.
 
-- [ ] **Step 3: Verify the new threshold against the real report.**
+- [x] **Step 3: Verify the new threshold against the real report.**
 
 ```bash
 rtk proxy ./scripts/check-critical-coverage.sh target/coverage-summary.json
@@ -809,7 +809,7 @@ rtk proxy ./scripts/check-critical-coverage.sh target/coverage-summary.json
 
 Expected output includes `refresh scheduler line coverage` at or above 95%. If it is below 95%, add behavior-focused pure scheduler tests and regenerate the report; do not lower the floor or exclude lines.
 
-- [ ] **Step 4: Document fixed-delay and priority behavior.**
+- [x] **Step 4: Document fixed-delay and priority behavior.**
 
 Immediately below the configuration example, add this exact operator text:
 
@@ -832,7 +832,7 @@ rtk rg -n "fixed delay after the previous refresh|Manual refresh requests are re
 
 Expected: both phrases appear in the configuration section. The site is plain HTML with no build step; do not run `preview-site.sh` because it opens a browser.
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 
 ```bash
 rtk git add scripts/check-critical-coverage.sh site/docs/index.html
@@ -845,7 +845,7 @@ rtk git commit -m "docs(refresh): document bounded scheduler behavior"
 
 - Modify only files required to fix failures caused by Tasks 1-7.
 
-- [ ] **Step 1: Run formatting and both lint configurations.**
+- [x] **Step 1: Run formatting and both lint configurations.**
 
 ```bash
 rtk cargo fmt --all -- --check
@@ -853,21 +853,21 @@ rtk cargo clippy --locked --all-targets -- -D warnings
 rtk cargo clippy --locked --all-targets --features dbus -- -D warnings
 ```
 
-- [ ] **Step 2: Run complete tests and deterministic performance budget.**
+- [x] **Step 2: Run complete tests and deterministic performance budget.**
 
 ```bash
 rtk cargo test --locked --all-features
 rtk cargo test --locked --release performance_budget -- --test-threads=1
 ```
 
-- [ ] **Step 3: Enforce overall and critical coverage.**
+- [x] **Step 3: Enforce overall and critical coverage.**
 
 ```bash
 rtk cargo llvm-cov --locked --all-features --fail-under-lines 75 --json --summary-only --output-path target/coverage-summary.json
 rtk proxy ./scripts/check-critical-coverage.sh target/coverage-summary.json
 ```
 
-- [ ] **Step 4: Run the real firewalld matrix only in disposable containers.**
+- [x] **Step 4: Run the real firewalld matrix only in disposable containers.**
 
 ```bash
 rtk docker compose -f docker-compose.yml run --rm dev cargo test --offline --locked --features dbus --test real_firewalld -- --ignored --test-threads=1
@@ -877,7 +877,7 @@ rtk docker compose -f docker-compose.yml run --rm dev-el9 cargo test --offline -
 
 Expected: every distribution passes serially. Never substitute a host invocation.
 
-- [ ] **Step 5: Inspect the final diff and run targeted impact checks.**
+- [x] **Step 5: Inspect the final diff and run targeted impact checks.**
 
 ```bash
 rtk git diff --check develop...HEAD
@@ -886,7 +886,7 @@ rtk git status --short --branch
 
 Confirm no unrelated file, generated coverage report, container target, `.agents`, `.forge`, `.idea`, or `skills-lock.json` is staged.
 
-- [ ] **Step 6: Commit only genuine validation fixes.**
+- [x] **Step 6: Commit only genuine validation fixes.**
 
 If validation required code changes:
 
