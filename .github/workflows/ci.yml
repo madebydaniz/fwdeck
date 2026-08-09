@@ -124,6 +124,11 @@ jobs:
         run: >-
           shellcheck docker/entrypoint.sh scripts/install.sh
           scripts/preview-site.sh scripts/check-critical-coverage.sh
+          scripts/check-dbus-coverage.sh
+          scripts/test-dbus-coverage-checker.sh
+          scripts/run-dbus-coverage.sh
+      - name: Test D-Bus coverage checker
+        run: ./scripts/test-dbus-coverage-checker.sh
 
   zizmor:
     name: Zizmor (Actions security)
@@ -198,6 +203,36 @@ jobs:
             cargo llvm-cov report --summary-only
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  dbus-real-coverage:
+    name: D-Bus real-daemon coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+      - name: Pre-fetch crates on the runner
+        run: cargo fetch --locked
+      - name: Measure D-Bus adapter coverage
+        run: >-
+          FWDECK_CARGO_REGISTRY="$HOME/.cargo/registry"
+          ./scripts/run-dbus-coverage.sh
+      - name: Publish D-Bus coverage summary
+        if: always()
+        run: |
+          if [[ -f target/dbus-coverage-summary.json ]]; then
+            {
+              echo '## D-Bus real-daemon coverage'
+              echo '```text'
+              ./scripts/check-dbus-coverage.sh \
+                target/dbus-coverage-summary.json || :
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   packaging-versions:
     name: Packaging versions in sync
