@@ -577,10 +577,11 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 reconcile_selection(state, selected);
             }
         }
-        UiAction::RefreshStarted => {
+        UiAction::RefreshStarted { .. } => {
             state.refreshing = true;
         }
         UiAction::RefreshCompleted {
+            schedule: _,
             result,
             observation,
         } => {
@@ -630,6 +631,13 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 // beats an empty screen.
                 Err(error) => state.backend_error = Some(error),
             }
+        }
+        UiAction::RefreshCancelled { .. } => {
+            state.refreshing = false;
+        }
+        UiAction::EngineStopped(error) => {
+            state.refreshing = false;
+            state.backend_error = Some(error);
         }
     }
     Vec::new()
@@ -1119,6 +1127,15 @@ mod tests {
         state
     }
 
+    fn refresh_schedule() -> crate::application::RefreshScheduleObservation {
+        crate::application::RefreshScheduleObservation {
+            id: crate::application::RefreshId::new(1),
+            trigger: crate::application::RefreshTrigger::Manual,
+            merged_manual_requests: 0,
+            coalesced_periodic_ticks: 0,
+        }
+    }
+
     fn reviewed(operation: FirewallOperation) -> MutationRequest {
         MutationRequest::new(operation, std::sync::Arc::new(mock::sample().unwrap()))
     }
@@ -1368,11 +1385,18 @@ mod tests {
     fn refresh_error_keeps_stale_snapshot() {
         use crate::application::ports::FirewallError;
         let mut s = state();
-        update(&mut s, UiAction::RefreshStarted);
+        update(
+            &mut s,
+            UiAction::RefreshStarted {
+                id: crate::application::RefreshId::new(1),
+                trigger: crate::application::RefreshTrigger::Manual,
+            },
+        );
         assert!(s.refreshing);
         update(
             &mut s,
             UiAction::RefreshCompleted {
+                schedule: refresh_schedule(),
                 result: Err(FirewallError::DaemonNotRunning),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::ZERO,
@@ -1381,6 +1405,47 @@ mod tests {
         );
         assert!(!s.refreshing);
         assert!(s.snapshot.is_some(), "stale data must survive an error");
+        assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
+    }
+
+    #[test]
+    fn refresh_cancellation_only_clears_the_spinner() {
+        use crate::application::{
+            FirewallError, RefreshCancellationReason, RefreshId, RefreshScheduleObservation,
+            RefreshTrigger,
+        };
+        use crate::domain::RefreshObservation;
+        use std::time::Duration;
+
+        let mut s = state();
+        let previous_refresh = RefreshObservation::total_only(Duration::from_secs(7));
+        s.last_refresh = Some(previous_refresh.clone());
+        s.backend_error = Some(FirewallError::DaemonNotRunning);
+        update(
+            &mut s,
+            UiAction::RefreshStarted {
+                id: RefreshId::new(41),
+                trigger: RefreshTrigger::Manual,
+            },
+        );
+        assert!(s.refreshing);
+
+        update(
+            &mut s,
+            UiAction::RefreshCancelled {
+                schedule: RefreshScheduleObservation {
+                    id: RefreshId::new(41),
+                    trigger: RefreshTrigger::Manual,
+                    merged_manual_requests: 0,
+                    coalesced_periodic_ticks: 0,
+                },
+                reason: RefreshCancellationReason::MutationPreempted,
+                elapsed: Duration::from_millis(20),
+            },
+        );
+
+        assert!(!s.refreshing);
+        assert_eq!(s.last_refresh, Some(previous_refresh));
         assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
     }
 
@@ -1397,6 +1462,7 @@ mod tests {
         update(
             &mut s,
             UiAction::RefreshCompleted {
+                schedule: refresh_schedule(),
                 result: Ok(snapshot),
                 observation: observation.clone(),
             },
@@ -1613,6 +1679,7 @@ mod tests {
         update(
             &mut s,
             UiAction::RefreshCompleted {
+                schedule: refresh_schedule(),
                 result: Ok(std::sync::Arc::new(refreshed)),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::ZERO,
@@ -2093,6 +2160,7 @@ mod tests {
         update(
             &mut s,
             UiAction::RefreshCompleted {
+                schedule: refresh_schedule(),
                 result: Ok(snap),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::ZERO,
