@@ -112,6 +112,12 @@ impl RefreshScheduler {
         Some(active.observation())
     }
 
+    pub(crate) fn cancel_for_rollback(&mut self) -> Option<RefreshScheduleObservation> {
+        let active = self.active.take()?;
+        self.trailing_manual = false;
+        Some(active.observation())
+    }
+
     pub(crate) fn finish(&mut self, id: RefreshId) -> Option<RefreshCompletion> {
         if self.active_id() != Some(id) {
             return None;
@@ -166,6 +172,18 @@ mod tests {
         let post = scheduler.start(RefreshTrigger::PostMutation).unwrap();
         assert!(scheduler.cancel_for_mutation().is_none());
         assert_eq!(scheduler.active_id(), Some(post.id));
+    }
+
+    #[test]
+    fn safety_rollback_cancels_post_mutation_refresh() {
+        let mut scheduler = RefreshScheduler::new();
+        let post = scheduler.start(RefreshTrigger::PostMutation).unwrap();
+
+        let cancelled = scheduler.cancel_for_rollback().unwrap();
+
+        assert_eq!(cancelled.id, post.id);
+        assert_eq!(cancelled.trigger, RefreshTrigger::PostMutation);
+        assert_eq!(scheduler.active_id(), None);
     }
 
     #[test]
