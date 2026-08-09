@@ -1,8 +1,6 @@
 # Phase 5C2 Refresh Scheduler Design
 
-**Status:** Proposed for written review. The runtime behavior was approved in
-conversation on 2026-08-09; implementation begins only after this committed
-specification is reviewed.
+**Status:** Accepted on 2026-08-09 after written review.
 
 ## Problem
 
