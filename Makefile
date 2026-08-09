@@ -45,6 +45,10 @@ test: ## Run the unit test suite (never touches a firewall)
 test-real: ## Run the real-firewalld integration tests (dev container, serial)
 	$(COMPOSE) run --rm $(SERVICE) $(CARGO) test --features dbus --test real_firewalld -- --ignored --test-threads=1
 
+.PHONY: coverage-dbus
+coverage-dbus: ## Measure real-daemon D-Bus coverage in an isolated Fedora container
+	./scripts/run-dbus-coverage.sh
+
 .PHONY: fmt
 fmt: ## Format the whole workspace
 	$(CARGO) fmt --all

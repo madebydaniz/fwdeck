@@ -28,6 +28,26 @@ services:
     stdin_open: true
     tty: true
 
+  # Fedora-only instrumentation image. Compatibility behavior remains covered
+  # independently by dev, dev-debian, and dev-el9.
+  dev-coverage:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: coverage
+      args:
+        BASE_IMAGE: fedora:44
+    image: fwdeck-dev-coverage
+    privileged: true
+    volumes:
+      - .:/workspace
+      - cargo-registry:/root/.cargo/registry
+      - cargo-target-coverage:/workspace/target-coverage
+    environment:
+      TERM: xterm-256color
+      CARGO_TARGET_DIR: /workspace/target-coverage
+      FWDECK_DEMO_LOGS: "0"
+
   # Same environment on AlmaLinux 9 (EL9, firewalld 1.x) to verify RHEL-compatible
   # distros. Separate target dir: EL9's older glibc/toolchain must not share build
   # artifacts with the Fedora service.
@@ -82,5 +102,6 @@ services:
 volumes:
   cargo-registry:
   cargo-target:
+  cargo-target-coverage:
   cargo-target-el9:
   cargo-target-debian:

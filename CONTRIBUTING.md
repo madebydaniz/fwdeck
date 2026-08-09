@@ -27,10 +27,26 @@ docker compose run --rm dev      # real firewalld sandbox
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo test --test real_firewalld -- --ignored   # container only
+make test-real                  # container only; serialized real-daemon suite
+make coverage-dbus              # container only; real-daemon D-Bus coverage
 ```
 
-All four must pass. `cargo test` must never touch the host firewall.
+All applicable gates must pass. `cargo test` must never touch the host firewall.
+
+### Backend evidence
+
+Real-firewalld tests run only inside disposable privileged containers and are
+serialized with `--test-threads=1`; never run an ignored firewalld test against
+the host. The compatibility matrix exercises Fedora 44, Debian 13, and
+AlmaLinux 9. Line coverage is measured once in the Fedora 44 coverage image so
+instrumentation does not triple the matrix cost.
+
+`make coverage-dbus` runs the D-Bus integration target and enforces at least
+60% line coverage for `src/infrastructure/firewalld/dbus.rs`. On a cold Docker
+cache, expose the host Cargo registry read-only with
+`FWDECK_CARGO_REGISTRY="$HOME/.cargo/registry" make coverage-dbus`. Improve this
+gate with tests for supported behavior; do not lower the threshold, exclude
+adapter code, or add test-only production branches.
 
 Pull requests target `develop`. Pushes to `develop` and `main` run the full CI
 and CodeQL suites. Changes to release, packaging, dependency, or shell files

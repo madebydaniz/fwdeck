@@ -371,6 +371,57 @@ async fn policy_set_gateway_enable_disable_round_trip() {
 }
 
 #[cfg(feature = "dbus")]
+fn sorted<T: Clone + Ord>(items: &[T]) -> Vec<T> {
+    let mut items = items.to_vec();
+    items.sort();
+    items
+}
+
+#[cfg(feature = "dbus")]
+fn assert_zone_parity(cli: &fwdeck::domain::ZoneDetails, dbus: &fwdeck::domain::ZoneDetails) {
+    assert_eq!(dbus.target, cli.target, "zone targets must match");
+    assert_eq!(sorted(&dbus.services), sorted(&cli.services));
+    assert_eq!(sorted(&dbus.ports), sorted(&cli.ports));
+    assert_eq!(sorted(&dbus.forward_ports), sorted(&cli.forward_ports));
+    assert_eq!(sorted(&dbus.rich_rules), sorted(&cli.rich_rules));
+    assert_eq!(sorted(&dbus.interfaces), sorted(&cli.interfaces));
+    assert_eq!(sorted(&dbus.sources), sorted(&cli.sources));
+    assert_eq!(sorted(&dbus.icmp_blocks), sorted(&cli.icmp_blocks));
+    assert_eq!(dbus.masquerade, cli.masquerade);
+}
+
+#[cfg(feature = "dbus")]
+fn assert_applied_method(outcome: &fwdeck::application::ports::OperationOutcome, expected: &str) {
+    use fwdeck::application::ports::OperationOutcome;
+
+    let OperationOutcome::Applied { steps, .. } = outcome else {
+        panic!("expected applied outcome, got {outcome:?}");
+    };
+    assert_eq!(steps.len(), 1, "D-Bus operations report one step");
+    assert_eq!(steps[0].target, "runtime");
+    assert_eq!(
+        steps[0].invocation.first().map(String::as_str),
+        Some(expected)
+    );
+    assert!(steps[0].result.is_ok());
+}
+
+#[cfg(feature = "dbus")]
+fn assert_cleanup_applied(
+    primary: &fwdeck::application::ports::OperationOutcome,
+    cleanup: &fwdeck::application::ports::OperationOutcome,
+    expected: &str,
+) {
+    if !matches!(
+        cleanup,
+        fwdeck::application::ports::OperationOutcome::Applied { .. }
+    ) {
+        panic!("cleanup {expected} failed after primary outcome {primary:?}: {cleanup:?}");
+    }
+    assert_applied_method(cleanup, expected);
+}
+
+#[cfg(feature = "dbus")]
 #[tokio::test]
 #[ignore = "requires a running firewalld + D-Bus (dev container)"]
 async fn dbus_backend_agrees_with_cli_on_read_path() {
@@ -392,22 +443,11 @@ async fn dbus_backend_agrees_with_cli_on_read_path() {
     let cli_snap = cli.snapshot().await.unwrap();
     let dbus_snap = dbus.snapshot().await.unwrap();
     assert_eq!(cli_snap.default_zone, dbus_snap.default_zone);
-    // Same zone set and, for the default zone, the same services (order-normalized).
+    // Same zone set and supported zone fields (order-normalized).
     assert_eq!(cli_snap.zone_names(), dbus_snap.zone_names());
     let zone = &cli_snap.default_zone;
-    let mut cli_services: Vec<_> = cli_snap.runtime[zone]
-        .services
-        .iter()
-        .map(|s| s.as_str().to_owned())
-        .collect();
-    let mut dbus_services: Vec<_> = dbus_snap.runtime[zone]
-        .services
-        .iter()
-        .map(|s| s.as_str().to_owned())
-        .collect();
-    cli_services.sort();
-    dbus_services.sort();
-    assert_eq!(cli_services, dbus_services, "runtime services must match");
+    assert_zone_parity(&cli_snap.runtime[zone], &dbus_snap.runtime[zone]);
+    assert_zone_parity(&cli_snap.permanent[zone], &dbus_snap.permanent[zone]);
     // The D-Bus adapter intentionally omits these resource families. Its
     // aggregate drift value is therefore not comparable to the full CLI
     // snapshot, but the missing capabilities must be reported honestly.
@@ -415,6 +455,7 @@ async fn dbus_backend_agrees_with_cli_on_read_path() {
         SnapshotSection::IpSets,
         SnapshotSection::Policies,
         SnapshotSection::DirectRules,
+        SnapshotSection::ServiceDefinitions,
     ] {
         assert!(
             dbus_snap
@@ -432,7 +473,6 @@ async fn dbus_backend_agrees_with_cli_on_read_path() {
 async fn dbus_backend_add_and_remove_service_runtime() {
     let _serial = FIREWALL_LOCK.lock().await;
 
-    use fwdeck::application::ports::OperationOutcome;
     use fwdeck::domain::{ConfigurationTarget, FirewallOperation, ServiceName, ZoneName};
     use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
 
@@ -446,26 +486,43 @@ async fn dbus_backend_add_and_remove_service_runtime() {
         service: service.clone(),
         target: ConfigurationTarget::Runtime,
     };
-    let outcome = backend.apply(&add).await;
-    assert!(
-        matches!(outcome, OperationOutcome::Applied { .. }),
-        "{outcome:?}"
-    );
-    let snapshot = backend.snapshot().await.unwrap();
-    assert!(snapshot.runtime[&zone].services.contains(&service));
+    let initial = backend.snapshot().await.unwrap();
+    if initial.runtime[&zone].services.contains(&service) {
+        let preclean = backend
+            .apply(&FirewallOperation::RemoveService {
+                zone: zone.clone(),
+                service: service.clone(),
+                target: ConfigurationTarget::Runtime,
+            })
+            .await;
+        assert_applied_method(&preclean, "removeService");
+    }
+
+    let add_outcome = backend.apply(&add).await;
+    let added_snapshot = backend.snapshot().await;
 
     let remove = FirewallOperation::RemoveService {
         zone: zone.clone(),
         service: service.clone(),
         target: ConfigurationTarget::Runtime,
     };
-    let outcome = backend.apply(&remove).await;
+    let remove_outcome = backend.apply(&remove).await;
+    let restored_snapshot = backend.snapshot().await;
+
+    assert_cleanup_applied(&add_outcome, &remove_outcome, "removeService");
+    assert_applied_method(&add_outcome, "addService");
     assert!(
-        matches!(outcome, OperationOutcome::Applied { .. }),
-        "{outcome:?}"
+        added_snapshot.unwrap().runtime[&zone]
+            .services
+            .contains(&service),
+        "service must be present after add"
     );
-    let snapshot = backend.snapshot().await.unwrap();
-    assert!(!snapshot.runtime[&zone].services.contains(&service));
+    assert!(
+        !restored_snapshot.unwrap().runtime[&zone]
+            .services
+            .contains(&service),
+        "service must be absent after cleanup"
+    );
 }
 
 #[cfg(feature = "dbus")]
@@ -487,9 +544,126 @@ async fn dbus_backend_refuses_permanent_scope_honestly() {
     // Anything wider than runtime is refused (Failed) before mutating — never
     // half-applied-and-claimed-success.
     let outcome = backend.apply(&op).await;
+    let OperationOutcome::Failed { steps, .. } = outcome else {
+        panic!("expected permanent-scope refusal, got {outcome:?}");
+    };
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].target, "runtime");
+    assert_eq!(
+        steps[0].invocation.first().map(String::as_str),
+        Some("addService")
+    );
+    assert!(steps[0].result.is_err());
+}
+
+#[cfg(feature = "dbus")]
+#[tokio::test]
+#[ignore = "MUTATES firewalld via D-Bus — dev container only"]
+async fn dbus_backend_add_and_remove_port_runtime() {
+    let _serial = FIREWALL_LOCK.lock().await;
+
+    use fwdeck::domain::{FirewallOperation, ZoneName};
+    use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
+
+    let backend = DbusBackend::connect().await.unwrap();
+    let zone = ZoneName::parse("public").unwrap();
+    let port: PortSpec = "49152/tcp".parse().unwrap();
+
+    let initial = backend.snapshot().await.unwrap();
+    if initial.runtime[&zone].ports.contains(&port) {
+        let preclean = backend
+            .apply(&FirewallOperation::RemovePort {
+                zone: zone.clone(),
+                port,
+                target: ConfigurationTarget::Runtime,
+            })
+            .await;
+        assert_applied_method(&preclean, "removePort");
+    }
+
+    let add_outcome = backend
+        .apply(&FirewallOperation::AddPort {
+            zone: zone.clone(),
+            port,
+            target: ConfigurationTarget::Runtime,
+        })
+        .await;
+    let added_snapshot = backend.snapshot().await;
+    let remove_outcome = backend
+        .apply(&FirewallOperation::RemovePort {
+            zone: zone.clone(),
+            port,
+            target: ConfigurationTarget::Runtime,
+        })
+        .await;
+    let restored_snapshot = backend.snapshot().await;
+
+    assert_cleanup_applied(&add_outcome, &remove_outcome, "removePort");
+    assert_applied_method(&add_outcome, "addPort");
     assert!(
-        matches!(outcome, OperationOutcome::Failed { .. }),
-        "{outcome:?}"
+        added_snapshot.unwrap().runtime[&zone].ports.contains(&port),
+        "port must be present after add"
+    );
+    assert!(
+        !restored_snapshot.unwrap().runtime[&zone]
+            .ports
+            .contains(&port),
+        "port must be absent after cleanup"
+    );
+}
+
+#[cfg(feature = "dbus")]
+#[tokio::test]
+#[ignore = "MUTATES firewalld via D-Bus — dev container only"]
+async fn dbus_backend_restores_masquerade_runtime_state() {
+    let _serial = FIREWALL_LOCK.lock().await;
+
+    use fwdeck::domain::{FirewallOperation, ZoneName};
+    use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
+
+    let backend = DbusBackend::connect().await.unwrap();
+    let zone = ZoneName::parse("public").unwrap();
+    let initial = backend.snapshot().await.unwrap().runtime[&zone].masquerade;
+    let toggled = !initial;
+    let toggle_method = if toggled {
+        "addMasquerade"
+    } else {
+        "removeMasquerade"
+    };
+    let restore_method = if initial {
+        "addMasquerade"
+    } else {
+        "removeMasquerade"
+    };
+
+    let toggle_outcome = backend
+        .apply(&FirewallOperation::SetMasquerade {
+            zone: zone.clone(),
+            enabled: toggled,
+            target: ConfigurationTarget::Runtime,
+        })
+        .await;
+    let toggled_snapshot = backend.snapshot().await;
+    let restore_outcome = backend
+        .apply(&FirewallOperation::SetMasquerade {
+            zone: zone.clone(),
+            enabled: initial,
+            target: ConfigurationTarget::Runtime,
+        })
+        .await;
+    let restored_snapshot = backend.snapshot().await;
+
+    assert_cleanup_applied(&toggle_outcome, &restore_outcome, restore_method);
+    assert_applied_method(&toggle_outcome, toggle_method);
+    assert_eq!(
+        toggled_snapshot.unwrap().runtime[&zone].masquerade,
+        toggled,
+        "masquerade must change after toggle"
+    );
+    assert_eq!(
+        restored_snapshot.unwrap().runtime[&zone].masquerade,
+        initial,
+        "masquerade must return to its initial state"
     );
 }
 
