@@ -857,10 +857,13 @@ container — the host firewall is never touched:</p>
 <pre><span class="g">$</span> docker compose run --rm dev   <span class="c"># Fedora + firewalld + Rust, repo mounted</span>
 <span class="g">$</span> cargo run                     <span class="c"># inside: the TUI with real data</span>
 <span class="g">$</span> cargo test                    <span class="c"># fixtures + fake-runner suite</span>
-<span class="g">$</span> cargo test --test real_firewalld -- --ignored --test-threads=1</pre>
+<span class="g">$</span> make test-real                <span class="c"># serialized container-only suite</span>
+<span class="g">$</span> make coverage-dbus            <span class="c"># Fedora real-daemon D-Bus coverage</span></pre>
 <p>Quality gates enforced in CI: <code>cargo fmt --check</code>,
 <code>clippy -D warnings</code> (both feature sets), tests, MSRV 1.88,
-cargo-deny, CodeQL. Commits follow
+cargo-deny, CodeQL, and a 60% line-coverage floor for the D-Bus adapter.
+Compatibility behavior is tested separately on Fedora, Debian, and AlmaLinux.
+Commits follow
 <a href="https://www.conventionalcommits.org/">Conventional Commits</a> —
 release-please turns them into releases automatically. See
 <a href="https://github.com/madebydaniz/fwdeck/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>.</p>
