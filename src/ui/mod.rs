@@ -223,8 +223,9 @@ async fn execute_effect(
     match effect {
         Effect::Quit => return ControlFlow::Break(()),
         Effect::Refresh => {
-            // A full queue already guarantees a refresh is coming.
-            let _ = engine.requests.try_send(EngineRequest::ManualRefresh);
+            if !send_request(engine, pending, EngineRequest::ManualRefresh).await {
+                state.toast(state::ToastKind::Error, "engine is gone — refresh not sent");
+            }
         }
         Effect::Apply(request) => {
             // Reserving-send drains events while it waits, so a momentarily full
@@ -510,7 +511,7 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{base64_encode, drain_rollbacks_on_exit};
+    use super::{base64_encode, drain_rollbacks_on_exit, execute_effect};
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -519,6 +520,53 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[tokio::test]
+    async fn manual_refresh_waits_for_bounded_channel_capacity() {
+        use crate::application::api::{EngineHandle, EngineRequest};
+        use crate::config::Config;
+        use crate::ui::action::Effect;
+        use crate::ui::state::UiState;
+        use std::collections::VecDeque;
+        use std::ops::ControlFlow;
+        use std::time::Duration;
+
+        let config = Config::default();
+        let mut state = UiState::new(&config, "test".to_owned(), false, None);
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        request_tx.send(EngineRequest::ManualRefresh).await.unwrap();
+        let (_event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+        let mut engine = EngineHandle {
+            requests: request_tx,
+            events: event_rx,
+        };
+        let mut pending = VecDeque::new();
+        let effect = execute_effect(
+            Effect::Refresh,
+            &mut state,
+            &mut engine,
+            &mut pending,
+            config.retention,
+        );
+        tokio::pin!(effect);
+
+        let first = tokio::select! {
+            biased;
+            outcome = &mut effect => panic!("refresh returned before capacity: {outcome:?}"),
+            request = request_rx.recv() => request.unwrap(),
+        };
+        assert!(matches!(first, EngineRequest::ManualRefresh));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut effect)
+                .await
+                .unwrap(),
+            ControlFlow::Continue(())
+        );
+        assert!(matches!(
+            request_rx.recv().await,
+            Some(EngineRequest::ManualRefresh)
+        ));
     }
 
     #[tokio::test]

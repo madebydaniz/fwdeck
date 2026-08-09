@@ -577,16 +577,19 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 reconcile_selection(state, selected);
             }
         }
-        UiAction::RefreshStarted { .. } => {
-            state.refreshing = true;
+        UiAction::RefreshStarted { id, .. } => {
+            state.active_refresh = Some(id);
         }
         UiAction::RefreshCompleted {
-            schedule: _,
+            schedule,
             result,
             observation,
         } => {
+            if state.active_refresh != Some(schedule.id) {
+                return Vec::new();
+            }
             let selected = selected_row_id(state);
-            state.refreshing = false;
+            state.active_refresh = None;
             state.last_refresh = Some(observation);
             match result {
                 Ok(snapshot) => {
@@ -632,11 +635,13 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 Err(error) => state.backend_error = Some(error),
             }
         }
-        UiAction::RefreshCancelled { .. } => {
-            state.refreshing = false;
+        UiAction::RefreshCancelled { schedule, .. } => {
+            if state.active_refresh == Some(schedule.id) {
+                state.active_refresh = None;
+            }
         }
         UiAction::EngineStopped(error) => {
-            state.refreshing = false;
+            state.active_refresh = None;
             state.backend_error = Some(error);
         }
     }
@@ -1127,13 +1132,33 @@ mod tests {
         state
     }
 
-    fn refresh_schedule() -> crate::application::RefreshScheduleObservation {
+    fn refresh_schedule_for(
+        id: crate::application::RefreshId,
+        trigger: crate::application::RefreshTrigger,
+    ) -> crate::application::RefreshScheduleObservation {
         crate::application::RefreshScheduleObservation {
-            id: crate::application::RefreshId::new(1),
-            trigger: crate::application::RefreshTrigger::Manual,
+            id,
+            trigger,
             merged_manual_requests: 0,
             coalesced_periodic_ticks: 0,
         }
+    }
+
+    fn refresh_schedule() -> crate::application::RefreshScheduleObservation {
+        refresh_schedule_for(
+            crate::application::RefreshId::new(1),
+            crate::application::RefreshTrigger::Manual,
+        )
+    }
+
+    fn begin_refresh(state: &mut UiState) {
+        update(
+            state,
+            UiAction::RefreshStarted {
+                id: crate::application::RefreshId::new(1),
+                trigger: crate::application::RefreshTrigger::Manual,
+            },
+        );
     }
 
     fn reviewed(operation: FirewallOperation) -> MutationRequest {
@@ -1382,6 +1407,51 @@ mod tests {
     }
 
     #[test]
+    fn stale_refresh_completion_cannot_replace_newer_lifecycle() {
+        use crate::application::{FirewallError, RefreshId, RefreshTrigger};
+        use crate::domain::RefreshObservation;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let mut s = state();
+        let original_snapshot = Arc::clone(s.snapshot.as_ref().unwrap());
+        let previous_refresh = RefreshObservation::total_only(Duration::from_secs(3));
+        s.last_refresh = Some(previous_refresh.clone());
+        s.backend_error = Some(FirewallError::DaemonNotRunning);
+        update(
+            &mut s,
+            UiAction::RefreshStarted {
+                id: RefreshId::new(1),
+                trigger: RefreshTrigger::Manual,
+            },
+        );
+        update(
+            &mut s,
+            UiAction::RefreshStarted {
+                id: RefreshId::new(2),
+                trigger: RefreshTrigger::Periodic,
+            },
+        );
+
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(RefreshId::new(1), RefreshTrigger::Manual),
+                result: Ok(Arc::new(mock::sample().unwrap())),
+                observation: RefreshObservation::total_only(Duration::from_secs(9)),
+            },
+        );
+
+        assert_eq!(s.active_refresh, Some(RefreshId::new(2)));
+        assert!(Arc::ptr_eq(
+            s.snapshot.as_ref().unwrap(),
+            &original_snapshot
+        ));
+        assert_eq!(s.last_refresh, Some(previous_refresh));
+        assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
+    }
+
+    #[test]
     fn refresh_error_keeps_stale_snapshot() {
         use crate::application::ports::FirewallError;
         let mut s = state();
@@ -1392,7 +1462,10 @@ mod tests {
                 trigger: crate::application::RefreshTrigger::Manual,
             },
         );
-        assert!(s.refreshing);
+        assert_eq!(
+            s.active_refresh,
+            Some(crate::application::RefreshId::new(1))
+        );
         update(
             &mut s,
             UiAction::RefreshCompleted {
@@ -1403,38 +1476,40 @@ mod tests {
                 ),
             },
         );
-        assert!(!s.refreshing);
+        assert_eq!(s.active_refresh, None);
         assert!(s.snapshot.is_some(), "stale data must survive an error");
         assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
     }
 
     #[test]
-    fn refresh_cancellation_only_clears_the_spinner() {
+    fn matching_cancellation_clears_spinner_without_error_or_snapshot_loss() {
         use crate::application::{
             FirewallError, RefreshCancellationReason, RefreshId, RefreshScheduleObservation,
             RefreshTrigger,
         };
         use crate::domain::RefreshObservation;
+        use std::sync::Arc;
         use std::time::Duration;
 
         let mut s = state();
+        let original_snapshot = Arc::clone(s.snapshot.as_ref().unwrap());
         let previous_refresh = RefreshObservation::total_only(Duration::from_secs(7));
         s.last_refresh = Some(previous_refresh.clone());
         s.backend_error = Some(FirewallError::DaemonNotRunning);
         update(
             &mut s,
             UiAction::RefreshStarted {
-                id: RefreshId::new(41),
+                id: RefreshId::new(9),
                 trigger: RefreshTrigger::Manual,
             },
         );
-        assert!(s.refreshing);
+        assert_eq!(s.active_refresh, Some(RefreshId::new(9)));
 
         update(
             &mut s,
             UiAction::RefreshCancelled {
                 schedule: RefreshScheduleObservation {
-                    id: RefreshId::new(41),
+                    id: RefreshId::new(9),
                     trigger: RefreshTrigger::Manual,
                     merged_manual_requests: 0,
                     coalesced_periodic_ticks: 0,
@@ -1444,9 +1519,46 @@ mod tests {
             },
         );
 
-        assert!(!s.refreshing);
+        assert_eq!(s.active_refresh, None);
+        assert!(Arc::ptr_eq(
+            s.snapshot.as_ref().unwrap(),
+            &original_snapshot
+        ));
         assert_eq!(s.last_refresh, Some(previous_refresh));
         assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
+    }
+
+    #[test]
+    fn mismatched_cancellation_does_not_clear_active_refresh() {
+        use crate::application::{
+            RefreshCancellationReason, RefreshId, RefreshScheduleObservation, RefreshTrigger,
+        };
+        use std::time::Duration;
+
+        let mut s = state();
+        update(
+            &mut s,
+            UiAction::RefreshStarted {
+                id: RefreshId::new(9),
+                trigger: RefreshTrigger::Manual,
+            },
+        );
+
+        update(
+            &mut s,
+            UiAction::RefreshCancelled {
+                schedule: RefreshScheduleObservation {
+                    id: RefreshId::new(8),
+                    trigger: RefreshTrigger::Periodic,
+                    merged_manual_requests: 0,
+                    coalesced_periodic_ticks: 0,
+                },
+                reason: RefreshCancellationReason::MutationPreempted,
+                elapsed: Duration::from_millis(20),
+            },
+        );
+
+        assert_eq!(s.active_refresh, Some(RefreshId::new(9)));
     }
 
     #[test]
@@ -1459,6 +1571,7 @@ mod tests {
         s.backend_error = Some(FirewallError::DaemonNotRunning);
         let snapshot = std::sync::Arc::new(mock::sample().unwrap());
         let observation = RefreshObservation::total_only(Duration::from_millis(42));
+        begin_refresh(&mut s);
         update(
             &mut s,
             UiAction::RefreshCompleted {
@@ -1676,6 +1789,7 @@ mod tests {
             .unwrap()
             .services
             .push(ServiceName::parse("aardvark").unwrap());
+        begin_refresh(&mut s);
         update(
             &mut s,
             UiAction::RefreshCompleted {
@@ -2157,6 +2271,7 @@ mod tests {
         assert!(!s.pending_rollback.is_empty(), "risky op arms rollback");
         // A refresh must NOT promote an armed op to undoable.
         let snap = std::sync::Arc::new(mock::sample().unwrap());
+        begin_refresh(&mut s);
         update(
             &mut s,
             UiAction::RefreshCompleted {
