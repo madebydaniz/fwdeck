@@ -280,10 +280,20 @@ async fn send_refresh_cancelled(
     schedule: RefreshScheduleObservation,
     elapsed: Duration,
 ) -> Result<(), ()> {
+    let reason = RefreshCancellationReason::MutationPreempted;
+    tracing::debug!(
+        refresh_id = schedule.id.get(),
+        trigger = ?schedule.trigger,
+        merged_manual_requests = schedule.merged_manual_requests,
+        coalesced_periodic_ticks = schedule.coalesced_periodic_ticks,
+        elapsed_ms = elapsed.as_millis(),
+        reason = ?reason,
+        "refresh cancelled"
+    );
     events
         .send(EngineEvent::RefreshCancelled {
             schedule,
-            reason: RefreshCancellationReason::MutationPreempted,
+            reason,
             elapsed,
         })
         .await
@@ -728,15 +738,25 @@ async fn send_refresh_finished(
     let observation = read.observation;
     match &result {
         Ok(snapshot) => tracing::debug!(
-            zones = snapshot.runtime.len(),
-            elapsed_ms = observation.elapsed.as_millis(),
+            refresh_id = completion.schedule.id.get(),
+            trigger = ?completion.schedule.trigger,
+            merged_manual_requests = completion.schedule.merged_manual_requests,
+            coalesced_periodic_ticks = completion.schedule.coalesced_periodic_ticks,
+            backend_elapsed_ms = observation.elapsed.as_millis(),
             process_count = observation.process_count,
+            success = true,
+            zones = snapshot.runtime.len(),
             "refresh finished"
         ),
         Err(err) => tracing::warn!(
-            error = %err,
-            elapsed_ms = observation.elapsed.as_millis(),
+            refresh_id = completion.schedule.id.get(),
+            trigger = ?completion.schedule.trigger,
+            merged_manual_requests = completion.schedule.merged_manual_requests,
+            coalesced_periodic_ticks = completion.schedule.coalesced_periodic_ticks,
+            backend_elapsed_ms = observation.elapsed.as_millis(),
             process_count = observation.process_count,
+            success = false,
+            error = %err,
             "refresh failed"
         ),
     }
@@ -1506,7 +1526,7 @@ mod tests {
         rx.recv().await.unwrap(); // RefreshFinished
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn mutation_drops_ordinary_refresh_before_apply() {
         let (request_tx, request_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(8);
@@ -1521,41 +1541,70 @@ mod tests {
             Duration::from_secs(30),
         ));
 
-        assert!(matches!(
-            event_rx.recv().await.unwrap(),
+        let cancelled_id = match event_rx.recv().await.unwrap() {
             EngineEvent::RefreshStarted {
+                id,
                 trigger: RefreshTrigger::Initial,
-                ..
-            }
-        ));
+            } => id,
+            other => panic!("expected initial refresh start, got {other:?}"),
+        };
         backend.wait_for_snapshot_start().await;
+        tokio::time::advance(Duration::from_millis(5)).await;
         request_tx
             .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
             .await
             .unwrap();
 
-        assert!(matches!(
-            event_rx.recv().await.unwrap(),
+        match event_rx.recv().await.unwrap() {
             EngineEvent::RefreshCancelled {
-                reason: RefreshCancellationReason::MutationPreempted,
-                ..
+                schedule,
+                reason,
+                elapsed,
+            } => {
+                assert_eq!(schedule.id, cancelled_id);
+                assert_eq!(schedule.trigger, RefreshTrigger::Initial);
+                assert_eq!(schedule.merged_manual_requests, 0);
+                assert_eq!(schedule.coalesced_periodic_ticks, 0);
+                assert_eq!(reason, RefreshCancellationReason::MutationPreempted);
+                assert!(elapsed > Duration::ZERO);
             }
-        ));
+            other => panic!("expected refresh cancellation, got {other:?}"),
+        }
         assert!(matches!(
             event_rx.recv().await.unwrap(),
             EngineEvent::OperationFinished(_)
         ));
-        assert!(matches!(
-            event_rx.recv().await.unwrap(),
+        let post_mutation_id = match event_rx.recv().await.unwrap() {
             EngineEvent::RefreshStarted {
+                id,
                 trigger: RefreshTrigger::PostMutation,
-                ..
-            }
-        ));
+            } => id,
+            other => panic!("expected post-mutation refresh start, got {other:?}"),
+        };
+        assert_ne!(post_mutation_id, cancelled_id);
         backend.wait_for_snapshot_start().await;
 
         assert!(backend.apply_observed_zero_active.load(Ordering::SeqCst));
         assert_eq!(backend.max_active_snapshots.load(Ordering::SeqCst), 1);
+
+        backend.release_snapshot();
+        match event_rx.recv().await.unwrap() {
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(_),
+                ..
+            } => {
+                assert_eq!(schedule.id, post_mutation_id);
+                assert_ne!(schedule.id, cancelled_id);
+                assert_eq!(schedule.trigger, RefreshTrigger::PostMutation);
+            }
+            other => panic!("expected post-mutation refresh completion, got {other:?}"),
+        }
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
