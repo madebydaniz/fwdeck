@@ -2,6 +2,7 @@
 //! serially (mutations serialize structurally), refreshes are
 //! coalesced, and events reach the UI in order — no stale-result races.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::domain::FirewallSnapshot;
 
 use super::api::{
-    EngineEvent, EngineRequest, MutationPlan, MutationRequest, OperationResult,
+    EngineEvent, EngineRequest, MutationPlan, MutationRequest, OperationResult, REQUEST_CAPACITY,
     RefreshCancellationReason, RefreshScheduleObservation, RefreshTrigger, RollbackRegistration,
 };
 use super::ports::{
@@ -56,10 +57,10 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
     let timer = tokio::time::sleep(refresh_interval);
     tokio::pin!(timer);
     let mut next_trigger = Some(RefreshTrigger::Initial);
-    let mut pending_mutation = None;
+    let mut pending_requests = VecDeque::with_capacity(REQUEST_CAPACITY);
 
     loop {
-        if let Some(request) = pending_mutation.take() {
+        if let Some(request) = pending_requests.pop_front() {
             if execute_request(
                 &backend,
                 &rollback_guard,
@@ -74,7 +75,11 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
                 return;
             }
 
-            if run_post_mutation_refresh(&backend, &events, &mut scheduler)
+            let Ok(start) = begin_post_mutation_refresh(&events, &mut scheduler).await else {
+                return;
+            };
+            absorb_observed_requests(&mut requests, &mut pending_requests, &mut scheduler);
+            if finish_mandatory_refresh(&backend, &events, &mut scheduler, start)
                 .await
                 .is_err()
             {
@@ -98,7 +103,7 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
                         RefreshTrigger::Manual
                     }
                     Some(request) => {
-                        pending_mutation = Some(request);
+                        pending_requests.push_back(request);
                         continue;
                     }
                 },
@@ -122,17 +127,11 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
 
         match drive_ordinary_refresh(&backend, &mut requests, &mut scheduler, start).await {
             OrdinaryRefreshOutcome::Completed(read) => {
-                let Some(completion) = scheduler.finish(start.id) else {
-                    tracing::error!(refresh_id = start.id.get(), "refresh completion was lost");
+                let Ok(trailing_manual) =
+                    finish_ordinary_refresh(&events, &mut scheduler, start, read).await
+                else {
                     return;
                 };
-                let trailing_manual = completion.trailing_manual;
-                if send_refresh_finished(&events, completion, read)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
                 if trailing_manual {
                     next_trigger = Some(RefreshTrigger::Manual);
                 } else {
@@ -150,9 +149,29 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
                 {
                     return;
                 }
-                pending_mutation = Some(request);
+                pending_requests.push_back(request);
             }
             OrdinaryRefreshOutcome::RequestsClosed => return,
+        }
+    }
+}
+
+fn absorb_observed_requests(
+    requests: &mut mpsc::Receiver<EngineRequest>,
+    pending_requests: &mut VecDeque<EngineRequest>,
+    scheduler: &mut RefreshScheduler,
+) {
+    let immediately_available = requests.len();
+    for _ in 0..immediately_available {
+        if pending_requests.len() == REQUEST_CAPACITY {
+            break;
+        }
+        match requests.try_recv() {
+            Ok(EngineRequest::ManualRefresh) => scheduler.absorb_manual(),
+            Ok(request) => pending_requests.push_back(request),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
         }
     }
 }
@@ -201,23 +220,46 @@ async fn drive_mandatory_refresh<B: FirewallBackend>(
     Some((read, completion))
 }
 
-async fn run_post_mutation_refresh<B: FirewallBackend>(
-    backend: &B,
+async fn begin_post_mutation_refresh(
     events: &mpsc::Sender<EngineEvent>,
     scheduler: &mut RefreshScheduler,
-) -> Result<(), ()> {
-    // The mandatory read is awaited directly, never selected against later
-    // requests, so the mutation postcondition is always observed.
+) -> Result<RefreshStart, ()> {
     let Some(start) = scheduler.start(RefreshTrigger::PostMutation) else {
         tracing::error!("post-mutation refresh could not start");
         return Err(());
     };
     send_refresh_started(events, start).await?;
+    Ok(start)
+}
+
+async fn finish_mandatory_refresh<B: FirewallBackend>(
+    backend: &B,
+    events: &mpsc::Sender<EngineEvent>,
+    scheduler: &mut RefreshScheduler,
+    start: RefreshStart,
+) -> Result<(), ()> {
+    // Later mutations are not polled here: every engine mutation needs one
+    // complete observed-state reconciliation before the next mutation runs.
     let Some((read, completion)) = drive_mandatory_refresh(backend, scheduler, start).await else {
         tracing::error!("post-mutation refresh lifecycle was lost");
         return Err(());
     };
     send_refresh_finished(events, completion, read).await
+}
+
+async fn finish_ordinary_refresh(
+    events: &mpsc::Sender<EngineEvent>,
+    scheduler: &mut RefreshScheduler,
+    start: RefreshStart,
+    read: SnapshotRead,
+) -> Result<bool, ()> {
+    let Some(completion) = scheduler.finish(start.id) else {
+        tracing::error!(refresh_id = start.id.get(), "refresh completion was lost");
+        return Err(());
+    };
+    let trailing_manual = completion.trailing_manual;
+    send_refresh_finished(events, completion, read).await?;
+    Ok(trailing_manual)
 }
 
 async fn send_refresh_started(
@@ -850,6 +892,7 @@ mod tests {
         snapshot_started: Arc<Semaphore>,
         snapshot_release: Arc<Semaphore>,
         apply_observed_zero_active: Arc<AtomicBool>,
+        applied_operations: Arc<Mutex<Vec<FirewallOperation>>>,
     }
 
     impl ControlledSnapshotBackend {
@@ -861,6 +904,7 @@ mod tests {
                 snapshot_started: Arc::new(Semaphore::new(0)),
                 snapshot_release: Arc::new(Semaphore::new(0)),
                 apply_observed_zero_active: Arc::new(AtomicBool::new(false)),
+                applied_operations: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -907,6 +951,10 @@ mod tests {
                 self.active_snapshots.load(Ordering::SeqCst) == 0,
                 Ordering::SeqCst,
             );
+            self.applied_operations
+                .lock()
+                .unwrap()
+                .push(operation.clone());
             OperationOutcome::Applied {
                 operation: operation.clone(),
                 steps: vec![StepReport {
@@ -1508,6 +1556,347 @@ mod tests {
 
         assert!(backend.apply_observed_zero_active.load(Ordering::SeqCst));
         assert_eq!(backend.max_active_snapshots.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_mutation_cannot_cancel_post_mutation_refresh() {
+        let (request_tx, request_rx) = mpsc::channel(REQUEST_CAPACITY);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let backend = ControlledSnapshotBackend::new();
+        let first = FirewallOperation::Reload;
+        let second = FirewallOperation::SetPanicMode { enabled: true };
+
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            request_rx,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        request_tx
+            .try_send(EngineRequest::Apply(reviewed(first.clone())))
+            .unwrap();
+        request_tx.try_send(EngineRequest::ManualRefresh).unwrap();
+        request_tx
+            .try_send(EngineRequest::Apply(reviewed(second.clone())))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled {
+                reason: RefreshCancellationReason::MutationPreempted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result) if result.outcome.operation() == &first
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+
+        tokio::task::yield_now().await;
+        assert_eq!(backend.active_snapshots.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(_),
+                ..
+            } if schedule.trigger == RefreshTrigger::PostMutation
+                && schedule.merged_manual_requests == 1
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result) if result.outcome.operation() == &second
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(_),
+                ..
+            } if schedule.trigger == RefreshTrigger::PostMutation
+        ));
+
+        assert_eq!(*backend.applied_operations.lock().unwrap(), [first, second]);
+        assert_eq!(backend.max_active_snapshots.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn mutations_and_rollbacks_remain_fifo_and_exactly_once() {
+        let (request_tx, request_rx) = mpsc::channel(REQUEST_CAPACITY);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let backend = ControlledSnapshotBackend::new();
+        let mutation = FirewallOperation::Reload;
+        let rollback = FirewallOperation::SetPanicMode { enabled: true };
+        let plan_operation = FirewallOperation::Reload;
+        let rollback_id = RollbackGuardId::new(808);
+
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            request_rx,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        request_tx
+            .try_send(EngineRequest::Apply(reviewed(mutation.clone())))
+            .unwrap();
+        request_tx
+            .try_send(EngineRequest::Rollback {
+                id: rollback_id,
+                operation: rollback.clone(),
+                watchdog_unit: None,
+            })
+            .unwrap();
+        request_tx
+            .try_send(EngineRequest::ApplyPlan(reviewed_plan(vec![
+                plan_operation.clone(),
+            ])))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled { .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if result.outcome.operation() == &mutation
+                    && result.completed_rollback.is_none()
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished { result: Ok(_), .. }
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if result.outcome.operation() == &rollback
+                    && result.completed_rollback == Some(rollback_id)
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished { result: Ok(_), .. }
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if result.outcome.operation() == &plan_operation
+                    && result.completed_rollback.is_none()
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::PlanFinished {
+                applied: 1,
+                ref remaining,
+            } if remaining.is_empty()
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished { result: Ok(_), .. }
+        ));
+
+        assert_eq!(
+            *backend.applied_operations.lock().unwrap(),
+            [mutation, rollback, plan_operation]
+        );
+        assert_eq!(backend.snapshot_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(backend.max_active_snapshots.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test(start_paused = true)]
+    async fn blocked_refresh_manual_burst_timer_advance_and_mutation_stay_bounded() {
+        const BURST: usize = 100;
+        const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+        let (request_tx, request_rx) = mpsc::channel(REQUEST_CAPACITY);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let backend = ControlledSnapshotBackend::new();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            request_rx,
+            event_tx,
+            REFRESH_INTERVAL,
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished { result: Ok(_), .. }
+        ));
+
+        request_tx.send(EngineRequest::ManualRefresh).await.unwrap();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Manual,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+
+        let burst_tx = request_tx.clone();
+        let mut burst = tokio::spawn(async move {
+            for _ in 0..BURST {
+                burst_tx.send(EngineRequest::ManualRefresh).await.unwrap();
+            }
+        });
+        let mut unexpected_events = Vec::new();
+        loop {
+            tokio::select! {
+                result = &mut burst => {
+                    result.unwrap();
+                    break;
+                }
+                event = event_rx.recv() => {
+                    unexpected_events.push(event.unwrap());
+                }
+            }
+        }
+        assert!(
+            unexpected_events.is_empty(),
+            "blocked manual refresh emitted unexpected events: {unexpected_events:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while request_tx.capacity() != REQUEST_CAPACITY {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::time::advance(REFRESH_INTERVAL * 10).await;
+        request_tx
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled {
+                schedule,
+                reason: RefreshCancellationReason::MutationPreempted,
+                ..
+            } if schedule.trigger == RefreshTrigger::Manual
+                && schedule.merged_manual_requests == BURST as u64
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if matches!(result.outcome, OperationOutcome::Applied { .. })
+        ));
+        assert!(backend.apply_observed_zero_active.load(Ordering::SeqCst));
+        assert_eq!(backend.applied_operations.lock().unwrap().len(), 1);
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(_),
+                ..
+            } if schedule.trigger == RefreshTrigger::PostMutation
+        ));
+        tokio::task::yield_now().await;
+
+        assert_eq!(backend.snapshot_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.active_snapshots.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.max_active_snapshots.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

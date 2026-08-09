@@ -13,6 +13,9 @@ use super::ports::{
     FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId,
 };
 
+pub(crate) const REQUEST_CAPACITY: usize = 32;
+const EVENT_CAPACITY: usize = 64;
+
 /// One reviewed mutation together with the exact observed state it was
 /// validated and confirmed against. The engine re-reads firewalld immediately
 /// before execution and rejects the request if that state has changed.
@@ -217,8 +220,8 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
     read_only: bool,
     rollback_timeout: Duration,
 ) -> EngineHandle {
-    let (request_tx, request_rx) = mpsc::channel(32);
-    let (event_tx, event_rx) = mpsc::channel(64);
+    let (request_tx, request_rx) = mpsc::channel(REQUEST_CAPACITY);
+    let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
     tokio::spawn(engine::run(
         backend,
         rollback_guard,
