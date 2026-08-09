@@ -126,9 +126,12 @@ jobs:
           scripts/preview-site.sh scripts/check-critical-coverage.sh
           scripts/check-dbus-coverage.sh
           scripts/test-dbus-coverage-checker.sh
+          scripts/test-dbus-coverage-runner.sh
           scripts/run-dbus-coverage.sh
       - name: Test D-Bus coverage checker
         run: ./scripts/test-dbus-coverage-checker.sh
+      - name: Test D-Bus coverage runner
+        run: ./scripts/test-dbus-coverage-runner.sh
 
   zizmor:
     name: Zizmor (Actions security)

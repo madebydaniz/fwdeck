@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly repo_root
 readonly report="${repo_root}/target/dbus-coverage-summary.json"
+readonly report_dir="${report%/*}"
 compose=(docker compose -f "${repo_root}/docker-compose.yml")
 run_args=(run --rm)
 
@@ -18,6 +19,7 @@ if [[ -n "${FWDECK_CARGO_REGISTRY:-}" ]]; then
     )
 fi
 
+mkdir -p "$report_dir"
 if [[ -f "$report" ]]; then
     rm -- "$report"
 fi
