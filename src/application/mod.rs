@@ -7,6 +7,7 @@ pub mod ports;
 
 pub use api::{
     EngineEvent, EngineHandle, EngineRequest, MutationPlan, MutationRequest, OperationResult,
+    RefreshCancellationReason, RefreshId, RefreshScheduleObservation, RefreshTrigger,
     RollbackRegistration,
 };
 pub use ports::{
