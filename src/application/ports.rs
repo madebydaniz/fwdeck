@@ -221,6 +221,9 @@ pub trait FirewallBackend: Send + Sync + 'static {
 
     /// Full state plus refresh telemetry. Adapters can override this to report
     /// subprocess and per-section metrics; the default remains total-only.
+    /// The returned future must be cancellation-safe: dropping it must not mutate
+    /// firewall state, detach unbounded work, or leave a child process running.
+    /// The engine may drop ordinary refreshes before a confirmed mutation.
     fn snapshot_observed(&self) -> impl Future<Output = SnapshotRead> + Send {
         async move {
             let started = std::time::Instant::now();
