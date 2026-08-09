@@ -85,7 +85,6 @@ impl RefreshScheduler {
         }
     }
 
-    #[allow(dead_code)] // Task 4 consumes mandatory-load coalescing through this hook.
     pub(crate) fn absorb_manual(&mut self) {
         if let Some(active) = self.active.as_mut() {
             active.merged_manual_requests = active.merged_manual_requests.saturating_add(1);
