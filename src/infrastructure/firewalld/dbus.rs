@@ -9,7 +9,7 @@
 //! attributes) and the common zone mutations. IP sets, policies, direct rules,
 //! and permanent-only object lifecycle (create zone/service/ipset/policy) route
 //! through the CLI backend for now; the D-Bus backend reports them as
-//! unsupported rather than failing silently. See `docs/backend.md`.
+//! unsupported rather than failing silently. See `CONTRIBUTING.md`.
 
 use std::collections::{BTreeMap, HashMap};
 
