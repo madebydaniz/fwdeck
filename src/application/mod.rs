@@ -4,6 +4,8 @@
 pub mod api;
 pub mod engine;
 pub mod ports;
+#[allow(dead_code)]
+mod refresh_scheduler;
 
 pub use api::{
     EngineEvent, EngineHandle, EngineRequest, MutationPlan, MutationRequest, OperationResult,
