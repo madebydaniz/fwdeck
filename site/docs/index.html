@@ -750,6 +750,10 @@ max_age_days = 30
 [retention.audit]
 max_files = 10                  # includes the active audit.jsonl
 max_file_size_mb = 5</pre>
+<p><code>refresh_interval_ms</code> is a fixed delay after the previous refresh
+attempt completes. Manual refresh requests are reliable and coalesced. A
+confirmed change or rollback takes priority over an ordinary background read;
+FWDeck then completes a fresh reconciliation before accepting the next change.</p>
 <p>Retention runs at startup and after new state is written. It only removes
 regular files with FWDeck-generated names; symlinks, imported snapshots, and
 unknown files are ignored. Preview the exact plan before applying it:</p>
