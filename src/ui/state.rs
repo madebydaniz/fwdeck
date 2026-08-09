@@ -133,8 +133,8 @@ pub struct UiState {
     /// The first successful snapshot of the session — the baseline the
     /// "session diff" compares the current state against.
     pub session_baseline: Option<Arc<FirewallSnapshot>>,
-    /// A refresh is in flight (engine sent `RefreshStarted`).
-    pub refreshing: bool,
+    /// Exact refresh lifecycle currently in flight, if any.
+    pub active_refresh: Option<crate::application::RefreshId>,
     /// Last backend failure; cleared by the next successful refresh.
     pub backend_error: Option<FirewallError>,
     /// Denied packets seen this session (from the log tailer).
@@ -222,7 +222,7 @@ impl UiState {
             overlay_scroll: 0,
             snapshot: None,
             session_baseline: None,
-            refreshing: false,
+            active_refresh: None,
             backend_error: None,
             denied_session: 0,
             log_buffer: std::collections::VecDeque::new(),
