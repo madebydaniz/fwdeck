@@ -14,6 +14,8 @@ use super::ports::{
 };
 
 pub(crate) const REQUEST_CAPACITY: usize = 32;
+const MANUAL_REFRESH_CAPACITY: usize = REQUEST_CAPACITY;
+const ROLLBACK_CAPACITY: usize = 1;
 const EVENT_CAPACITY: usize = 64;
 
 /// One reviewed mutation together with the exact observed state it was
@@ -132,24 +134,23 @@ pub enum RefreshCancellationReason {
     RollbackPreempted,
 }
 
-/// UI → engine commands. Sent over the bounded request channel.
+/// A safety rollback sent over its dedicated bounded priority lane.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollbackRequest {
+    /// Correlates completion during bounded clean shutdown.
+    pub id: RollbackGuardId,
+    /// Connectivity-restoring inverse.
+    pub operation: FirewallOperation,
+    /// External watchdog to stop after the inverse has run.
+    pub watchdog_unit: Option<String>,
+}
+
+/// UI → engine normal mutation commands. Sent over the bounded request channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineRequest {
-    /// Take a fresh snapshot now. Concurrent manual demand is coalesced.
-    ManualRefresh,
     /// Verify the reviewed snapshot is still current, execute one operation
     /// (runtime step first, then permanent — ADR-3), then refresh.
     Apply(MutationRequest),
-    /// Execute a previously armed inverse, then best-effort disarm its external
-    /// watchdog. Applying the inverse never depends on disarm success.
-    Rollback {
-        /// Correlates completion during bounded clean shutdown.
-        id: RollbackGuardId,
-        /// Connectivity-restoring inverse.
-        operation: FirewallOperation,
-        /// External watchdog to stop after the inverse has run.
-        watchdog_unit: Option<String>,
-    },
     /// Verify the reviewed start state, then execute a staged plan as one
     /// sequential transaction: fail-fast on the first non-applied outcome,
     /// one refresh at the end, unexecuted operations returned via
@@ -205,8 +206,12 @@ pub enum EngineEvent {
 
 /// The UI's only connection to the engine task: send requests, receive events.
 pub struct EngineHandle {
-    /// Bounded request channel into the engine (capacity 32).
+    /// Bounded normal mutation channel into the engine (capacity 32).
     pub requests: mpsc::Sender<EngineRequest>,
+    /// Bounded manual-demand lane (capacity 32); active demand is coalesced.
+    pub manual_refreshes: mpsc::Sender<()>,
+    /// Bounded safety-priority rollback lane (capacity 1).
+    pub rollbacks: mpsc::Sender<RollbackRequest>,
     /// Bounded event channel out of the engine (capacity 64).
     pub events: mpsc::Receiver<EngineEvent>,
 }
@@ -222,11 +227,13 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
     rollback_timeout: Duration,
 ) -> EngineHandle {
     let (request_tx, request_rx) = mpsc::channel(REQUEST_CAPACITY);
+    let (manual_refresh_tx, manual_refresh_rx) = mpsc::channel(MANUAL_REFRESH_CAPACITY);
+    let (rollback_tx, rollback_rx) = mpsc::channel(ROLLBACK_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
     tokio::spawn(engine::run(
         backend,
         rollback_guard,
-        request_rx,
+        engine::EngineReceivers::new(request_rx, manual_refresh_rx, rollback_rx),
         event_tx,
         refresh_interval,
         read_only,
@@ -234,6 +241,8 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
     ));
     EngineHandle {
         requests: request_tx,
+        manual_refreshes: manual_refresh_tx,
+        rollbacks: rollback_tx,
         events: event_rx,
     }
 }

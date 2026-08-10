@@ -25,7 +25,7 @@ use futures_util::StreamExt;
 
 use tokio::sync::mpsc;
 
-use crate::application::api::{EngineEvent, EngineHandle, EngineRequest};
+use crate::application::api::{EngineEvent, EngineHandle, EngineRequest, RollbackRequest};
 use crate::application::ports::FirewallError;
 use crate::config::Config;
 use crate::error::AppError;
@@ -184,16 +184,15 @@ fn engine_event_action(event: EngineEvent) -> UiAction {
 /// full requests queue cannot deadlock against a full events queue — each side
 /// blocked on the other. Returns false if the engine is gone; drained events
 /// run as follow-up actions so no outcome is lost.
-async fn send_request(
-    engine: &mut EngineHandle,
+async fn send_request<T>(
+    sender: &mpsc::Sender<T>,
+    events: &mut mpsc::Receiver<EngineEvent>,
     pending: &mut std::collections::VecDeque<UiAction>,
-    request: EngineRequest,
+    request: T,
 ) -> bool {
-    let requests = &mut engine.requests;
-    let events = &mut engine.events;
     loop {
         tokio::select! {
-            permit = requests.reserve() => {
+            permit = sender.reserve() => {
                 return match permit {
                     Ok(permit) => {
                         permit.send(request);
@@ -223,14 +222,21 @@ async fn execute_effect(
     match effect {
         Effect::Quit => return ControlFlow::Break(()),
         Effect::Refresh => {
-            if !send_request(engine, pending, EngineRequest::ManualRefresh).await {
+            if !send_request(&engine.manual_refreshes, &mut engine.events, pending, ()).await {
                 state.toast(state::ToastKind::Error, "engine is gone — refresh not sent");
             }
         }
         Effect::Apply(request) => {
             // Reserving-send drains events while it waits, so a momentarily full
-            // queue can't drop a mutation (rollbacks especially) or deadlock.
-            if !send_request(engine, pending, EngineRequest::Apply(request)).await {
+            // queue cannot drop a normal mutation or deadlock.
+            if !send_request(
+                &engine.requests,
+                &mut engine.events,
+                pending,
+                EngineRequest::Apply(request),
+            )
+            .await
+            {
                 state.toast(state::ToastKind::Error, "engine is gone — operation lost");
             }
         }
@@ -240,9 +246,10 @@ async fn execute_effect(
             watchdog_unit,
         } => {
             if !send_request(
-                engine,
+                &engine.rollbacks,
+                &mut engine.events,
                 pending,
-                EngineRequest::Rollback {
+                RollbackRequest {
                     id,
                     operation,
                     watchdog_unit,
@@ -257,7 +264,14 @@ async fn execute_effect(
             }
         }
         Effect::ApplyPlan(plan) => {
-            if !send_request(engine, pending, EngineRequest::ApplyPlan(plan)).await {
+            if !send_request(
+                &engine.requests,
+                &mut engine.events,
+                pending,
+                EngineRequest::ApplyPlan(plan),
+            )
+            .await
+            {
                 state.toast(state::ToastKind::Error, "engine is gone — plan not sent");
             }
         }
@@ -430,14 +444,14 @@ async fn drain_rollbacks_on_exit(state: &mut state::UiState, engine: &mut Engine
     for rollback in pending.into_iter().rev() {
         tracing::warn!(operation = %rollback.description, "quit inside rollback window — reverting");
         let id = rollback.id;
-        let mut request = Some(EngineRequest::Rollback {
+        let mut request = Some(RollbackRequest {
             id,
             operation: rollback.inverse,
             watchdog_unit: rollback.watchdog_unit,
         });
         loop {
             tokio::select! {
-                permit = engine.requests.reserve() => {
+                permit = engine.rollbacks.reserve() => {
                     let Ok(permit) = permit else { return };
                     if let Some(request) = request.take() {
                         permit.send(request);
@@ -524,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn manual_refresh_waits_for_bounded_channel_capacity() {
-        use crate::application::api::{EngineHandle, EngineRequest};
+        use crate::application::api::EngineHandle;
         use crate::config::Config;
         use crate::ui::action::Effect;
         use crate::ui::state::UiState;
@@ -534,11 +548,15 @@ mod tests {
 
         let config = Config::default();
         let mut state = UiState::new(&config, "test".to_owned(), false, None);
-        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
-        request_tx.send(EngineRequest::ManualRefresh).await.unwrap();
+        let (request_tx, _request_rx) = tokio::sync::mpsc::channel(1);
+        let (manual_tx, mut manual_rx) = tokio::sync::mpsc::channel(1);
+        manual_tx.send(()).await.unwrap();
+        let (rollback_tx, _rollback_rx) = tokio::sync::mpsc::channel(1);
         let (_event_tx, event_rx) = tokio::sync::mpsc::channel(1);
         let mut engine = EngineHandle {
             requests: request_tx,
+            manual_refreshes: manual_tx,
+            rollbacks: rollback_tx,
             events: event_rx,
         };
         let mut pending = VecDeque::new();
@@ -551,27 +569,106 @@ mod tests {
         );
         tokio::pin!(effect);
 
-        let first = tokio::select! {
+        tokio::select! {
             biased;
             outcome = &mut effect => panic!("refresh returned before capacity: {outcome:?}"),
-            request = request_rx.recv() => request.unwrap(),
-        };
-        assert!(matches!(first, EngineRequest::ManualRefresh));
+            request = manual_rx.recv() => request.unwrap(),
+        }
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), &mut effect)
                 .await
                 .unwrap(),
             ControlFlow::Continue(())
         );
+        assert_eq!(manual_rx.recv().await, Some(()));
+    }
+
+    #[tokio::test]
+    async fn rollback_waits_for_priority_lane_capacity_while_draining_events() {
+        use crate::application::api::{
+            EngineEvent, EngineHandle, RefreshId, RefreshTrigger, RollbackRequest,
+        };
+        use crate::application::ports::RollbackGuardId;
+        use crate::config::Config;
+        use crate::domain::FirewallOperation;
+        use crate::ui::action::{Effect, UiAction};
+        use crate::ui::state::UiState;
+        use std::collections::VecDeque;
+        use std::ops::ControlFlow;
+        use std::time::Duration;
+
+        let config = Config::default();
+        let mut state = UiState::new(&config, "test".to_owned(), false, None);
+        let (request_tx, _request_rx) = tokio::sync::mpsc::channel(1);
+        let (manual_tx, _manual_rx) = tokio::sync::mpsc::channel(1);
+        let (rollback_tx, mut rollback_rx) = tokio::sync::mpsc::channel(1);
+        rollback_tx
+            .send(RollbackRequest {
+                id: RollbackGuardId::new(1),
+                operation: FirewallOperation::Reload,
+                watchdog_unit: None,
+            })
+            .await
+            .unwrap();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .send(EngineEvent::RefreshStarted {
+                id: RefreshId::new(77),
+                trigger: RefreshTrigger::PostMutation,
+            })
+            .await
+            .unwrap();
+        let mut engine = EngineHandle {
+            requests: request_tx,
+            manual_refreshes: manual_tx,
+            rollbacks: rollback_tx,
+            events: event_rx,
+        };
+        let mut pending = VecDeque::new();
+        let rollback_id = RollbackGuardId::new(2);
+        let outcome = {
+            let effect = execute_effect(
+                Effect::ApplyRollback {
+                    id: rollback_id,
+                    operation: FirewallOperation::SetPanicMode { enabled: true },
+                    watchdog_unit: None,
+                },
+                &mut state,
+                &mut engine,
+                &mut pending,
+                config.retention,
+            );
+            tokio::pin!(effect);
+
+            let first = tokio::select! {
+                biased;
+                outcome = &mut effect => panic!("rollback returned before capacity: {outcome:?}"),
+                request = rollback_rx.recv() => request.unwrap(),
+            };
+            assert_eq!(first.id, RollbackGuardId::new(1));
+            tokio::time::timeout(Duration::from_secs(1), &mut effect)
+                .await
+                .unwrap()
+        };
+        assert_eq!(outcome, ControlFlow::Continue(()));
         assert!(matches!(
-            request_rx.recv().await,
-            Some(EngineRequest::ManualRefresh)
+            pending.pop_front(),
+            Some(UiAction::RefreshStarted {
+                id,
+                trigger: RefreshTrigger::PostMutation,
+            }) if id == RefreshId::new(77)
+        ));
+        assert!(matches!(
+            rollback_rx.recv().await,
+            Some(RollbackRequest { id, .. }) if id == rollback_id
         ));
     }
 
     #[tokio::test]
     async fn clean_exit_waits_for_the_matching_rollback_id() {
-        use crate::application::api::{EngineEvent, EngineHandle, EngineRequest, OperationResult};
+        use crate::application::api::{
+            EngineEvent, EngineHandle, OperationResult, RollbackRequest,
+        };
         use crate::application::ports::{OperationOutcome, RollbackGuardId};
         use crate::config::Config;
         use crate::domain::{ConfigurationTarget, FirewallOperation, ZoneName};
@@ -594,17 +691,21 @@ mod tests {
             watchdog_unit: None,
         });
 
-        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let (request_tx, _request_rx) = tokio::sync::mpsc::channel(1);
+        let (manual_tx, _manual_rx) = tokio::sync::mpsc::channel(1);
+        let (rollback_tx, mut rollback_rx) = tokio::sync::mpsc::channel(1);
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
         let mut engine = EngineHandle {
             requests: request_tx,
+            manual_refreshes: manual_tx,
+            rollbacks: rollback_tx,
             events: event_rx,
         };
         let responder = tokio::spawn(async move {
-            let request = request_rx.recv().await.unwrap();
+            let request = rollback_rx.recv().await.unwrap();
             assert!(matches!(
                 request,
-                EngineRequest::Rollback { id, .. } if id == rollback_id
+                RollbackRequest { id, .. } if id == rollback_id
             ));
             event_tx
                 .send(EngineEvent::OperationFinished(Box::new(OperationResult {

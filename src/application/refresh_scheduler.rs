@@ -13,6 +13,12 @@ pub(crate) struct RefreshCompletion {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefreshCancellation {
+    pub schedule: RefreshScheduleObservation,
+    pub trailing_manual: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefreshDemand {
     StartNow,
     Trailing,
@@ -112,10 +118,13 @@ impl RefreshScheduler {
         Some(active.observation())
     }
 
-    pub(crate) fn cancel_for_rollback(&mut self) -> Option<RefreshScheduleObservation> {
+    pub(crate) fn cancel_for_rollback(&mut self) -> Option<RefreshCancellation> {
         let active = self.active.take()?;
-        self.trailing_manual = false;
-        Some(active.observation())
+        let trailing_manual = std::mem::take(&mut self.trailing_manual);
+        Some(RefreshCancellation {
+            schedule: active.observation(),
+            trailing_manual,
+        })
     }
 
     pub(crate) fn finish(&mut self, id: RefreshId) -> Option<RefreshCompletion> {
@@ -178,11 +187,14 @@ mod tests {
     fn safety_rollback_cancels_post_mutation_refresh() {
         let mut scheduler = RefreshScheduler::new();
         let post = scheduler.start(RefreshTrigger::PostMutation).unwrap();
+        scheduler.record_manual();
 
         let cancelled = scheduler.cancel_for_rollback().unwrap();
 
-        assert_eq!(cancelled.id, post.id);
-        assert_eq!(cancelled.trigger, RefreshTrigger::PostMutation);
+        assert_eq!(cancelled.schedule.id, post.id);
+        assert_eq!(cancelled.schedule.trigger, RefreshTrigger::PostMutation);
+        assert_eq!(cancelled.schedule.merged_manual_requests, 1);
+        assert!(cancelled.trailing_manual);
         assert_eq!(scheduler.active_id(), None);
     }
 
