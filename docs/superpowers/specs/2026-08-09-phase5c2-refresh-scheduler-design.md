@@ -111,20 +111,24 @@ initial refresh immediately, polls ordinary refresh futures alongside incoming
 requests, and drops an ordinary future before executing a preempting request.
 The engine never polls a snapshot and a mutation future concurrently.
 
-Rename the UI-originated `EngineRequest::Refresh` variant to
-`EngineRequest::ManualRefresh`. Periodic demand remains internal to the engine.
+`EngineRequest` carries only normal `Apply` and `ApplyPlan` work on its bounded
+capacity-32 lane. UI-originated manual demand uses a separate bounded
+capacity-32 signal lane, while typed `RollbackRequest` uses a dedicated bounded
+capacity-1 safety-priority lane. Periodic demand remains internal to the engine.
 Normal mutation requests retain FIFO order and are never discarded. Rollback
 is never discarded and may overtake queued normal work only as the documented
 safety exception.
 
-The engine maintains a small local FIFO for requests it has already removed
-from the bounded receiver. Immediately before a post-mutation refresh it may
-drain currently available requests into that FIFO. Manual requests already
-present are absorbed by the newer post-mutation snapshot; normal mutation
-requests retain their original order. A rollback already observed by the
-mandatory driver may overtake that normal work as the safety exception. Manual
-requests arriving after the post-mutation snapshot starts follow the normal
-rule and produce one trailing manual refresh.
+The engine maintains a capacity-32 local FIFO only for normal work it has
+already removed from the normal receiver. Immediately before a post-mutation
+refresh it may fill available local slots from that lane. Manual demand already
+present is absorbed by the newer post-mutation snapshot. While reconciliation
+is active, manual demand remains observable and creates one trailing manual
+lifecycle; normal work is read only while local capacity remains. The rollback
+lane stays observable even when the local FIFO is full, so safety work cannot
+be hidden behind saturation. It may overtake normal work, cancels the snapshot,
+and carries already-observed trailing manual demand through the fresh mandatory
+reconciliation.
 
 ### Fixed-delay timer
 
@@ -154,7 +158,7 @@ mechanism because scheduling is based on one explicit next deadline.
 
 ### Mutation preemption
 
-1. A mutation, plan, or rollback arrives during an ordinary refresh.
+1. A normal mutation/plan or priority-lane rollback arrives during an ordinary refresh.
 2. The engine drops the snapshot future and emits `RefreshCancelled` with its
    identity, trigger, elapsed duration, cancellation reason, and accumulated
    coalescing counts.
@@ -208,11 +212,11 @@ The following post-mutation `RefreshStarted` event restores the spinner while
 reconciliation runs. Existing success and failure reconciliation in the pure
 reducer remains unchanged.
 
-Manual refresh effects use the reliable request-send path that drains engine
-events while waiting for bounded-channel capacity. The current best-effort
-`try_send` is insufficient because a full queue does not prove that a manual
-refresh newer than the active snapshot will occur. Periodic demand never uses
-the request channel.
+Manual refresh effects use their bounded lane through the same reliable send
+helper that drains engine events while waiting for capacity. Normal and
+rollback lanes use that helper too. The current best-effort `try_send` is
+insufficient because a full queue does not prove that a manual refresh newer
+than the active snapshot will occur. Periodic demand never uses an input lane.
 
 ## Observability
 
@@ -235,12 +239,14 @@ tests and logs without adding permanent header noise.
   the categorized error to the operator.
 - Cancellation is a scheduler outcome, never a backend failure.
 - A closed event channel stops the engine cleanly, as it does today.
-- Mutation, plan, and rollback requests continue using reliable bounded sends;
-  an observed rollback receives safety priority inside mandatory reconciliation.
-- Manual refresh switches to the same deadlock-safe reserving send; engine
-  events are drained while the UI waits for capacity.
-- The scheduler stores only booleans, counters, one active lifecycle, and a
-  bounded-channel-derived local FIFO. It cannot create an unbounded queue.
+- Normal mutations/plans, manual demand, and rollback use distinct bounded
+  lanes and the same reliable reserving send; engine events are drained while
+  the UI waits for capacity.
+- The rollback lane reserves one safety slot and remains observable inside
+  mandatory reconciliation even when the local normal FIFO is saturated.
+- The scheduler stores only booleans, counters, and one active lifecycle; the
+  engine's only local FIFO is bounded by the normal request-channel capacity.
+  No lane or local state can create an unbounded queue.
 - If the engine stops while the UI is waiting to send, the existing visible
   engine-gone handling remains in effect.
 

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make ordinary refreshes cancellable by confirmed mutations, keep manual and periodic demand bounded and coalesced, and guarantee one complete reconciliation after every mutation.
+**Goal:** Make ordinary refreshes cancellable by confirmed mutations, keep manual and periodic demand bounded and coalesced, and guarantee complete reconciliation after every normal mutation, with safety rollback as the sole priority exception that restarts reconciliation.
 
-**Architecture:** Add a pure application-layer scheduler that owns refresh policy and typed lifecycle metadata while the existing engine remains the single owner of backend I/O. The engine polls one ordinary snapshot alongside requests, drops that read before a preempting mutation, runs post-mutation refreshes non-preemptibly, and schedules periodic work with a fixed delay after completion. The UI tracks refresh identity and preserves stale data across cancellation or failure.
+**Architecture:** Add a pure application-layer scheduler that owns refresh policy and typed lifecycle metadata while the existing engine remains the single owner of backend I/O. The engine polls one ordinary snapshot alongside bounded normal, manual-demand, and safety-rollback lanes; drops that read before preempting work; and runs post-mutation refreshes non-preemptibly by normal mutations. A rollback on the dedicated priority lane is the explicit safety exception: it drops a blocked reconciliation, executes exactly once, and starts a fresh mandatory reconciliation. Periodic work uses a fixed delay after final completion. The UI tracks refresh identity and preserves stale data across cancellation or failure.
 
 **Tech Stack:** Rust 1.88, Tokio bounded MPSC/time/test-util, ratatui pure reducer, tracing, cargo-llvm-cov, Bash/jq, Docker Compose real-firewalld matrix.
 
@@ -13,17 +13,17 @@
 ## Guardrails
 
 - Never run a real-firewalld test on the host; use only the disposable Compose services.
-- Never cancel, reorder, coalesce, or concurrently poll a mutation, plan, or rollback future.
+- Never cancel, coalesce, or concurrently poll a mutation, plan, or rollback future. Normal mutations and plans remain FIFO; a safety rollback may overtake queued normal work only through its documented bounded priority lane.
 - Keep exactly one backend snapshot future active and drop it before starting a preempting mutation.
-- Treat `PostMutation` refresh as mandatory and non-preemptible.
+- Treat `PostMutation` refresh as mandatory and non-preemptible by normal mutations. A safety rollback may cancel it only if the engine immediately executes the rollback and restarts mandatory reconciliation.
 - Preserve stale snapshots and categorized backend errors; cancellation is not an error.
-- Keep request/event channels bounded and cap any local FIFO at the request-channel capacity.
+- Keep every request/event lane bounded: normal requests and manual demand each have capacity 32, rollback has reserved capacity 1, events have capacity 64, and the local normal FIFO never exceeds 32.
 - Do not change backend fetch algorithms, snapshot schema, refresh configuration, selected-zone behavior, or lazy details in this slice.
 - Do not use `unwrap`, `expect`, `panic!`, or shell interpolation in production code.
 
 ## File Responsibility Map
 
-- `src/application/api.rs`: public engine protocol, refresh identity, trigger, cancellation reason, and lifecycle observations.
+- `src/application/api.rs`: public engine protocol, bounded normal/manual/rollback lanes, refresh identity, trigger, cancellation reason, and lifecycle observations.
 - `src/application/refresh_scheduler.rs`: pure refresh state machine; no Tokio, backend, channels, or I/O.
 - `src/application/engine.rs`: fixed-delay timer, one active backend future, request serialization, cancellation, and tracing.
 - `src/application/ports.rs`: cancellation-safety contract for backend snapshot futures.
@@ -438,7 +438,10 @@ Expected: compilation fails because lifecycle events and the cancellable driver 
 
 - [x] **Step 3: Extend the engine protocol.**
 
-Rename `EngineRequest::Refresh` to `EngineRequest::ManualRefresh`. Replace the two refresh event variants with:
+Keep `EngineRequest` for normal `Apply` and `ApplyPlan` work. Move manual demand
+to its own bounded `Sender<()>` lane and move `RollbackRequest` to a dedicated
+bounded safety-priority lane, so neither can be hidden behind a saturated local
+normal FIFO. Replace the two refresh event variants with:
 
 ```rust
 RefreshStarted {
@@ -467,11 +470,11 @@ Introduce private outcomes with no backend types exposed through the public API:
 enum OrdinaryRefreshOutcome {
     Completed(SnapshotRead),
     Preempted {
-        request: EngineRequest,
+        work: EngineWork,
         schedule: RefreshScheduleObservation,
         elapsed: Duration,
     },
-    RequestsClosed,
+    Shutdown,
 }
 ```
 
@@ -480,16 +483,18 @@ Implement these helpers:
 ```rust
 async fn drive_ordinary_refresh<B: FirewallBackend>(
     backend: &B,
-    requests: &mut mpsc::Receiver<EngineRequest>,
+    inputs: &mut EngineReceivers,
     scheduler: &mut RefreshScheduler,
     start: RefreshStart,
 ) -> OrdinaryRefreshOutcome;
 
 async fn drive_mandatory_refresh<B: FirewallBackend>(
     backend: &B,
+    inputs: &mut EngineReceivers,
+    pending_requests: &mut VecDeque<EngineRequest>,
     scheduler: &mut RefreshScheduler,
     start: RefreshStart,
-) -> Option<(SnapshotRead, RefreshCompletion)>;
+) -> MandatoryRefreshOutcome;
 
 async fn send_refresh_started(
     events: &mpsc::Sender<EngineEvent>,
@@ -503,14 +508,14 @@ async fn send_refresh_finished(
 ) -> Result<(), ()>;
 ```
 
-`drive_ordinary_refresh` pins exactly one `snapshot_observed` future and selects between it and `requests.recv()`:
+`drive_ordinary_refresh` pins exactly one `snapshot_observed` future and selects between it, channel closure, and all three bounded input lanes:
 
-- manual request: call `record_manual` and keep polling the same future;
-- mutation/plan/rollback: call `cancel_for_mutation`, return `Preempted`, and let the pinned future drop when the helper returns;
-- closed receiver: return `RequestsClosed` so the future drops and the engine exits;
+- manual demand: call `record_manual` and keep polling the same future;
+- normal mutation/plan or rollback: cancel the ordinary lifecycle, return `Preempted`, and let the pinned future drop when the helper returns;
+- closed inputs or event channel: return `Shutdown` so the future drops and the engine exits;
 - completed read: call `finish` and return the same backend result and observation.
 
-The outer loop must not call `execute_request` until `drive_ordinary_refresh` has returned. After a preemption, emit `RefreshCancelled`, execute the exact returned request, then start one `PostMutation` refresh. Await mandatory refresh directly without selecting the request channel.
+The outer loop must not execute work until `drive_ordinary_refresh` has returned. After a preemption, emit `RefreshCancelled`, execute the exact returned work, then start one `PostMutation` refresh. The mandatory driver continues observing bounded demand: it buffers normal work only while the local FIFO has capacity, records manual demand, and permits only the safety rollback lane to cancel the snapshot. After that rollback it starts a fresh mandatory reconciliation before normal FIFO work resumes.
 
 Replace `tokio::time::interval` with one resettable `tokio::time::Sleep`. Arm it for `now + refresh_interval` only after the final completed refresh in a lifecycle. A trailing manual refresh starts immediately and delays timer arming until it completes.
 Use `tokio::time::Instant` for cancellation elapsed time so paused-clock tests
@@ -578,30 +583,38 @@ rtk cargo test --locked application::engine::tests::blocked_refresh_manual_burst
 
 Expected: at least the mandatory/FIFO assertions fail until queued-request handling is explicit.
 
-- [x] **Step 3: Add one bounded pending-request FIFO.**
+- [x] **Step 3: Add bounded typed input lanes and one normal pending-request FIFO.**
 
 Define the channel capacities once in `api.rs`:
 
 ```rust
 pub(crate) const REQUEST_CAPACITY: usize = 32;
+const MANUAL_REFRESH_CAPACITY: usize = REQUEST_CAPACITY;
+const ROLLBACK_CAPACITY: usize = 1;
 const EVENT_CAPACITY: usize = 64;
 ```
 
-Use them in `spawn`. The engine local FIFO must never exceed `REQUEST_CAPACITY`.
+Use them in `spawn`. `EngineRequest` contains only normal `Apply`/`ApplyPlan`
+work; manual demand and typed rollback use their own bounded lanes. The engine
+local FIFO contains only normal work and must never exceed `REQUEST_CAPACITY`.
 
 Immediately after executing a preempting request:
 
 1. start the `PostMutation` scheduler lifecycle;
-2. while the local FIFO has capacity, drain immediately available channel requests;
-3. call `scheduler.absorb_manual()` for each observed `ManualRefresh`;
-4. retain every mutation/plan/rollback in arrival order; and
-5. await the mandatory snapshot without polling the receiver.
+2. absorb immediately available manual demand into the newer snapshot;
+3. while the local FIFO has capacity, drain immediately available normal work;
+4. retain every normal mutation/plan in arrival order; and
+5. drive the mandatory snapshot while still observing manual and rollback lanes, and the normal lane only while the local FIFO has capacity.
 
-After the mandatory refresh completes, consume the local FIFO before receiving newer channel items. If the local FIFO is full, stop draining; never create a second queue or grow it beyond 32. A manual request not yet observed remains in the bounded channel and may legitimately become one later trailing refresh.
+After the mandatory refresh completes, consume the local normal FIFO before newer normal channel items. If the local FIFO is full, stop draining normal work; never create a second normal queue or grow it beyond 32. Manual demand observed after the post-mutation read starts becomes exactly one trailing manual lifecycle with its exact merged count. The priority rollback lane stays observable even when the normal FIFO is full; it may overtake normal work, but is never duplicated or discarded.
 
 - [x] **Step 4: Make the mandatory boundary explicit.**
 
-`drive_mandatory_refresh` must not accept a request receiver. Its signature is the proof that no later request can cancel a post-mutation snapshot. Add a comment at the call site explaining that later mutations wait because each engine mutation needs one complete observed-state reconciliation.
+`drive_mandatory_refresh` accepts the typed receiver bundle so it can observe
+closure, manual demand, and the dedicated safety lane. It must never let normal
+requests cancel the snapshot: normal work is FIFO-buffered only up to the local
+cap. A rollback is the sole preemption exception; the snapshot is dropped
+before rollback execution and a fresh mandatory lifecycle completes afterward.
 
 - [x] **Step 5: Run GREEN and regression tests.**
 
@@ -638,7 +651,9 @@ Add reducer tests named
 
 The matching-cancellation test seeds `snapshot`, `last_refresh`, and `backend_error`, starts ID 9, cancels ID 9, and asserts only active lifecycle state changes. Cancellation must not clear or overwrite those three values.
 
-In `ui::mod` add an async test with a capacity-one request channel. Fill the channel, begin the manual refresh effect, drain the first request, and assert the waiting effect reliably sends `EngineRequest::ManualRefresh` rather than returning early.
+In `ui::mod` add an async test with a capacity-one manual-demand lane. Fill the
+lane, begin the manual refresh effect, drain the first signal, and assert the
+waiting effect reliably sends the second signal rather than returning early.
 
 - [x] **Step 2: Run RED.**
 
@@ -695,13 +710,20 @@ Replace the `try_send` arm with:
 
 ```rust
 Effect::Refresh => {
-    if !send_request(engine, pending, EngineRequest::ManualRefresh).await {
+    if !send_request(
+        &engine.manual_refreshes,
+        &mut engine.events,
+        pending,
+        (),
+    ).await {
         state.toast(state::ToastKind::Error, "engine is gone — refresh not sent");
     }
 }
 ```
 
-Keep `send_request`'s event-draining `reserve` loop unchanged. Do not add an unbounded channel or block without draining events.
+Keep `send_request` generic and preserve its event-draining `reserve` loop for
+normal, manual, and rollback lanes. Do not add an unbounded channel or block
+without draining events.
 
 - [x] **Step 5: Run GREEN and UI regression targets.**
 
