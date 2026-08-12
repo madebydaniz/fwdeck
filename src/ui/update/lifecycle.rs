@@ -12,24 +12,30 @@ pub(super) fn operation_finished(
     state: &mut UiState,
     op_id: u64,
     outcome: OperationOutcome,
-    rollback: Option<RollbackRegistration>,
+    mut rollback: Option<RollbackRegistration>,
     guard_warning: Option<String>,
     is_forward_operation: bool,
 ) -> Vec<Effect> {
     let risky = is_forward_operation
         && state.rollback_ticks != 0
         && outcome.operation().connectivity_warning().is_some();
-    if risky {
-        let Some(remaining) = state.rollback_reservations.checked_sub(1) else {
-            state.toast(
-                ToastKind::Error,
-                "internal error: risky operation finished without a rollback reservation",
-            );
-            return record_operation_finished(state, op_id, outcome, rollback, guard_warning);
-        };
-        state.rollback_reservations = remaining;
+    let missing_reservation = risky && !super::consume_rollback_reservation(state);
+    if missing_reservation {
+        state.toast(
+            ToastKind::Error,
+            "internal error: risky operation finished without a rollback reservation",
+        );
     }
-    record_operation_finished(state, op_id, outcome, rollback, guard_warning)
+    let emergency_rollback = missing_reservation.then(|| rollback.take()).flatten();
+    let mut effects = record_operation_finished(state, op_id, outcome, rollback, guard_warning);
+    if let Some(rollback) = emergency_rollback {
+        effects.push(Effect::ApplyRollback {
+            id: rollback.id,
+            operation: rollback.inverse,
+            watchdog_unit: rollback.watchdog_unit,
+        });
+    }
+    effects
 }
 
 fn record_operation_finished(
