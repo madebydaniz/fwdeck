@@ -97,6 +97,16 @@ pub struct PendingRollback {
     pub watchdog_unit: Option<String>,
 }
 
+/// Reservation progress for the one sequential mutation plan currently
+/// submitted to the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlanRollbackReservations {
+    /// Risky operations reserved before the plan was submitted.
+    pub(crate) total: usize,
+    /// Risky forward outcomes already received for this plan.
+    pub(crate) consumed: usize,
+}
+
 /// A transient notification rendered in the toast stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
@@ -175,6 +185,10 @@ pub struct UiState {
     pub rollback_outbox_pending: usize,
     /// Capacity reserved by submitted risky operations awaiting outcomes.
     pub rollback_reservations: usize,
+    /// Risky single-operation reservations submitted before any active plan.
+    pub(crate) single_rollback_reservations: usize,
+    /// Exact reservation progress for the active sequential plan.
+    pub(crate) in_flight_plan_rollback: Option<PlanRollbackReservations>,
     /// Dead-man's switch window in ticks; 0 = disabled.
     pub rollback_ticks: u64,
     /// Monotonic UI clock, incremented every 250 ms tick.
@@ -246,6 +260,8 @@ impl UiState {
             engine_normal_backpressured: false,
             rollback_outbox_pending: 0,
             rollback_reservations: 0,
+            single_rollback_reservations: 0,
+            in_flight_plan_rollback: None,
             rollback_ticks: config.rollback_timeout.as_secs() * 4, // 250 ms ticks
             tick: 0,
             read_only: config.read_only,
