@@ -604,15 +604,30 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             );
         }
         UiAction::PlanFinished { applied, remaining } => {
-            let release = match state.in_flight_plan_rollback.take() {
-                Some(plan) => plan.total.checked_sub(plan.consumed).unwrap_or_else(|| {
+            let release = if let Some(plan) = state.in_flight_plan_rollback.take() {
+                plan.total.checked_sub(plan.consumed).unwrap_or_else(|| {
                     state.toast(
                         ToastKind::Error,
                         "internal error: plan consumed more rollback reservations than it owned",
                     );
                     0
-                }),
-                None => risky_operation_count(&remaining, state.rollback_ticks),
+                })
+            } else {
+                state.toast(
+                    ToastKind::Error,
+                    "internal error: plan finished without an active plan",
+                );
+                let unclassified = state
+                    .rollback_reservations
+                    .checked_sub(state.single_rollback_reservations)
+                    .unwrap_or_else(|| {
+                        state.toast(
+                            ToastKind::Error,
+                            "internal error: single rollback reservations exceed the total",
+                        );
+                        0
+                    });
+                risky_operation_count(&remaining, state.rollback_ticks).min(unclassified)
             };
             release_rollback_reservations(state, release, "halted plan");
             if remaining.is_empty() {
@@ -842,7 +857,7 @@ fn reserve_plan_rollback_capacity(state: &mut UiState, required: usize) -> bool 
         return false;
     };
     state.rollback_reservations = total;
-    state.in_flight_plan_rollback = (required != 0).then_some(PlanRollbackReservations {
+    state.in_flight_plan_rollback = Some(PlanRollbackReservations {
         total: required,
         consumed: 0,
     });
@@ -3767,6 +3782,124 @@ mod tests {
 
         assert!(matches!(effects.as_slice(), [Effect::ApplyPlan(_)]));
         assert_eq!(state.rollback_reservations, 2);
+    }
+
+    #[test]
+    fn zero_risk_plan_blocks_mutations_until_plan_finished() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        state.staged = vec![FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("mdns").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        }];
+
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyStagedPlan).as_slice(),
+            [Effect::ApplyPlan(_)]
+        ));
+        assert_eq!(state.rollback_reservations, 0);
+        assert!(state.in_flight_plan_rollback.is_some());
+
+        let mutation = FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("samba-client").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        assert!(
+            update(
+                &mut state,
+                UiAction::ApplyOperation(reviewed(mutation.clone()))
+            )
+            .is_empty()
+        );
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Warning && toast.text.contains("plan is still running")
+        }));
+
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+        assert!(state.in_flight_plan_rollback.is_none());
+        assert_eq!(state.rollback_reservations, 0);
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyOperation(reviewed(mutation))).as_slice(),
+            [Effect::Apply(_)]
+        ));
+    }
+
+    #[test]
+    fn duplicate_zero_risk_plan_finished_is_safe_and_visible() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        state.staged = vec![FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("mdns").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        }];
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyStagedPlan).as_slice(),
+            [Effect::ApplyPlan(_)]
+        ));
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+        state.toasts.clear();
+
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+
+        assert!(state.in_flight_plan_rollback.is_none());
+        assert_eq!(state.rollback_reservations, 0);
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Error && toast.text.contains("without an active plan")
+        }));
+    }
+
+    #[test]
+    fn unexpected_plan_finished_does_not_release_single_reservation() {
+        let mut state = state();
+        let operation = FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("http").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        assert!(matches!(
+            update(
+                &mut state,
+                UiAction::ApplyOperation(reviewed(operation.clone()))
+            )
+            .as_slice(),
+            [Effect::Apply(_)]
+        ));
+        assert_eq!(state.rollback_reservations, 1);
+
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                applied: 0,
+                remaining: vec![operation],
+            },
+        );
+
+        assert_eq!(state.rollback_reservations, 1);
+        assert_eq!(state.single_rollback_reservations, 1);
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Error && toast.text.contains("without an active plan")
+        }));
     }
 
     #[test]
