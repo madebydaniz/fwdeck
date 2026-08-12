@@ -169,6 +169,12 @@ pub struct UiState {
     /// Armed dead-man's-switch rollbacks, oldest first. A stack, not a slot:
     /// a second risky change must never silently overwrite the first inverse.
     pub pending_rollback: Vec<PendingRollback>,
+    /// Whether the shell's single normal-priority engine-outbox slot is full.
+    pub engine_normal_backpressured: bool,
+    /// Rollback-priority requests waiting in the shell outbox.
+    pub rollback_outbox_pending: usize,
+    /// Capacity reserved by submitted risky operations awaiting outcomes.
+    pub rollback_reservations: usize,
     /// Dead-man's switch window in ticks; 0 = disabled.
     pub rollback_ticks: u64,
     /// Monotonic UI clock, incremented every 250 ms tick.
@@ -237,6 +243,9 @@ impl UiState {
             last_refresh: None,
             verify_next_refresh: Vec::new(),
             pending_rollback: Vec::new(),
+            engine_normal_backpressured: false,
+            rollback_outbox_pending: 0,
+            rollback_reservations: 0,
             rollback_ticks: config.rollback_timeout.as_secs() * 4, // 250 ms ticks
             tick: 0,
             read_only: config.read_only,

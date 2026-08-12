@@ -239,6 +239,13 @@ pub enum UiAction {
         /// Tokio-clock duration before cancellation.
         elapsed: Duration,
     },
+    /// The shell's bounded engine-outbox occupancy changed.
+    EngineOutboxChanged {
+        /// Whether the single normal-priority slot is occupied.
+        normal_pending: bool,
+        /// Rollback-priority requests waiting in the shell outbox.
+        rollback_pending: usize,
+    },
     /// A manual refresh batch exceeded the exact lifecycle metadata limit.
     ManualDemandRejected {
         /// Exact rejected demand for the operator-facing notification.
