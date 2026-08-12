@@ -33,6 +33,7 @@ pub(crate) struct ManualDemandOverflow;
 pub(crate) struct RefreshScheduler {
     next_id: u64,
     active: Option<ActiveRefresh>,
+    pending_manual_start: Option<u64>,
     trailing_manual: bool,
 }
 
@@ -60,6 +61,7 @@ impl RefreshScheduler {
         Self {
             next_id: 1,
             active: None,
+            pending_manual_start: None,
             trailing_manual: false,
         }
     }
@@ -70,10 +72,15 @@ impl RefreshScheduler {
         }
         let id = RefreshId::new(self.next_id);
         self.next_id = self.next_id.wrapping_add(1).max(1);
+        let merged_manual_requests = if trigger == RefreshTrigger::Manual {
+            self.pending_manual_start.take().unwrap_or(0)
+        } else {
+            0
+        };
         self.active = Some(ActiveRefresh {
             id,
             trigger,
-            merged_manual_requests: 0,
+            merged_manual_requests,
             coalesced_periodic_ticks: 0,
         });
         Some(RefreshStart { id, trigger })
@@ -88,6 +95,14 @@ impl RefreshScheduler {
         count: NonZeroU64,
     ) -> Result<RefreshDemand, ManualDemandOverflow> {
         let Some(active) = self.active.as_mut() else {
+            if let Some(pending) = self.pending_manual_start {
+                let merged_manual_requests = pending
+                    .checked_add(count.get())
+                    .ok_or(ManualDemandOverflow)?;
+                self.pending_manual_start = Some(merged_manual_requests);
+                return Ok(RefreshDemand::Coalesced);
+            }
+            self.pending_manual_start = Some(count.get() - 1);
             return Ok(RefreshDemand::StartNow);
         };
         let merged_manual_requests = active
@@ -177,6 +192,42 @@ mod tests {
         );
         let completion = scheduler.finish(start.id).unwrap();
         assert_eq!(completion.schedule.merged_manual_requests, 7);
+    }
+
+    #[test]
+    fn idle_manual_batch_retains_remaining_count_for_started_lifecycle() {
+        let mut scheduler = RefreshScheduler::new();
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::new(7).unwrap()),
+            Ok(RefreshDemand::StartNow),
+        );
+
+        let start = scheduler.start(RefreshTrigger::Manual).unwrap();
+        let completion = scheduler.finish(start.id).unwrap();
+        assert_eq!(completion.schedule.merged_manual_requests, 6);
+        assert!(!completion.trailing_manual);
+    }
+
+    #[test]
+    fn idle_manual_batch_overflow_keeps_pending_count_unchanged() {
+        let mut scheduler = RefreshScheduler::new();
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::new(u64::MAX).unwrap()),
+            Ok(RefreshDemand::StartNow),
+        );
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::MIN),
+            Ok(RefreshDemand::Coalesced),
+        );
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::MIN),
+            Err(ManualDemandOverflow),
+        );
+
+        let start = scheduler.start(RefreshTrigger::Manual).unwrap();
+        let completion = scheduler.finish(start.id).unwrap();
+        assert_eq!(completion.schedule.merged_manual_requests, u64::MAX);
+        assert!(!completion.trailing_manual);
     }
 
     #[test]

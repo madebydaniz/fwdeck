@@ -239,6 +239,11 @@ pub enum UiAction {
         /// Tokio-clock duration before cancellation.
         elapsed: Duration,
     },
+    /// A manual refresh batch exceeded the exact lifecycle metadata limit.
+    ManualDemandRejected {
+        /// Exact rejected demand for the operator-facing notification.
+        count: std::num::NonZeroU64,
+    },
     /// The engine event channel closed unexpectedly.
     EngineStopped(FirewallError),
     /// New kernel/netfilter log entries from the log tailer.

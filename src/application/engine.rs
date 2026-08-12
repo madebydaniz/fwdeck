@@ -1689,6 +1689,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_batched_manual_request_retains_six_merged_requests() {
+        let (_request_tx, request_rx) = mpsc::channel(8);
+        let (inputs, manual_tx, _rollback_tx) = test_receiver_lanes(request_rx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            inputs,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(_),
+                ..
+            } if schedule.trigger == RefreshTrigger::Initial
+        ));
+
+        manual_tx
+            .send(ManualRefreshRequest::new(
+                std::num::NonZeroU64::new(7).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Manual,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(_),
+                ..
+            } if schedule.trigger == RefreshTrigger::Manual
+                && schedule.merged_manual_requests == 6
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(backend.snapshot_calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn manual_batch_overflow_is_rejected_without_corrupting_active_lifecycle() {
         let (_request_tx, request_rx) = mpsc::channel(8);
         let (inputs, manual_tx, _rollback_tx) = test_receiver_lanes(request_rx);
