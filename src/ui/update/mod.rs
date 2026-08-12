@@ -640,6 +640,10 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.active_refresh = None;
             }
         }
+        UiAction::ManualDemandRejected { count } => state.toast(
+            ToastKind::Error,
+            format!("manual refresh demand limit reached — {count} request(s) not queued"),
+        ),
         UiAction::EngineStopped(error) => {
             state.active_refresh = None;
             state.backend_error = Some(error);
@@ -1526,6 +1530,65 @@ mod tests {
         ));
         assert_eq!(s.last_refresh, Some(previous_refresh));
         assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
+    }
+
+    #[test]
+    fn manual_demand_rejection_preserves_lifecycle_and_allows_completion() {
+        use crate::application::{FirewallError, RefreshId, RefreshTrigger};
+        use crate::domain::RefreshObservation;
+        use std::num::NonZeroU64;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let mut s = state();
+        let refresh_id = RefreshId::new(9);
+        let original_snapshot = Arc::clone(s.snapshot.as_ref().unwrap());
+        let previous_refresh = RefreshObservation::total_only(Duration::from_secs(7));
+        s.active_refresh = Some(refresh_id);
+        s.backend_error = Some(FirewallError::DaemonNotRunning);
+        s.last_refresh = Some(previous_refresh.clone());
+        let toast_count = s.toasts.len();
+
+        assert!(
+            update(
+                &mut s,
+                UiAction::ManualDemandRejected {
+                    count: NonZeroU64::new(7).unwrap(),
+                },
+            )
+            .is_empty()
+        );
+
+        assert_eq!(s.active_refresh, Some(refresh_id));
+        assert!(Arc::ptr_eq(
+            s.snapshot.as_ref().unwrap(),
+            &original_snapshot
+        ));
+        assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
+        assert_eq!(s.last_refresh, Some(previous_refresh));
+        assert_eq!(s.toasts.len(), toast_count + 1);
+        let toast = s.toasts.back().unwrap();
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert!(toast.text.contains("7 request(s) not queued"));
+
+        let completed_snapshot = Arc::new(mock::sample().unwrap());
+        let completed_refresh = RefreshObservation::total_only(Duration::from_millis(42));
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(refresh_id, RefreshTrigger::Manual),
+                result: Ok(Arc::clone(&completed_snapshot)),
+                observation: completed_refresh.clone(),
+            },
+        );
+
+        assert_eq!(s.active_refresh, None);
+        assert!(Arc::ptr_eq(
+            s.snapshot.as_ref().unwrap(),
+            &completed_snapshot
+        ));
+        assert_eq!(s.backend_error, None);
+        assert_eq!(s.last_refresh, Some(completed_refresh));
     }
 
     #[test]

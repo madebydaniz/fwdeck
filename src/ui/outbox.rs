@@ -135,6 +135,7 @@ mod tests {
             Err(NormalEnqueueError::Full(second))
         );
         assert_eq!(outbox.take_normal(), Some(first));
+        assert_eq!(outbox.take_normal(), None);
     }
 
     #[test]
@@ -164,6 +165,9 @@ mod tests {
             outbox.enqueue_rollback(overflow.clone()),
             Err(RollbackEnqueueError::Full(overflow))
         );
-        assert_eq!(outbox.take_rollback(), Some(rollback_request(1)));
+        for id in 1..=32 {
+            assert_eq!(outbox.take_rollback(), Some(rollback_request(id)));
+        }
+        assert_eq!(outbox.take_rollback(), None);
     }
 }

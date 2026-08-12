@@ -177,12 +177,7 @@ fn engine_event_action(event: EngineEvent) -> UiAction {
             reason,
             elapsed,
         },
-        EngineEvent::ManualDemandRejected { count } => {
-            UiAction::EngineStopped(FirewallError::Process(format!(
-                "manual refresh demand limit reached — {} request(s) not queued",
-                count.get()
-            )))
-        }
+        EngineEvent::ManualDemandRejected { count } => UiAction::ManualDemandRejected { count },
         EngineEvent::OperationFinished(result) => UiAction::OperationFinished(result),
         EngineEvent::PlanFinished { applied, remaining } => {
             UiAction::PlanFinished { applied, remaining }
@@ -543,7 +538,7 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
-    use super::{base64_encode, drain_rollbacks_on_exit, execute_effect};
+    use super::{base64_encode, drain_rollbacks_on_exit, engine_event_action, execute_effect};
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -552,6 +547,19 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_encode(b"foo"), "Zm9v");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn manual_demand_rejection_maps_to_notification_action() {
+        use crate::application::EngineEvent;
+        use crate::ui::action::UiAction;
+        use std::num::NonZeroU64;
+
+        let count = NonZeroU64::new(7).unwrap();
+        assert_eq!(
+            engine_event_action(EngineEvent::ManualDemandRejected { count }),
+            UiAction::ManualDemandRejected { count }
+        );
     }
 
     #[tokio::test]
