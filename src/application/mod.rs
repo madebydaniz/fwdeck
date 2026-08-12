@@ -7,9 +7,9 @@ pub mod ports;
 mod refresh_scheduler;
 
 pub use api::{
-    EngineEvent, EngineHandle, EngineRequest, MutationPlan, MutationRequest, OperationResult,
-    RefreshCancellationReason, RefreshId, RefreshScheduleObservation, RefreshTrigger,
-    RollbackRegistration, RollbackRequest,
+    EngineEvent, EngineHandle, EngineRequest, ManualRefreshRequest, MutationPlan, MutationRequest,
+    OperationResult, RefreshCancellationReason, RefreshId, RefreshScheduleObservation,
+    RefreshTrigger, RollbackRegistration, RollbackRequest,
 };
 pub use ports::{
     FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardError,

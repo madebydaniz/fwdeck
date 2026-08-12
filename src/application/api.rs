@@ -1,6 +1,7 @@
 //! Channel-based handle connecting the UI loop to the engine task. The UI
 //! depends on these types only — never on `FirewallBackend` implementations.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -134,6 +135,22 @@ pub enum RefreshCancellationReason {
     RollbackPreempted,
 }
 
+/// One or more coalescible manual refresh requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManualRefreshRequest(NonZeroU64);
+
+impl ManualRefreshRequest {
+    #[must_use]
+    pub const fn new(count: NonZeroU64) -> Self {
+        Self(count)
+    }
+
+    #[must_use]
+    pub const fn count(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
 /// A safety rollback sent over its dedicated bounded priority lane.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RollbackRequest {
@@ -187,6 +204,11 @@ pub enum EngineEvent {
         /// Deterministic Tokio-clock duration before cancellation.
         elapsed: Duration,
     },
+    /// A manual batch could not be represented without overflowing lifecycle metadata.
+    ManualDemandRejected {
+        /// Exact rejected demand; the active lifecycle remains valid.
+        count: NonZeroU64,
+    },
     /// One operation completed with its honest [`OperationOutcome`]
     /// (applied / partially applied / failed — never a swallowed partial),
     /// plus the correlation id shared with tracing and the audit line.
@@ -209,7 +231,7 @@ pub struct EngineHandle {
     /// Bounded normal mutation channel into the engine (capacity 32).
     pub requests: mpsc::Sender<EngineRequest>,
     /// Bounded manual-demand lane (capacity 32); active demand is coalesced.
-    pub manual_refreshes: mpsc::Sender<()>,
+    pub manual_refreshes: mpsc::Sender<ManualRefreshRequest>,
     /// Bounded safety-priority rollback lane (capacity 1).
     pub rollbacks: mpsc::Sender<RollbackRequest>,
     /// Bounded event channel out of the engine (capacity 64).
