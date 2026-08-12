@@ -1,6 +1,6 @@
 # Phase 5C2 Non-Blocking UI Outbox Design
 
-**Status:** Option accepted in chat on 2026-08-13; written review pending.
+**Status:** Accepted on 2026-08-13 after written review.
 
 ## Problem
 
