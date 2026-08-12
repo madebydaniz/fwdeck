@@ -8,6 +8,8 @@ pub mod components;
 pub mod details;
 pub mod fuzzy;
 pub mod keymap;
+#[allow(dead_code)] // Consumed by the non-blocking dispatch task that follows this protocol task.
+pub(super) mod outbox;
 pub mod overlays;
 pub mod palette;
 pub mod render;
@@ -18,6 +20,7 @@ pub mod theme;
 pub mod update;
 pub mod views;
 
+use std::num::NonZeroU64;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream};
@@ -25,7 +28,9 @@ use futures_util::StreamExt;
 
 use tokio::sync::mpsc;
 
-use crate::application::api::{EngineEvent, EngineHandle, EngineRequest, RollbackRequest};
+use crate::application::api::{
+    EngineEvent, EngineHandle, EngineRequest, ManualRefreshRequest, RollbackRequest,
+};
 use crate::application::ports::FirewallError;
 use crate::config::Config;
 use crate::error::AppError;
@@ -172,6 +177,12 @@ fn engine_event_action(event: EngineEvent) -> UiAction {
             reason,
             elapsed,
         },
+        EngineEvent::ManualDemandRejected { count } => {
+            UiAction::EngineStopped(FirewallError::Process(format!(
+                "manual refresh demand limit reached — {} request(s) not queued",
+                count.get()
+            )))
+        }
         EngineEvent::OperationFinished(result) => UiAction::OperationFinished(result),
         EngineEvent::PlanFinished { applied, remaining } => {
             UiAction::PlanFinished { applied, remaining }
@@ -222,7 +233,14 @@ async fn execute_effect(
     match effect {
         Effect::Quit => return ControlFlow::Break(()),
         Effect::Refresh => {
-            if !send_request(&engine.manual_refreshes, &mut engine.events, pending, ()).await {
+            if !send_request(
+                &engine.manual_refreshes,
+                &mut engine.events,
+                pending,
+                ManualRefreshRequest::new(NonZeroU64::MIN),
+            )
+            .await
+            {
                 state.toast(state::ToastKind::Error, "engine is gone — refresh not sent");
             }
         }
@@ -538,11 +556,12 @@ mod tests {
 
     #[tokio::test]
     async fn manual_refresh_waits_for_bounded_channel_capacity() {
-        use crate::application::api::EngineHandle;
+        use crate::application::api::{EngineHandle, ManualRefreshRequest};
         use crate::config::Config;
         use crate::ui::action::Effect;
         use crate::ui::state::UiState;
         use std::collections::VecDeque;
+        use std::num::NonZeroU64;
         use std::ops::ControlFlow;
         use std::time::Duration;
 
@@ -550,7 +569,8 @@ mod tests {
         let mut state = UiState::new(&config, "test".to_owned(), false, None);
         let (request_tx, _request_rx) = tokio::sync::mpsc::channel(1);
         let (manual_tx, mut manual_rx) = tokio::sync::mpsc::channel(1);
-        manual_tx.send(()).await.unwrap();
+        let manual_request = ManualRefreshRequest::new(NonZeroU64::MIN);
+        manual_tx.send(manual_request).await.unwrap();
         let (rollback_tx, _rollback_rx) = tokio::sync::mpsc::channel(1);
         let (_event_tx, event_rx) = tokio::sync::mpsc::channel(1);
         let mut engine = EngineHandle {
@@ -572,7 +592,9 @@ mod tests {
         tokio::select! {
             biased;
             outcome = &mut effect => panic!("refresh returned before capacity: {outcome:?}"),
-            request = manual_rx.recv() => request.unwrap(),
+            request = manual_rx.recv() => {
+                let _ = request.unwrap();
+            },
         }
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), &mut effect)
@@ -580,7 +602,7 @@ mod tests {
                 .unwrap(),
             ControlFlow::Continue(())
         );
-        assert_eq!(manual_rx.recv().await, Some(()));
+        assert_eq!(manual_rx.recv().await, Some(manual_request));
     }
 
     #[tokio::test]
