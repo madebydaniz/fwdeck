@@ -14,6 +14,30 @@ pub(super) fn operation_finished(
     outcome: OperationOutcome,
     rollback: Option<RollbackRegistration>,
     guard_warning: Option<String>,
+    is_forward_operation: bool,
+) -> Vec<Effect> {
+    let risky = is_forward_operation
+        && state.rollback_ticks != 0
+        && outcome.operation().connectivity_warning().is_some();
+    if risky {
+        let Some(remaining) = state.rollback_reservations.checked_sub(1) else {
+            state.toast(
+                ToastKind::Error,
+                "internal error: risky operation finished without a rollback reservation",
+            );
+            return record_operation_finished(state, op_id, outcome, rollback, guard_warning);
+        };
+        state.rollback_reservations = remaining;
+    }
+    record_operation_finished(state, op_id, outcome, rollback, guard_warning)
+}
+
+fn record_operation_finished(
+    state: &mut UiState,
+    op_id: u64,
+    outcome: OperationOutcome,
+    rollback: Option<RollbackRegistration>,
+    guard_warning: Option<String>,
 ) -> Vec<Effect> {
     state.push_audit(crate::ui::state::AuditEntry {
         tick: state.tick,
@@ -78,7 +102,7 @@ pub(super) fn operation_finished(
                 id: rollback.id,
                 forward: outcome.operation().clone(),
                 inverse: rollback.inverse,
-                deadline_tick: state.tick + state.rollback_ticks,
+                deadline_tick: state.tick.saturating_add(state.rollback_ticks),
                 description: outcome.operation().describe(),
                 watchdog_unit: rollback.watchdog_unit,
             });

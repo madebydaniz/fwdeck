@@ -194,6 +194,17 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             state.overlay_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX);
         }
         UiAction::ConfirmAccept => {
+            let required = match state.overlays.last() {
+                Some(Overlay::Confirm(confirmation)) => {
+                    confirmation_engine_reservations(&confirmation.on_confirm, state.rollback_ticks)
+                }
+                _ => None,
+            };
+            if let Some(required) = required
+                && !engine_dispatch_allowed(state, required, false)
+            {
+                return Vec::new();
+            }
             if let Some(Overlay::Confirm(confirmation)) = state.overlays.pop() {
                 return update(state, confirmation.on_confirm);
             }
@@ -369,10 +380,43 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             return plans::snapshot_loaded(state, &name, result);
         }
         UiAction::ShowStagedPlan => state.overlays.push(Overlay::Details(plan_details(state))),
-        UiAction::ApplyStagedPlan => return apply_staged_plan(state),
+        UiAction::ApplyStagedPlan => {
+            if state.engine_normal_backpressured {
+                engine_dispatch_allowed(state, 0, false);
+                return Vec::new();
+            }
+            let staged_before = state.staged.clone();
+            let toasts_before = state.toasts.clone();
+            let effects = apply_staged_plan(state);
+            let required = effects.iter().find_map(|effect| match effect {
+                Effect::ApplyPlan(plan) => Some(risky_operation_count(
+                    &plan.operations,
+                    state.rollback_ticks,
+                )),
+                _ => None,
+            });
+            if let Some(required) = required
+                && !engine_dispatch_allowed(state, required, true)
+            {
+                let rejection = state.toasts.back().cloned();
+                state.staged = staged_before;
+                state.toasts = toasts_before;
+                if let Some(rejection) = rejection {
+                    state.toast(rejection.kind, rejection.text);
+                }
+                return Vec::new();
+            }
+            return effects;
+        }
         // The confirmed apply of a staged plan (carried by the plan confirm's
         // on_confirm): arms the dead-man's switch, then dispatches the batch.
-        UiAction::ApplyPlanConfirmed(plan) => return apply_plan_now(state, plan),
+        UiAction::ApplyPlanConfirmed(plan) => {
+            let required = risky_operation_count(&plan.operations, state.rollback_ticks);
+            if !engine_dispatch_allowed(state, required, true) {
+                return Vec::new();
+            }
+            return apply_plan_now(state, plan);
+        }
         UiAction::DiscardStagedPlan => {
             let count = state.staged.len();
             state.staged.clear();
@@ -536,6 +580,13 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         UiAction::RichBuilderCommit => return rich_builder_commit(state),
         UiAction::RequestOperation(operation) => return request_operation(state, operation),
         UiAction::ApplyOperation(request) => {
+            let required = usize::from(operation_needs_rollback_reservation(
+                &request.operation,
+                state.rollback_ticks,
+            ));
+            if !engine_dispatch_allowed(state, required, true) {
+                return Vec::new();
+            }
             state.toast(
                 ToastKind::Info,
                 format!("applying: {}", request.operation.describe()),
@@ -550,9 +601,15 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 result.outcome,
                 result.rollback,
                 result.guard_warning,
+                result.completed_rollback.is_none(),
             );
         }
         UiAction::PlanFinished { applied, remaining } => {
+            release_rollback_reservations(
+                state,
+                risky_operation_count(&remaining, state.rollback_ticks),
+                "halted plan",
+            );
             if remaining.is_empty() {
                 state.toast(
                     ToastKind::Success,
@@ -640,6 +697,14 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.active_refresh = None;
             }
         }
+        UiAction::EngineOutboxChanged {
+            normal_pending,
+            rollback_pending,
+        } => {
+            state.engine_normal_backpressured = normal_pending;
+            state.rollback_outbox_pending = rollback_pending;
+            report_rollback_invariant(state, "engine outbox update");
+        }
         UiAction::ManualDemandRejected { count } => state.toast(
             ToastKind::Error,
             format!("manual refresh demand limit reached — {count} request(s) not queued"),
@@ -650,6 +715,107 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
     }
     Vec::new()
+}
+
+fn operation_needs_rollback_reservation(
+    operation: &FirewallOperation,
+    rollback_ticks: u64,
+) -> bool {
+    rollback_ticks != 0 && operation.connectivity_warning().is_some()
+}
+
+fn risky_operation_count(operations: &[FirewallOperation], rollback_ticks: u64) -> usize {
+    operations
+        .iter()
+        .filter(|operation| operation_needs_rollback_reservation(operation, rollback_ticks))
+        .count()
+}
+
+fn confirmation_engine_reservations(action: &UiAction, rollback_ticks: u64) -> Option<usize> {
+    match action {
+        UiAction::ApplyOperation(request) => Some(usize::from(
+            operation_needs_rollback_reservation(&request.operation, rollback_ticks),
+        )),
+        UiAction::ApplyPlanConfirmed(plan) => {
+            Some(risky_operation_count(&plan.operations, rollback_ticks))
+        }
+        _ => None,
+    }
+}
+
+fn rollback_capacity_used(state: &UiState) -> Option<usize> {
+    state
+        .pending_rollback
+        .len()
+        .checked_add(state.rollback_outbox_pending)?
+        .checked_add(state.rollback_reservations)
+}
+
+fn engine_dispatch_allowed(state: &mut UiState, required: usize, reserve: bool) -> bool {
+    if state.engine_normal_backpressured {
+        state.toast(
+            ToastKind::Warning,
+            "engine request queue is busy — retry shortly",
+        );
+        return false;
+    }
+    let Some(used) = rollback_capacity_used(state) else {
+        state.toast(
+            ToastKind::Error,
+            "internal error: rollback capacity accounting overflow",
+        );
+        return false;
+    };
+    let Some(next) = used.checked_add(required) else {
+        state.toast(
+            ToastKind::Error,
+            "internal error: rollback capacity accounting overflow",
+        );
+        return false;
+    };
+    if next > super::outbox::ROLLBACK_OUTBOX_CAPACITY {
+        state.toast(
+            ToastKind::Warning,
+            "rollback safety queue is full — keep or roll back pending changes first",
+        );
+        return false;
+    }
+    if reserve {
+        let Some(reservations) = state.rollback_reservations.checked_add(required) else {
+            state.toast(
+                ToastKind::Error,
+                "internal error: rollback reservation accounting overflow",
+            );
+            return false;
+        };
+        state.rollback_reservations = reservations;
+    }
+    true
+}
+
+fn release_rollback_reservations(state: &mut UiState, count: usize, context: &str) {
+    let Some(remaining) = state.rollback_reservations.checked_sub(count) else {
+        state.toast(
+            ToastKind::Error,
+            format!(
+                "internal error: {context} released {count} rollback reservation(s), but only {} remain",
+                state.rollback_reservations
+            ),
+        );
+        return;
+    };
+    state.rollback_reservations = remaining;
+}
+
+fn report_rollback_invariant(state: &mut UiState, context: &str) {
+    let valid = rollback_capacity_used(state)
+        .is_some_and(|used| used <= super::outbox::ROLLBACK_OUTBOX_CAPACITY);
+    if !valid {
+        state.toast(
+            ToastKind::Error,
+            format!("internal error: rollback capacity invariant failed after {context}"),
+        );
+    }
 }
 
 fn push_bounded_input(buffer: &mut String, character: char) -> bool {
@@ -1129,6 +1295,7 @@ mod tests {
     use crate::domain::ServiceName;
     use crate::domain::mock;
     use crate::ui::overlays::Confirmation;
+    use crate::ui::state::PendingRollback;
 
     fn state() -> UiState {
         let mut state = UiState::new(&Config::default(), "test".into(), false, None);
@@ -1193,6 +1360,85 @@ mod tests {
             guard_warning: None,
             completed_rollback: None,
         }))
+    }
+
+    fn state_with_confirmed_remove_service() -> UiState {
+        let mut state = state();
+        update(
+            &mut state,
+            UiAction::RequestOperation(FirewallOperation::RemoveService {
+                zone: ZoneName::parse("public").unwrap(),
+                service: ServiceName::parse("http").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            }),
+        );
+        assert!(matches!(state.overlays.last(), Some(Overlay::Confirm(_))));
+        state
+    }
+
+    fn state_with_confirmed_connectivity_change() -> UiState {
+        let mut state = state();
+        update(
+            &mut state,
+            UiAction::RequestOperation(FirewallOperation::RemoveService {
+                zone: ZoneName::parse("public").unwrap(),
+                service: ServiceName::parse("ssh").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            }),
+        );
+        assert!(matches!(state.overlays.last(), Some(Overlay::Confirm(_))));
+        state
+    }
+
+    fn pending_rollbacks(count: usize) -> Vec<PendingRollback> {
+        (0..count)
+            .map(|index| {
+                let forward = FirewallOperation::RemoveService {
+                    zone: ZoneName::parse("public").unwrap(),
+                    service: ServiceName::parse("http").unwrap(),
+                    target: ConfigurationTarget::Runtime,
+                };
+                PendingRollback {
+                    id: crate::application::ports::RollbackGuardId::new(
+                        u64::try_from(index).unwrap() + 1,
+                    ),
+                    inverse: forward.inverse().unwrap(),
+                    forward,
+                    deadline_tick: 1_000,
+                    description: format!("pending rollback {index}"),
+                    watchdog_unit: None,
+                }
+            })
+            .collect()
+    }
+
+    fn applied_risky_result_with_registration() -> UiAction {
+        use crate::application::ports::OperationOutcome;
+
+        let operation = FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("http").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        finished(
+            1,
+            OperationOutcome::Applied {
+                operation: operation.clone(),
+                steps: Vec::new(),
+            },
+            Some(rollback(1, &operation, None)),
+        )
+    }
+
+    fn two_risky_operations() -> Vec<FirewallOperation> {
+        ["http", "ssh"]
+            .into_iter()
+            .map(|service| FirewallOperation::RemoveService {
+                zone: ZoneName::parse("public").unwrap(),
+                service: ServiceName::parse(service).unwrap(),
+                target: ConfigurationTarget::Runtime,
+            })
+            .collect()
     }
 
     fn type_filter(s: &mut UiState, text: &str) {
@@ -1326,6 +1572,25 @@ mod tests {
         }));
         assert_eq!(update(&mut s, UiAction::ConfirmAccept), vec![Effect::Quit]);
         assert!(s.overlays.is_empty());
+    }
+
+    #[test]
+    fn normal_backpressure_keeps_confirmation_open_without_emitting_effect() {
+        let mut state = state_with_confirmed_remove_service();
+        state.engine_normal_backpressured = true;
+        let overlay_count = state.overlays.len();
+        assert!(update(&mut state, UiAction::ConfirmAccept).is_empty());
+        assert_eq!(state.overlays.len(), overlay_count);
+    }
+
+    #[test]
+    fn risky_confirmation_is_refused_before_rollback_capacity_can_overflow() {
+        let mut state = state_with_confirmed_connectivity_change();
+        state.rollback_outbox_pending = 10;
+        state.rollback_reservations = 10;
+        state.pending_rollback = pending_rollbacks(12);
+        assert!(update(&mut state, UiAction::ConfirmAccept).is_empty());
+        assert_eq!(state.rollback_reservations, 10);
     }
 
     #[test]
@@ -2958,6 +3223,54 @@ mod tests {
     }
 
     #[test]
+    fn operation_outcome_converts_one_reservation_to_armed_or_releases_it() {
+        let mut state = state();
+        state.rollback_reservations = 1;
+        update(&mut state, applied_risky_result_with_registration());
+        assert_eq!(state.rollback_reservations, 0);
+        assert_eq!(state.pending_rollback.len(), 1);
+    }
+
+    #[test]
+    fn completed_rollback_does_not_consume_a_forward_operation_reservation() {
+        use crate::application::ports::OperationOutcome;
+
+        let mut state = state();
+        state.rollback_reservations = 1;
+        let operation = FirewallOperation::SetDefaultZone {
+            zone: ZoneName::parse("public").unwrap(),
+        };
+        update(
+            &mut state,
+            UiAction::OperationFinished(Box::new(crate::application::api::OperationResult {
+                op_id: 1,
+                outcome: OperationOutcome::Applied {
+                    operation,
+                    steps: Vec::new(),
+                },
+                rollback: None,
+                guard_warning: None,
+                completed_rollback: Some(crate::application::ports::RollbackGuardId::new(1)),
+            })),
+        );
+        assert_eq!(state.rollback_reservations, 1);
+    }
+
+    #[test]
+    fn halted_plan_releases_reservations_for_unexecuted_risky_operations() {
+        let mut state = state();
+        state.rollback_reservations = 2;
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                applied: 0,
+                remaining: two_risky_operations(),
+            },
+        );
+        assert_eq!(state.rollback_reservations, 0);
+    }
+
+    #[test]
     fn clean_failure_does_not_register_a_rollback() {
         use crate::application::ports::{FirewallError, OperationOutcome, StepReport};
         let mut s = state();
@@ -3185,6 +3498,18 @@ mod tests {
             s.pending_rollback.is_empty(),
             "future plan items must not become rollback candidates"
         );
+    }
+
+    #[test]
+    fn plan_without_confirmation_reserves_every_risky_operation_before_dispatch() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        state.staged = two_risky_operations();
+
+        let effects = update(&mut state, UiAction::ApplyStagedPlan);
+
+        assert!(matches!(effects.as_slice(), [Effect::ApplyPlan(_)]));
+        assert_eq!(state.rollback_reservations, 2);
     }
 
     #[test]
