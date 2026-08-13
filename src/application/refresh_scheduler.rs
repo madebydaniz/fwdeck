@@ -1,0 +1,363 @@
+use std::num::NonZeroU64;
+
+use super::api::{RefreshId, RefreshScheduleObservation, RefreshTrigger};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefreshStart {
+    pub id: RefreshId,
+    pub trigger: RefreshTrigger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefreshCompletion {
+    pub schedule: RefreshScheduleObservation,
+    pub trailing_manual: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefreshCancellation {
+    pub schedule: RefreshScheduleObservation,
+    pub trailing_manual: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshDemand {
+    StartNow,
+    Trailing,
+    Coalesced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManualDemandOverflow;
+
+pub(crate) struct RefreshScheduler {
+    next_id: u64,
+    active: Option<ActiveRefresh>,
+    pending_manual_start: Option<u64>,
+    trailing_manual: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveRefresh {
+    id: RefreshId,
+    trigger: RefreshTrigger,
+    merged_manual_requests: u64,
+    coalesced_periodic_ticks: u64,
+}
+
+impl ActiveRefresh {
+    const fn observation(self) -> RefreshScheduleObservation {
+        RefreshScheduleObservation {
+            id: self.id,
+            trigger: self.trigger,
+            merged_manual_requests: self.merged_manual_requests,
+            coalesced_periodic_ticks: self.coalesced_periodic_ticks,
+        }
+    }
+}
+
+impl RefreshScheduler {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next_id: 1,
+            active: None,
+            pending_manual_start: None,
+            trailing_manual: false,
+        }
+    }
+
+    pub(crate) fn start(&mut self, trigger: RefreshTrigger) -> Option<RefreshStart> {
+        if self.active.is_some() {
+            return None;
+        }
+        let id = RefreshId::new(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let merged_manual_requests = if trigger == RefreshTrigger::Manual {
+            self.pending_manual_start.take().unwrap_or(0)
+        } else {
+            0
+        };
+        self.active = Some(ActiveRefresh {
+            id,
+            trigger,
+            merged_manual_requests,
+            coalesced_periodic_ticks: 0,
+        });
+        Some(RefreshStart { id, trigger })
+    }
+
+    pub(crate) fn active_id(&self) -> Option<RefreshId> {
+        self.active.map(|active| active.id)
+    }
+
+    pub(crate) fn record_manual_batch(
+        &mut self,
+        count: NonZeroU64,
+    ) -> Result<RefreshDemand, ManualDemandOverflow> {
+        let Some(active) = self.active.as_mut() else {
+            if let Some(pending) = self.pending_manual_start {
+                let merged_manual_requests = pending
+                    .checked_add(count.get())
+                    .ok_or(ManualDemandOverflow)?;
+                self.pending_manual_start = Some(merged_manual_requests);
+                return Ok(RefreshDemand::Coalesced);
+            }
+            self.pending_manual_start = Some(count.get() - 1);
+            return Ok(RefreshDemand::StartNow);
+        };
+        let merged_manual_requests = active
+            .merged_manual_requests
+            .checked_add(count.get())
+            .ok_or(ManualDemandOverflow)?;
+        let demand = if self.trailing_manual {
+            RefreshDemand::Coalesced
+        } else {
+            RefreshDemand::Trailing
+        };
+        active.merged_manual_requests = merged_manual_requests;
+        self.trailing_manual = true;
+        Ok(demand)
+    }
+
+    pub(crate) fn absorb_manual_batch(
+        &mut self,
+        count: NonZeroU64,
+    ) -> Result<(), ManualDemandOverflow> {
+        if let Some(active) = self.active.as_mut() {
+            let merged_manual_requests = active
+                .merged_manual_requests
+                .checked_add(count.get())
+                .ok_or(ManualDemandOverflow)?;
+            active.merged_manual_requests = merged_manual_requests;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_periodic(&mut self) -> RefreshDemand {
+        let Some(active) = self.active.as_mut() else {
+            return RefreshDemand::StartNow;
+        };
+        active.coalesced_periodic_ticks = active.coalesced_periodic_ticks.saturating_add(1);
+        RefreshDemand::Coalesced
+    }
+
+    pub(crate) fn cancel_for_mutation(&mut self) -> Option<RefreshScheduleObservation> {
+        if !self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.trigger.is_preemptible())
+        {
+            return None;
+        }
+        let active = self.active.take()?;
+        self.trailing_manual = false;
+        Some(active.observation())
+    }
+
+    pub(crate) fn cancel_for_rollback(&mut self) -> Option<RefreshCancellation> {
+        let active = self.active.take()?;
+        let trailing_manual = std::mem::take(&mut self.trailing_manual);
+        Some(RefreshCancellation {
+            schedule: active.observation(),
+            trailing_manual,
+        })
+    }
+
+    pub(crate) fn finish(&mut self, id: RefreshId) -> Option<RefreshCompletion> {
+        if self.active_id() != Some(id) {
+            return None;
+        }
+        let active = self.active.take()?;
+        let trailing_manual = std::mem::take(&mut self.trailing_manual);
+        Some(RefreshCompletion {
+            schedule: active.observation(),
+            trailing_manual,
+        })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn manual_batch_preserves_exact_count() {
+        let mut scheduler = RefreshScheduler::new();
+        let start = scheduler.start(RefreshTrigger::Manual).unwrap();
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::new(7).unwrap()),
+            Ok(RefreshDemand::Trailing),
+        );
+        let completion = scheduler.finish(start.id).unwrap();
+        assert_eq!(completion.schedule.merged_manual_requests, 7);
+    }
+
+    #[test]
+    fn idle_manual_batch_retains_remaining_count_for_started_lifecycle() {
+        let mut scheduler = RefreshScheduler::new();
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::new(7).unwrap()),
+            Ok(RefreshDemand::StartNow),
+        );
+
+        let start = scheduler.start(RefreshTrigger::Manual).unwrap();
+        let completion = scheduler.finish(start.id).unwrap();
+        assert_eq!(completion.schedule.merged_manual_requests, 6);
+        assert!(!completion.trailing_manual);
+    }
+
+    #[test]
+    fn idle_manual_batch_overflow_keeps_pending_count_unchanged() {
+        let mut scheduler = RefreshScheduler::new();
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::new(u64::MAX).unwrap()),
+            Ok(RefreshDemand::StartNow),
+        );
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::MIN),
+            Ok(RefreshDemand::Coalesced),
+        );
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::MIN),
+            Err(ManualDemandOverflow),
+        );
+
+        let start = scheduler.start(RefreshTrigger::Manual).unwrap();
+        let completion = scheduler.finish(start.id).unwrap();
+        assert_eq!(completion.schedule.merged_manual_requests, u64::MAX);
+        assert!(!completion.trailing_manual);
+    }
+
+    #[test]
+    fn manual_batch_overflow_keeps_lifecycle_metadata_unchanged() {
+        let mut scheduler = RefreshScheduler::new();
+        let start = scheduler.start(RefreshTrigger::Manual).unwrap();
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::new(u64::MAX).unwrap()),
+            Ok(RefreshDemand::Trailing),
+        );
+
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::MIN),
+            Err(ManualDemandOverflow),
+        );
+        let completion = scheduler.finish(start.id).unwrap();
+        assert_eq!(completion.schedule.merged_manual_requests, u64::MAX);
+    }
+
+    #[test]
+    fn manual_burst_creates_one_trailing_refresh() {
+        let mut scheduler = RefreshScheduler::new();
+        let active = scheduler.start(RefreshTrigger::Initial).unwrap();
+
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::MIN),
+            Ok(RefreshDemand::Trailing)
+        );
+        for _ in 0..99 {
+            assert_eq!(
+                scheduler.record_manual_batch(NonZeroU64::MIN),
+                Ok(RefreshDemand::Coalesced)
+            );
+        }
+
+        let finished = scheduler.finish(active.id).unwrap();
+        assert!(finished.trailing_manual);
+        assert_eq!(finished.schedule.merged_manual_requests, 100);
+    }
+
+    #[test]
+    fn periodic_demand_never_creates_trailing_work() {
+        let mut scheduler = RefreshScheduler::new();
+        let active = scheduler.start(RefreshTrigger::Periodic).unwrap();
+        for _ in 0..10 {
+            assert_eq!(scheduler.record_periodic(), RefreshDemand::Coalesced);
+        }
+        let finished = scheduler.finish(active.id).unwrap();
+        assert!(!finished.trailing_manual);
+        assert_eq!(finished.schedule.coalesced_periodic_ticks, 10);
+    }
+
+    #[test]
+    fn mutation_cancels_ordinary_but_not_post_mutation_refresh() {
+        let mut scheduler = RefreshScheduler::new();
+        scheduler.start(RefreshTrigger::Manual).unwrap();
+        assert!(scheduler.cancel_for_mutation().is_some());
+
+        let post = scheduler.start(RefreshTrigger::PostMutation).unwrap();
+        assert!(scheduler.cancel_for_mutation().is_none());
+        assert_eq!(scheduler.active_id(), Some(post.id));
+    }
+
+    #[test]
+    fn safety_rollback_cancels_post_mutation_refresh() {
+        let mut scheduler = RefreshScheduler::new();
+        let post = scheduler.start(RefreshTrigger::PostMutation).unwrap();
+        scheduler.record_manual_batch(NonZeroU64::MIN).unwrap();
+
+        let cancelled = scheduler.cancel_for_rollback().unwrap();
+
+        assert_eq!(cancelled.schedule.id, post.id);
+        assert_eq!(cancelled.schedule.trigger, RefreshTrigger::PostMutation);
+        assert_eq!(cancelled.schedule.merged_manual_requests, 1);
+        assert!(cancelled.trailing_manual);
+        assert_eq!(scheduler.active_id(), None);
+    }
+
+    #[test]
+    fn absorbed_manual_demand_does_not_create_a_trailing_refresh() {
+        let mut scheduler = RefreshScheduler::new();
+        let post = scheduler.start(RefreshTrigger::PostMutation).unwrap();
+        scheduler.absorb_manual_batch(NonZeroU64::MIN).unwrap();
+        let finished = scheduler.finish(post.id).unwrap();
+        assert!(!finished.trailing_manual);
+        assert_eq!(finished.schedule.merged_manual_requests, 1);
+    }
+
+    #[test]
+    fn idle_manual_demand_starts_now() {
+        let mut scheduler = RefreshScheduler::new();
+
+        assert_eq!(
+            scheduler.record_manual_batch(NonZeroU64::MIN),
+            Ok(RefreshDemand::StartNow)
+        );
+    }
+
+    #[test]
+    fn idle_periodic_demand_starts_now() {
+        let mut scheduler = RefreshScheduler::new();
+
+        assert_eq!(scheduler.record_periodic(), RefreshDemand::StartNow);
+    }
+
+    #[test]
+    fn mismatched_finish_identity_keeps_the_active_refresh() {
+        let mut scheduler = RefreshScheduler::new();
+        let active = scheduler.start(RefreshTrigger::Initial).unwrap();
+
+        assert_eq!(scheduler.finish(RefreshId::new(active.id.get() + 1)), None);
+        assert_eq!(scheduler.active_id(), Some(active.id));
+    }
+
+    #[test]
+    fn refresh_ids_advance_monotonically() {
+        let mut scheduler = RefreshScheduler::new();
+        let first = scheduler.start(RefreshTrigger::Initial).unwrap();
+        scheduler.finish(first.id).unwrap();
+        let second = scheduler.start(RefreshTrigger::Manual).unwrap();
+
+        assert_eq!(first.id.get(), 1);
+        assert_eq!(second.id.get(), 2);
+    }
+
+    #[test]
+    fn starting_while_active_is_rejected() {
+        let mut scheduler = RefreshScheduler::new();
+        scheduler.start(RefreshTrigger::Initial).unwrap();
+
+        assert_eq!(scheduler.start(RefreshTrigger::Manual), None);
+    }
+}

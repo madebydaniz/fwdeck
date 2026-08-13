@@ -121,7 +121,7 @@ default = []
 dbus = ["dep:zbus"]
 
 [dev-dependencies]
-# (none currently — the suite uses std assertions and in-repo fixtures)
+tokio = { version = "1", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

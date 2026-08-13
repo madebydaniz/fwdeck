@@ -226,7 +226,7 @@ pub fn render_breadcrumb(f: &mut Frame, area: Rect, state: &UiState, theme: &The
             theme.accent(),
         ));
     }
-    if state.refreshing {
+    if state.active_refresh.is_some() {
         spans.push(Span::styled("  ⟳ refreshing", theme.info()));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(theme.panel()), area);
