@@ -1,7 +1,6 @@
 # Phase 5C3 Staged Refresh and Lazy Detail Design
 
-**Status:** Proposed for written review. The architecture and error/testing
-behavior were approved in chat on 2026-08-13.
+**Status:** Accepted on 2026-08-13 after written review.
 
 ## Problem
 
