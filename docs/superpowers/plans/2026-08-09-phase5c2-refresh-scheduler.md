@@ -6,6 +6,8 @@
 
 **Architecture:** Add a pure application-layer scheduler that owns refresh policy and typed lifecycle metadata while the existing engine remains the single owner of backend I/O. The engine polls one ordinary snapshot alongside bounded normal, manual-demand, and safety-rollback lanes; drops that read before preempting work; and runs post-mutation refreshes non-preemptibly by normal mutations. A rollback on the dedicated priority lane is the explicit safety exception: it drops a blocked reconciliation, executes exactly once, and starts a fresh mandatory reconciliation. Periodic work uses a fixed delay after final completion. The UI tracks refresh identity and preserves stale data across cancellation or failure.
 
+The accepted [non-blocking UI outbox design](../specs/2026-08-13-phase5c2-ui-outbox-design.md) closes the UI-ingress backpressure gap without changing engine ownership or scheduler semantics. The UI shell now owns a one-request normal slot, one checked `u64` manual-demand aggregate, and a 32-request rollback FIFO. Its main event loop polls rollback, manual, and normal dispatch without awaiting engine capacity inside the effect worklist.
+
 **Tech Stack:** Rust 1.88, Tokio bounded MPSC/time/test-util, ratatui pure reducer, tracing, cargo-llvm-cov, Bash/jq, Docker Compose real-firewalld matrix.
 
 ---
@@ -20,6 +22,15 @@
 - Keep every request/event lane bounded: normal requests and manual demand each have capacity 32, rollback has reserved capacity 1, events have capacity 64, and the local normal FIFO never exceeds 32.
 - Do not change backend fetch algorithms, snapshot schema, refresh configuration, selected-zone behavior, or lazy details in this slice.
 - Do not use `unwrap`, `expect`, `panic!`, or shell interpolation in production code.
+
+## Accepted UI outbox amendment
+
+- [x] Preserve one confirmed normal request in a UI outbox with exact capacity `1`, and reject new confirmations visibly while that slot is occupied.
+- [x] Preserve manual demand in one checked `u64` aggregate and deliver its exact count to the scheduler.
+- [x] Preserve rollback requests in a FIFO UI outbox with capacity `32`, while bounding combined armed, reserved, and pending rollback work at `32`.
+- [x] Poll rollback, manual, and normal engine permits from the live UI event loop with rollback-first internal priority and no detached dispatcher.
+- [x] Prove end-to-end that ticks remain live under normal-lane saturation, rollback cancels the blocked reconciliation, and all normal work remains FIFO and exactly once.
+- [x] Re-run the complete local, coverage, performance, and disposable three-distribution real-firewalld validation after the outbox amendment.
 
 ## File Responsibility Map
 
