@@ -1,6 +1,7 @@
 //! Channel-based handle connecting the UI loop to the engine task. The UI
 //! depends on these types only — never on `FirewallBackend` implementations.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,11 @@ use super::engine;
 use super::ports::{
     FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId,
 };
+
+pub(crate) const REQUEST_CAPACITY: usize = 32;
+const MANUAL_REFRESH_CAPACITY: usize = REQUEST_CAPACITY;
+const ROLLBACK_CAPACITY: usize = 1;
+const EVENT_CAPACITY: usize = 64;
 
 /// One reviewed mutation together with the exact observed state it was
 /// validated and confirmed against. The engine re-reads firewalld immediately
@@ -85,24 +91,83 @@ pub struct OperationResult {
     pub completed_rollback: Option<RollbackGuardId>,
 }
 
-/// UI → engine commands. Sent over the bounded request channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RefreshId(u64);
+
+impl RefreshId {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshTrigger {
+    Initial,
+    Periodic,
+    Manual,
+    PostMutation,
+}
+
+impl RefreshTrigger {
+    #[must_use]
+    pub const fn is_preemptible(self) -> bool {
+        !matches!(self, Self::PostMutation)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshScheduleObservation {
+    pub id: RefreshId,
+    pub trigger: RefreshTrigger,
+    pub merged_manual_requests: u64,
+    pub coalesced_periodic_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshCancellationReason {
+    MutationPreempted,
+    RollbackPreempted,
+}
+
+/// One or more coalescible manual refresh requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManualRefreshRequest(NonZeroU64);
+
+impl ManualRefreshRequest {
+    #[must_use]
+    pub const fn new(count: NonZeroU64) -> Self {
+        Self(count)
+    }
+
+    #[must_use]
+    pub const fn count(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
+/// A safety rollback sent over its dedicated bounded priority lane.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollbackRequest {
+    /// Correlates completion during bounded clean shutdown.
+    pub id: RollbackGuardId,
+    /// Connectivity-restoring inverse.
+    pub operation: FirewallOperation,
+    /// External watchdog to stop after the inverse has run.
+    pub watchdog_unit: Option<String>,
+}
+
+/// UI → engine normal mutation commands. Sent over the bounded request channel.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineRequest {
-    /// Take a fresh snapshot now. Queued refreshes are coalesced into one pass.
-    Refresh,
     /// Verify the reviewed snapshot is still current, execute one operation
     /// (runtime step first, then permanent — ADR-3), then refresh.
     Apply(MutationRequest),
-    /// Execute a previously armed inverse, then best-effort disarm its external
-    /// watchdog. Applying the inverse never depends on disarm success.
-    Rollback {
-        /// Correlates completion during bounded clean shutdown.
-        id: RollbackGuardId,
-        /// Connectivity-restoring inverse.
-        operation: FirewallOperation,
-        /// External watchdog to stop after the inverse has run.
-        watchdog_unit: Option<String>,
-    },
     /// Verify the reviewed start state, then execute a staged plan as one
     /// sequential transaction: fail-fast on the first non-applied outcome,
     /// one refresh at the end, unexecuted operations returned via
@@ -113,15 +178,36 @@ pub enum EngineRequest {
 /// Engine → UI notifications. Delivered in order over the bounded event channel.
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
-    /// A snapshot pass began — lets the UI show a spinner immediately.
-    RefreshStarted,
+    /// A snapshot pass began — lets the UI track the exact active lifecycle.
+    RefreshStarted {
+        /// Monotonic process-local lifecycle identity.
+        id: RefreshId,
+        /// Demand that started this refresh.
+        trigger: RefreshTrigger,
+    },
     /// The snapshot pass ended. `Arc` because the UI keeps the previous
     /// snapshot alive while diffing against the new one.
     RefreshFinished {
+        /// Scheduler metadata for the completed lifecycle.
+        schedule: RefreshScheduleObservation,
         /// Fresh snapshot, or the categorized backend failure.
         result: Result<Arc<FirewallSnapshot>, FirewallError>,
         /// Exact telemetry for this snapshot attempt.
         observation: RefreshObservation,
+    },
+    /// A snapshot read was dropped so a queued mutation or safety rollback can run.
+    RefreshCancelled {
+        /// Scheduler metadata accumulated before cancellation.
+        schedule: RefreshScheduleObservation,
+        /// Why the lifecycle was cancelled.
+        reason: RefreshCancellationReason,
+        /// Deterministic Tokio-clock duration before cancellation.
+        elapsed: Duration,
+    },
+    /// A manual batch could not be represented without overflowing lifecycle metadata.
+    ManualDemandRejected {
+        /// Exact rejected demand; the active lifecycle remains valid.
+        count: NonZeroU64,
     },
     /// One operation completed with its honest [`OperationOutcome`]
     /// (applied / partially applied / failed — never a swallowed partial),
@@ -142,8 +228,12 @@ pub enum EngineEvent {
 
 /// The UI's only connection to the engine task: send requests, receive events.
 pub struct EngineHandle {
-    /// Bounded request channel into the engine (capacity 32).
+    /// Bounded normal mutation channel into the engine (capacity 32).
     pub requests: mpsc::Sender<EngineRequest>,
+    /// Bounded manual-demand lane (capacity 32); active demand is coalesced.
+    pub manual_refreshes: mpsc::Sender<ManualRefreshRequest>,
+    /// Bounded safety-priority rollback lane (capacity 1).
+    pub rollbacks: mpsc::Sender<RollbackRequest>,
     /// Bounded event channel out of the engine (capacity 64).
     pub events: mpsc::Receiver<EngineEvent>,
 }
@@ -158,12 +248,14 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
     read_only: bool,
     rollback_timeout: Duration,
 ) -> EngineHandle {
-    let (request_tx, request_rx) = mpsc::channel(32);
-    let (event_tx, event_rx) = mpsc::channel(64);
+    let (request_tx, request_rx) = mpsc::channel(REQUEST_CAPACITY);
+    let (manual_refresh_tx, manual_refresh_rx) = mpsc::channel(MANUAL_REFRESH_CAPACITY);
+    let (rollback_tx, rollback_rx) = mpsc::channel(ROLLBACK_CAPACITY);
+    let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
     tokio::spawn(engine::run(
         backend,
         rollback_guard,
-        request_rx,
+        engine::EngineReceivers::new(request_rx, manual_refresh_rx, rollback_rx),
         event_tx,
         refresh_interval,
         read_only,
@@ -171,6 +263,30 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
     ));
     EngineHandle {
         requests: request_tx,
+        manual_refreshes: manual_refresh_tx,
+        rollbacks: rollback_tx,
         events: event_rx,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_schedule_observation_preserves_identity_trigger_and_counts() {
+        let observation = RefreshScheduleObservation {
+            id: RefreshId::new(7),
+            trigger: RefreshTrigger::Manual,
+            merged_manual_requests: 4,
+            coalesced_periodic_ticks: 3,
+        };
+
+        assert_eq!(observation.id.get(), 7);
+        assert_eq!(observation.trigger, RefreshTrigger::Manual);
+        assert_eq!(observation.merged_manual_requests, 4);
+        assert_eq!(observation.coalesced_periodic_ticks, 3);
+        assert!(RefreshTrigger::Initial.is_preemptible());
+        assert!(!RefreshTrigger::PostMutation.is_preemptible());
     }
 }

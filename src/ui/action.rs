@@ -2,9 +2,13 @@
 //! effects a reducer step can request from the outer loop.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::application::ports::FirewallError;
-use crate::application::{MutationPlan, MutationRequest};
+use crate::application::{
+    MutationPlan, MutationRequest, RefreshCancellationReason, RefreshId,
+    RefreshScheduleObservation, RefreshTrigger,
+};
 use crate::domain::LogEntry;
 use crate::domain::{FirewallOperation, FirewallSnapshot, RefreshObservation};
 
@@ -210,15 +214,45 @@ pub enum UiAction {
     ReloadRequested,
     /// `t`: flip the zone-attribute/binding perspective (runtime ⇄ permanent).
     ToggleConfigView,
-    /// The engine started a refresh; show the spinner.
-    RefreshStarted,
+    /// The engine started a refresh; show the spinner for this lifecycle.
+    RefreshStarted {
+        /// Monotonic process-local lifecycle identity.
+        id: RefreshId,
+        /// Demand that started this refresh.
+        trigger: RefreshTrigger,
+    },
     /// The engine finished a refresh: a new snapshot or a backend error.
     RefreshCompleted {
+        /// Scheduler metadata for the completed lifecycle.
+        schedule: RefreshScheduleObservation,
         /// Fresh snapshot, or the categorized backend failure.
         result: Result<Arc<FirewallSnapshot>, FirewallError>,
         /// Exact telemetry from the same refresh attempt.
         observation: RefreshObservation,
     },
+    /// An ordinary refresh was cancelled before a mutation.
+    RefreshCancelled {
+        /// Scheduler metadata accumulated before cancellation.
+        schedule: RefreshScheduleObservation,
+        /// Why the lifecycle was cancelled.
+        reason: RefreshCancellationReason,
+        /// Tokio-clock duration before cancellation.
+        elapsed: Duration,
+    },
+    /// The shell's bounded engine-outbox occupancy changed.
+    EngineOutboxChanged {
+        /// Whether the single normal-priority slot is occupied.
+        normal_pending: bool,
+        /// Rollback-priority requests waiting in the shell outbox.
+        rollback_pending: usize,
+    },
+    /// A manual refresh batch exceeded the exact lifecycle metadata limit.
+    ManualDemandRejected {
+        /// Exact rejected demand for the operator-facing notification.
+        count: std::num::NonZeroU64,
+    },
+    /// The engine event channel closed unexpectedly.
+    EngineStopped(FirewallError),
     /// New kernel/netfilter log entries from the log tailer.
     LogsReceived(Vec<LogEntry>),
     /// Exit the application. Asks first when quitting would fire an armed
