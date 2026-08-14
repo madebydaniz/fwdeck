@@ -37,6 +37,12 @@ pub(super) struct DetailQueue {
     pending: Vec<DetailWork>,
 }
 
+pub(super) struct DetailBatch {
+    pub(super) work: Vec<DetailWork>,
+    pub(super) preferred_details: usize,
+    pub(super) background_details: usize,
+}
+
 impl DetailQueue {
     pub(super) fn new(mut pending: Vec<DetailWork>) -> Self {
         pending.sort_by(|left, right| left.stable_key().cmp(&right.stable_key()));
@@ -49,13 +55,22 @@ impl DetailQueue {
         limit: usize,
         overview: &RefreshOverview,
         priority: &RefreshPriority,
-    ) -> Vec<DetailWork> {
+    ) -> DetailBatch {
         self.pending.sort_by(|left, right| {
             left.priority_key(overview, priority)
                 .cmp(&right.priority_key(overview, priority))
         });
         let count = limit.min(self.pending.len());
-        self.pending.drain(..count).collect()
+        let work: Vec<_> = self.pending.drain(..count).collect();
+        let preferred_details = work
+            .iter()
+            .filter(|detail| detail.priority_key(overview, priority).0 < 2)
+            .count();
+        DetailBatch {
+            background_details: work.len().saturating_sub(preferred_details),
+            work,
+            preferred_details,
+        }
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -70,7 +85,7 @@ fn order_pending(
     priority: &RefreshPriority,
 ) -> Vec<DetailWork> {
     let mut queue = DetailQueue::new(pending);
-    queue.take_batch(usize::MAX, overview, priority)
+    queue.take_batch(usize::MAX, overview, priority).work
 }
 
 fn preferred_zone_has_service(
@@ -203,14 +218,20 @@ mod tests {
     fn a_new_hint_reorders_only_work_not_already_taken() {
         let overview = fixture_overview();
         let mut queue = DetailQueue::new(fixture_work());
-        let first = queue.take_batch(8, &overview, &RefreshPriority::default());
+        let first_batch = queue.take_batch(8, &overview, &RefreshPriority::default());
+        assert_eq!(first_batch.preferred_details, 0);
+        assert_eq!(first_batch.background_details, 8);
+        let first = first_batch.work;
         let updated = RefreshPriority {
             zone: None,
             service: Some(service("https")),
             policy: None,
         };
 
-        let second = queue.take_batch(8, &overview, &updated);
+        let second_batch = queue.take_batch(8, &overview, &updated);
+        assert_eq!(second_batch.preferred_details, 1);
+        assert_eq!(second_batch.background_details, 4);
+        let second = second_batch.work;
 
         assert!(first.iter().all(|work| !second.contains(work)));
         assert!(matches!(&second[0], DetailWork::Service(name) if name.as_str() == "https"));
@@ -228,9 +249,28 @@ mod tests {
         };
         let mut queue = DetailQueue::new(vec![runtime.clone(), runtime.clone(), permanent.clone()]);
 
-        let batch = queue.take_batch(8, &fixture_overview(), &RefreshPriority::default());
+        let batch = queue
+            .take_batch(8, &fixture_overview(), &RefreshPriority::default())
+            .work;
 
         assert_eq!(batch, vec![runtime, permanent]);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn batch_counts_preferences_at_dispatch_time() {
+        let overview = fixture_overview();
+        let mut queue = DetailQueue::new(fixture_work());
+        let priority = RefreshPriority {
+            zone: Some(ZoneName::parse("work").unwrap()),
+            service: None,
+            policy: Some(policy("allow-work")),
+        };
+
+        let batch = queue.take_batch(8, &overview, &priority);
+
+        assert_eq!(batch.preferred_details, 2);
+        assert_eq!(batch.background_details, 6);
+        assert_eq!(batch.work.len(), 8);
     }
 }

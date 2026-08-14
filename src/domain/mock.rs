@@ -192,17 +192,26 @@ pub fn sample() -> Result<FirewallSnapshot, ValidationError> {
     })
 }
 
+/// Zone count in the deterministic enterprise-scale fixture.
+pub(crate) const LARGE_ZONE_COUNT: usize = 100;
+/// Service-definition count in the deterministic enterprise-scale fixture.
+pub(crate) const LARGE_SERVICE_COUNT: usize = 500;
+/// Runtime and permanent IP-set count in the enterprise-scale fixture.
+pub(crate) const LARGE_IPSET_COUNT: usize = 100;
+/// Runtime and permanent policy count in the enterprise-scale fixture.
+pub(crate) const LARGE_POLICY_COUNT: usize = 100;
+
 /// Generated enterprise-scale snapshot used by deterministic performance
 /// tests. It exercises domain/UI structures without inventing firewalld text.
 pub fn large() -> Result<FirewallSnapshot, ValidationError> {
     let mut snapshot = sample()?;
-    let service_names = (0..500)
+    let service_names = (0..LARGE_SERVICE_COUNT)
         .map(|index| ServiceName::parse(&format!("svc-{index:04}")))
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut zones = BTreeMap::new();
     let mut active = BTreeMap::new();
-    for index in 0..100 {
+    for index in 0..LARGE_ZONE_COUNT {
         let name = ZoneName::parse(&format!("zone-{index:03}"))?;
         let mut details = ZoneDetails::empty(name.clone());
         if index == 0 {
@@ -227,7 +236,7 @@ pub fn large() -> Result<FirewallSnapshot, ValidationError> {
         .collect();
     snapshot.available_services.clone_from(&service_names);
 
-    let ipsets = (0..100)
+    let ipsets = (0..LARGE_IPSET_COUNT)
         .map(|index| {
             Ok((
                 IpSetName::parse(&format!("set-{index:03}"))?,
@@ -243,11 +252,11 @@ pub fn large() -> Result<FirewallSnapshot, ValidationError> {
         permanent: ipsets,
     };
 
-    let policies = (0..100)
+    let policies = (0..LARGE_POLICY_COUNT)
         .map(|index| {
             let name = PolicyName::parse(&format!("policy-{index:03}"))?;
             let mut details = PolicyDetails::empty(name.clone());
-            details.ingress_zones = vec![format!("zone-{:03}", index % 100)];
+            details.ingress_zones = vec![format!("zone-{:03}", index % LARGE_ZONE_COUNT)];
             details.egress_zones = vec!["ANY".to_owned()];
             details.services = vec![service_names[index % service_names.len()].clone()];
             Ok((name, details))
@@ -280,10 +289,13 @@ mod tests {
     fn large_snapshot_matches_the_performance_fixture_shape() {
         let snap = large().unwrap();
 
-        assert_eq!(snap.zone_names().len(), 100);
-        assert_eq!(snap.service_definitions.len(), 500);
-        assert_eq!(snap.ipsets.runtime.len(), 100);
-        assert_eq!(snap.policies.runtime.len(), 100);
-        assert_eq!(snap.runtime[&snap.default_zone].services.len(), 500);
+        assert_eq!(snap.zone_names().len(), LARGE_ZONE_COUNT);
+        assert_eq!(snap.service_definitions.len(), LARGE_SERVICE_COUNT);
+        assert_eq!(snap.ipsets.runtime.len(), LARGE_IPSET_COUNT);
+        assert_eq!(snap.policies.runtime.len(), LARGE_POLICY_COUNT);
+        assert_eq!(
+            snap.runtime[&snap.default_zone].services.len(),
+            LARGE_SERVICE_COUNT
+        );
     }
 }

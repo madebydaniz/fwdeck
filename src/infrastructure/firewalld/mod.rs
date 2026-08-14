@@ -154,6 +154,14 @@ struct HydratedDetails {
     policy_degraded: Vec<DegradedSection>,
 }
 
+fn trace_detail_hydration(preferred_details: usize, background_details: usize) {
+    tracing::debug!(
+        preferred_details,
+        background_details,
+        "refresh detail hydration finished"
+    );
+}
+
 /// The `firewall-cmd` backend: the full-featured reference implementation of
 /// `FirewallBackend`. Sections that fail to fetch degrade with an honest
 /// report instead of an empty lie; heavy sections are tier-cached.
@@ -462,11 +470,16 @@ impl<R: CommandRunner> CliBackend<R> {
         let mut definitions = Vec::new();
         let mut service_degraded = Vec::new();
         let mut policy_degraded = Vec::new();
+        let mut preferred_details = 0usize;
+        let mut background_details = 0usize;
         while !queue.is_empty() {
             let latest = priority.latest();
             let batch = queue.take_batch(8, overview, &latest);
+            preferred_details = preferred_details.saturating_add(batch.preferred_details);
+            background_details = background_details.saturating_add(batch.background_details);
             let completed = bounded_fan_out(
                 batch
+                    .work
                     .into_iter()
                     .map(|work| async move { self.fetch_detail(work).await }),
             )
@@ -498,6 +511,7 @@ impl<R: CommandRunner> CliBackend<R> {
                 }
             }
         }
+        trace_detail_hydration(preferred_details, background_details);
 
         let mut cache = self
             .definitions

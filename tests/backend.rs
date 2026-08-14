@@ -86,6 +86,8 @@ struct StagedFixtureControl {
     background_detail_started: AtomicBool,
     background_detail_waiting: Notify,
     release_background_detail: Semaphore,
+    failed_service: Mutex<Option<String>>,
+    failed_runtime_policy: Mutex<Option<String>>,
     seen: Mutex<Vec<Vec<String>>>,
 }
 
@@ -108,6 +110,30 @@ impl StagedFixtureControl {
         self.release_background_detail.add_permits(1);
     }
 
+    fn fail_service(&self, name: &str) {
+        *self.failed_service.lock().unwrap() = Some(name.to_owned());
+    }
+
+    fn fail_runtime_policy(&self, name: &str) {
+        *self.failed_runtime_policy.lock().unwrap() = Some(name.to_owned());
+    }
+
+    fn service_should_fail(&self, argument: &str) -> bool {
+        self.failed_service
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|name| argument == format!("--info-service={name}"))
+    }
+
+    fn runtime_policy_should_fail(&self, argument: &str) -> bool {
+        self.failed_runtime_policy
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|name| argument == format!("--info-policy={name}"))
+    }
+
     fn detail_commands(&self) -> Vec<Vec<String>> {
         self.seen
             .lock()
@@ -128,6 +154,8 @@ fn staged_backend_fixture() -> (CliBackend<StagedFixtureRunner>, Arc<StagedFixtu
         background_detail_started: AtomicBool::new(false),
         background_detail_waiting: Notify::new(),
         release_background_detail: Semaphore::new(0),
+        failed_service: Mutex::new(None),
+        failed_runtime_policy: Mutex::new(None),
         seen: Mutex::new(Vec::new()),
     });
     (
@@ -178,6 +206,9 @@ impl CommandRunner for StagedFixtureRunner {
             }
             [services] if services == "--get-services" => "ssh http https\n".to_owned(),
             [policies] if policies == "--get-policies" => "alpha-policy zulu-policy\n".to_owned(),
+            [policy] if self.control.runtime_policy_should_fail(policy) => {
+                return Ok(output(Some(13), "", "selected policy detail failed"));
+            }
             [policy] if policy.starts_with("--info-policy=") => INFO_POLICY.to_owned(),
             [permanent, policies] if permanent == "--permanent" && policies == "--get-policies" => {
                 "alpha-policy zulu-policy\n".to_owned()
@@ -201,6 +232,9 @@ impl CommandRunner for StagedFixtureRunner {
                         return Err(ProcessError::Io("background detail gate closed".to_owned()));
                     }
                 }
+            }
+            [service] if self.control.service_should_fail(service) => {
+                return Ok(output(Some(13), "", "selected service detail failed"));
             }
             [service] if service.starts_with("--info-service=") => INFO_SERVICE.to_owned(),
             unexpected => panic!("unexpected fixture command: {unexpected:?}"),
@@ -293,6 +327,75 @@ async fn staged_priority_changes_only_reorder_unstarted_details() {
     assert_eq!(details.len(), 12);
     assert_eq!(&details[..8], first_batch.as_slice());
     assert_eq!(details[8], vec!["--info-policy=zulu-policy"]);
+}
+
+#[tokio::test]
+async fn staged_service_failure_is_exactly_degraded() {
+    let (backend, control) = staged_backend_fixture();
+    let (publisher, priority) = refresh_priority_channel();
+    let selected = ServiceName::parse("ssh").unwrap();
+    control.fail_service(selected.as_str());
+    publisher.publish(RefreshPriority {
+        zone: None,
+        service: Some(selected.clone()),
+        policy: None,
+    });
+
+    let overview = backend
+        .snapshot_overview(&priority)
+        .await
+        .result
+        .unwrap()
+        .unwrap();
+    let hydration = backend.snapshot_hydrated(Some(overview), &priority);
+    tokio::pin!(hydration);
+    assert!(futures_util::poll!(&mut hydration).is_pending());
+    control.wait_for_background_detail().await;
+    control.release_background_detail();
+    let snapshot = hydration.await.result.unwrap();
+
+    assert!(!snapshot.service_definitions.contains_key(&selected));
+    assert_eq!(snapshot.degraded.len(), 1);
+    let failure = &snapshot.degraded[0];
+    assert_eq!(failure.section, SnapshotSection::ServiceDefinitions);
+    assert_eq!(failure.target, None);
+    assert_eq!(failure.object.as_deref(), Some("ssh"));
+    assert!(failure.reason.contains("selected service detail failed"));
+}
+
+#[tokio::test]
+async fn staged_selected_policy_failure_keeps_exact_target_and_identity() {
+    let (backend, control) = staged_backend_fixture();
+    let (publisher, priority) = refresh_priority_channel();
+    let selected = PolicyName::parse("zulu-policy").unwrap();
+    control.fail_runtime_policy(selected.as_str());
+    publisher.publish(RefreshPriority {
+        zone: None,
+        service: None,
+        policy: Some(selected.clone()),
+    });
+
+    let overview = backend
+        .snapshot_overview(&priority)
+        .await
+        .result
+        .unwrap()
+        .unwrap();
+    let hydration = backend.snapshot_hydrated(Some(overview), &priority);
+    tokio::pin!(hydration);
+    assert!(futures_util::poll!(&mut hydration).is_pending());
+    control.wait_for_background_detail().await;
+    control.release_background_detail();
+    let snapshot = hydration.await.result.unwrap();
+
+    assert!(!snapshot.policies.runtime.contains_key(&selected));
+    assert!(snapshot.policies.permanent.contains_key(&selected));
+    assert_eq!(snapshot.degraded.len(), 1);
+    let failure = &snapshot.degraded[0];
+    assert_eq!(failure.section, SnapshotSection::Policies);
+    assert_eq!(failure.target, Some(ConfigurationTarget::Runtime));
+    assert_eq!(failure.object.as_deref(), Some("zulu-policy"));
+    assert!(failure.reason.contains("selected policy detail failed"));
 }
 
 #[tokio::test]
