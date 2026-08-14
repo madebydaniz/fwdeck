@@ -177,12 +177,10 @@ impl CommandRunner for StagedFixtureRunner {
                 DIRECT_RULES.to_owned()
             }
             [services] if services == "--get-services" => "ssh http https\n".to_owned(),
-            [policies] if policies == "--get-policies" => {
-                "alpha-policy fwdeck-fixture\n".to_owned()
-            }
+            [policies] if policies == "--get-policies" => "alpha-policy zulu-policy\n".to_owned(),
             [policy] if policy.starts_with("--info-policy=") => INFO_POLICY.to_owned(),
             [permanent, policies] if permanent == "--permanent" && policies == "--get-policies" => {
-                "alpha-policy fwdeck-fixture\n".to_owned()
+                "alpha-policy zulu-policy\n".to_owned()
             }
             [permanent, policy]
                 if permanent == "--permanent" && policy.starts_with("--info-policy=") =>
@@ -286,7 +284,7 @@ async fn staged_priority_changes_only_reorder_unstarted_details() {
     publisher.publish(RefreshPriority {
         zone: None,
         service: None,
-        policy: Some(PolicyName::parse("fwdeck-fixture").unwrap()),
+        policy: Some(PolicyName::parse("zulu-policy").unwrap()),
     });
     control.release_background_detail();
 
@@ -294,7 +292,7 @@ async fn staged_priority_changes_only_reorder_unstarted_details() {
     let details = control.detail_commands();
     assert_eq!(details.len(), 12);
     assert_eq!(&details[..8], first_batch.as_slice());
-    assert_eq!(details[8], vec!["--info-policy=fwdeck-fixture"]);
+    assert_eq!(details[8], vec!["--info-policy=zulu-policy"]);
 }
 
 #[tokio::test]

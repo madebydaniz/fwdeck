@@ -11,10 +11,10 @@ pub(super) enum DetailWork {
 }
 
 impl DetailWork {
-    pub(super) fn stable_key(&self) -> (u8, u8, &str) {
+    pub(super) fn stable_key(&self) -> (&str, u8, u8) {
         match self {
-            Self::Service(name) => (0, 0, name.as_str()),
-            Self::Policy { target, name } => (1, target_order(*target), name.as_str()),
+            Self::Service(name) => (name.as_str(), 0, 0),
+            Self::Policy { target, name } => (name.as_str(), 1, target_order(*target)),
         }
     }
 
@@ -22,7 +22,7 @@ impl DetailWork {
         &self,
         overview: &RefreshOverview,
         priority: &RefreshPriority,
-    ) -> (u8, (u8, u8, &str)) {
+    ) -> (u8, (&str, u8, u8)) {
         let class = match self {
             Self::Service(name) if preferred_zone_has_service(overview, priority, name) => 0,
             Self::Service(name) if priority.service.as_ref() == Some(name) => 1,
@@ -145,10 +145,20 @@ mod tests {
         ]
         .into_iter()
         .map(|name| DetailWork::Service(service(name)))
-        .chain(std::iter::once(DetailWork::Policy {
-            target: ConfigurationTarget::Runtime,
-            name: policy("allow-work"),
-        }))
+        .chain([
+            DetailWork::Policy {
+                target: ConfigurationTarget::Runtime,
+                name: policy("allow-work"),
+            },
+            DetailWork::Policy {
+                target: ConfigurationTarget::Permanent,
+                name: policy("aardvark-policy"),
+            },
+            DetailWork::Policy {
+                target: ConfigurationTarget::Runtime,
+                name: policy("zulu-policy"),
+            },
+        ])
         .collect()
     }
 
@@ -167,6 +177,20 @@ mod tests {
         assert!(
             matches!(&ordered[1], DetailWork::Policy { name, .. } if name.as_str() == "allow-work")
         );
+        assert!(matches!(
+            &ordered[2],
+            DetailWork::Policy {
+                target: ConfigurationTarget::Permanent,
+                name,
+            } if name.as_str() == "aardvark-policy"
+        ));
+        assert!(matches!(
+            ordered.last(),
+            Some(DetailWork::Policy {
+                target: ConfigurationTarget::Runtime,
+                name,
+            }) if name.as_str() == "zulu-policy"
+        ));
         assert!(
             ordered[2..]
                 .windows(2)
