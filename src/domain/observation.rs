@@ -2,6 +2,7 @@
 //! lines, and nft per-chain hit counters. Pure value types (no I/O) — adapters
 //! produce them and the application transports them inward-to-outward.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Logical part of one firewall snapshot refresh.
@@ -84,6 +85,37 @@ impl RefreshObservation {
             sections: Vec::new(),
         }
     }
+
+    /// Combines two serial refresh stages into one operator-facing observation.
+    #[must_use]
+    pub fn merge_sequential(self, next: Self) -> Self {
+        let process_count = self
+            .process_count
+            .zip(next.process_count)
+            .map(|(current, following)| current.saturating_add(following));
+        let mut sections: BTreeMap<RefreshSection, RefreshSectionObservation> = BTreeMap::new();
+
+        for section in self.sections.into_iter().chain(next.sections) {
+            match sections.entry(section.section) {
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let aggregate = entry.get_mut();
+                    aggregate.elapsed = aggregate.elapsed.saturating_add(section.elapsed);
+                    aggregate.process_count = aggregate
+                        .process_count
+                        .saturating_add(section.process_count);
+                }
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(section);
+                }
+            }
+        }
+
+        Self {
+            elapsed: self.elapsed.saturating_add(next.elapsed),
+            process_count,
+            sections: sections.into_values().collect(),
+        }
+    }
 }
 
 /// Netfilter verdict extracted from a kernel log line's rule-name prefix.
@@ -154,6 +186,34 @@ mod tests {
     use std::time::Duration;
 
     use super::{RefreshObservation, RefreshSection, RefreshSectionObservation};
+
+    #[test]
+    fn sequential_refresh_observations_merge_counts_and_sections() {
+        let overview = RefreshObservation::new(
+            Duration::from_millis(12),
+            3,
+            vec![RefreshSectionObservation {
+                section: RefreshSection::Services,
+                elapsed: Duration::from_millis(4),
+                process_count: 1,
+            }],
+        );
+        let hydration = RefreshObservation::new(
+            Duration::from_millis(20),
+            5,
+            vec![RefreshSectionObservation {
+                section: RefreshSection::Services,
+                elapsed: Duration::from_millis(7),
+                process_count: 2,
+            }],
+        );
+
+        let merged = overview.merge_sequential(hydration);
+        assert_eq!(merged.elapsed, Duration::from_millis(32));
+        assert_eq!(merged.process_count, Some(8));
+        assert_eq!(merged.sections[0].elapsed, Duration::from_millis(11));
+        assert_eq!(merged.sections[0].process_count, 3);
+    }
 
     #[test]
     fn refresh_observation_sorts_sections_and_preserves_totals() {

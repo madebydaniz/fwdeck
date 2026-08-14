@@ -221,6 +221,13 @@ pub enum UiAction {
         /// Demand that started this refresh.
         trigger: RefreshTrigger,
     },
+    /// The active refresh produced its low-latency overview while hydration continues.
+    RefreshOverviewReady {
+        /// Identity of the lifecycle that owns this overview.
+        id: RefreshId,
+        /// Overview data that is safe for preview-only rendering.
+        overview: Arc<crate::application::RefreshOverview>,
+    },
     /// The engine finished a refresh: a new snapshot or a backend error.
     RefreshCompleted {
         /// Scheduler metadata for the completed lifecycle.

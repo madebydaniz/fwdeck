@@ -754,6 +754,10 @@ max_file_size_mb = 5</pre>
 attempt completes. Manual refresh requests are reliable and coalesced. A
 confirmed change or rollback takes priority over an ordinary background read;
 FWDeck then completes a fresh reconciliation before accepting the next change.</p>
+<p>FWDeck shows status and zone data as soon as the overview stage completes.
+Service and policy details continue loading in the same cancellable refresh;
+only the final complete or explicitly degraded snapshot becomes authoritative
+for validation, snapshots, and exports.</p>
 <p>Retention runs at startup and after new state is written. It only removes
 regular files with FWDeck-generated names; symlinks, imported snapshots, and
 unknown files are ignored. Preview the exact plan before applying it:</p>

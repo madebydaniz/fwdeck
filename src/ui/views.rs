@@ -1,12 +1,15 @@
 //! View catalog: identity, columns, widths, and row extraction from a snapshot.
 //! Row extraction is pure — the render layer only formats what comes out of here.
 
+use std::collections::BTreeMap;
+
 use ratatui::layout::Constraint;
 use strum::{EnumIter, FromRepr};
 
+use crate::application::RefreshOverview;
 use crate::domain::{
-    ConfigurationTarget, FirewallSnapshot, ForwardPort, InterfaceName, IpSetName, LogEntry,
-    PolicyName, PortSpec, RichRule, ServiceName, SourceAddress, ZoneName,
+    ActiveZone, ConfigurationTarget, FirewallSnapshot, ForwardPort, InterfaceName, IpSetName,
+    LogEntry, PolicyName, PortSpec, RichRule, ServiceName, SourceAddress, ZoneDetails, ZoneName,
 };
 
 /// Number of views; sizes the per-view state array in `UiState`.
@@ -391,13 +394,14 @@ impl ViewId {
 /// The runtime and permanent slices of one zone attribute, selected by an
 /// accessor — the shared prelude of every scoped-entry row builder.
 fn zone_slices<'a, T>(
-    snap: &'a FirewallSnapshot,
+    runtime_zones: &'a BTreeMap<ZoneName, ZoneDetails>,
+    permanent_zones: &'a BTreeMap<ZoneName, ZoneDetails>,
     zone: &ZoneName,
-    field: impl Fn(&'a crate::domain::ZoneDetails) -> &'a [T],
+    field: impl Fn(&'a ZoneDetails) -> &'a [T],
 ) -> (&'a [T], &'a [T]) {
     (
-        snap.runtime.get(zone).map(&field).unwrap_or_default(),
-        snap.permanent.get(zone).map(&field).unwrap_or_default(),
+        runtime_zones.get(zone).map(&field).unwrap_or_default(),
+        permanent_zones.get(zone).map(&field).unwrap_or_default(),
     )
 }
 
@@ -478,19 +482,89 @@ pub fn rows(
     zone: &ZoneName,
     config: ConfigurationTarget,
 ) -> Vec<ViewRow> {
+    if let Some(rows) = zone_rows_from_parts(
+        view,
+        &snap.active,
+        &snap.runtime,
+        &snap.permanent,
+        &snap.default_zone,
+        zone,
+        config,
+    ) {
+        return rows;
+    }
     match view {
-        ViewId::Zones => zones_rows(snap, config),
         ViewId::Services => services_rows(snap, zone),
-        ViewId::Ports => ports_rows(snap, zone),
-        ViewId::Forwarding => forwarding_rows(snap, zone),
-        ViewId::RichRules => rich_rules_rows(snap, zone),
-        ViewId::Interfaces => interfaces_rows(snap, config),
-        ViewId::Sources => sources_rows(snap, config),
         ViewId::IpSets => ipsets_rows(snap, config),
         ViewId::Direct => direct_rows(snap),
-        // Logs rows come from the UI's ring buffer (`UiState::all_rows`).
-        ViewId::Logs => Vec::new(),
         ViewId::Policies => policies_rows(snap, config),
+        // Logs rows come from the UI's ring buffer (`UiState::all_rows`). The
+        // zone-backed arms returned above through `zone_rows_from_parts`.
+        ViewId::Logs
+        | ViewId::Zones
+        | ViewId::Ports
+        | ViewId::Forwarding
+        | ViewId::RichRules
+        | ViewId::Interfaces
+        | ViewId::Sources => Vec::new(),
+    }
+}
+
+/// Preview-safe rows projected directly from staged overview parts.
+///
+/// Service rows intentionally fall back to the authoritative snapshot because
+/// their port/protocol cells require hydrated service definitions.
+#[must_use]
+pub fn overview_rows(
+    view: ViewId,
+    overview: &RefreshOverview,
+    zone: &ZoneName,
+    config: ConfigurationTarget,
+) -> Option<Vec<ViewRow>> {
+    zone_rows_from_parts(
+        view,
+        &overview.active,
+        &overview.runtime,
+        &overview.permanent,
+        &overview.default_zone,
+        zone,
+        config,
+    )
+}
+
+/// Whether staged overview data is sufficient to render this view honestly.
+#[must_use]
+pub const fn overview_supports(view: ViewId) -> bool {
+    matches!(
+        view,
+        ViewId::Zones
+            | ViewId::Ports
+            | ViewId::Forwarding
+            | ViewId::RichRules
+            | ViewId::Interfaces
+            | ViewId::Sources
+    )
+}
+
+fn zone_rows_from_parts(
+    view: ViewId,
+    active: &BTreeMap<ZoneName, ActiveZone>,
+    runtime: &BTreeMap<ZoneName, ZoneDetails>,
+    permanent: &BTreeMap<ZoneName, ZoneDetails>,
+    default_zone: &ZoneName,
+    zone: &ZoneName,
+    config: ConfigurationTarget,
+) -> Option<Vec<ViewRow>> {
+    match view {
+        ViewId::Zones => Some(zones_rows(active, runtime, permanent, default_zone, config)),
+        ViewId::Ports => Some(ports_rows(runtime, permanent, zone)),
+        ViewId::Forwarding => Some(forwarding_rows(runtime, permanent, zone)),
+        ViewId::RichRules => Some(rich_rules_rows(runtime, permanent, zone)),
+        ViewId::Interfaces => Some(interfaces_rows(active, permanent, config)),
+        ViewId::Sources => Some(sources_rows(active, permanent, config)),
+        ViewId::Services | ViewId::IpSets | ViewId::Direct | ViewId::Logs | ViewId::Policies => {
+            None
+        }
     }
 }
 
@@ -656,14 +730,23 @@ fn direct_rows(snap: &FirewallSnapshot) -> Vec<ViewRow> {
         .collect()
 }
 
-fn zones_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewRow> {
-    snap.zone_names()
+fn zones_rows(
+    active: &BTreeMap<ZoneName, ActiveZone>,
+    runtime: &BTreeMap<ZoneName, ZoneDetails>,
+    permanent: &BTreeMap<ZoneName, ZoneDetails>,
+    default_zone: &ZoneName,
+    config: ConfigurationTarget,
+) -> Vec<ViewRow> {
+    let mut names: Vec<_> = runtime.keys().chain(permanent.keys()).collect();
+    names.sort();
+    names.dedup();
+    names
         .into_iter()
         .map(|name| {
             let details = if config == ConfigurationTarget::Permanent {
-                snap.permanent.get(name).or_else(|| snap.runtime.get(name))
+                permanent.get(name).or_else(|| runtime.get(name))
             } else {
-                snap.runtime.get(name).or_else(|| snap.permanent.get(name))
+                runtime.get(name).or_else(|| permanent.get(name))
             };
             let (target, interfaces, sources, services, masquerade) = details.map_or(
                 (String::new(), String::new(), String::new(), 0, false),
@@ -681,14 +764,14 @@ fn zones_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewR
                 RowId::Zone(name.clone()),
                 vec![
                     name.to_string(),
-                    if snap.is_zone_synced(name) { "" } else { "≠" }.to_owned(),
-                    if snap.is_active(name) { "yes" } else { "" }.to_owned(),
-                    if *name == snap.default_zone {
-                        "yes"
-                    } else {
+                    if runtime.get(name) == permanent.get(name) {
                         ""
+                    } else {
+                        "≠"
                     }
                     .to_owned(),
+                    if active.contains_key(name) { "yes" } else { "" }.to_owned(),
+                    if name == default_zone { "yes" } else { "" }.to_owned(),
                     target,
                     interfaces,
                     sources,
@@ -701,7 +784,9 @@ fn zones_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewR
 }
 
 fn services_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
-    let (runtime, permanent) = zone_slices(snap, zone, |z| z.services.as_slice());
+    let (runtime, permanent) = zone_slices(&snap.runtime, &snap.permanent, zone, |z| {
+        z.services.as_slice()
+    });
     union(runtime, permanent)
         .into_iter()
         .map(|service| {
@@ -732,8 +817,13 @@ fn services_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
         .collect()
 }
 
-fn ports_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
-    let (runtime, permanent) = zone_slices(snap, zone, |z| z.ports.as_slice());
+fn ports_rows(
+    runtime_zones: &BTreeMap<ZoneName, ZoneDetails>,
+    permanent_zones: &BTreeMap<ZoneName, ZoneDetails>,
+    zone: &ZoneName,
+) -> Vec<ViewRow> {
+    let (runtime, permanent) =
+        zone_slices(runtime_zones, permanent_zones, zone, |z| z.ports.as_slice());
     union(runtime, permanent)
         .into_iter()
         .map(|port| {
@@ -754,8 +844,14 @@ fn ports_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
         .collect()
 }
 
-fn forwarding_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
-    let (runtime, permanent) = zone_slices(snap, zone, |z| z.forward_ports.as_slice());
+fn forwarding_rows(
+    runtime_zones: &BTreeMap<ZoneName, ZoneDetails>,
+    permanent_zones: &BTreeMap<ZoneName, ZoneDetails>,
+    zone: &ZoneName,
+) -> Vec<ViewRow> {
+    let (runtime, permanent) = zone_slices(runtime_zones, permanent_zones, zone, |z| {
+        z.forward_ports.as_slice()
+    });
     union(runtime, permanent)
         .into_iter()
         .map(|fwd| {
@@ -778,8 +874,14 @@ fn forwarding_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
         .collect()
 }
 
-fn rich_rules_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
-    let (runtime, permanent) = zone_slices(snap, zone, |z| z.rich_rules.as_slice());
+fn rich_rules_rows(
+    runtime_zones: &BTreeMap<ZoneName, ZoneDetails>,
+    permanent_zones: &BTreeMap<ZoneName, ZoneDetails>,
+    zone: &ZoneName,
+) -> Vec<ViewRow> {
+    let (runtime, permanent) = zone_slices(runtime_zones, permanent_zones, zone, |z| {
+        z.rich_rules.as_slice()
+    });
     union(runtime, permanent)
         .into_iter()
         .map(|rule| {
@@ -801,11 +903,14 @@ fn rich_rules_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
         .collect()
 }
 
-fn interfaces_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewRow> {
+fn interfaces_rows(
+    active_zones: &BTreeMap<ZoneName, ActiveZone>,
+    permanent_zones: &BTreeMap<ZoneName, ZoneDetails>,
+    config: ConfigurationTarget,
+) -> Vec<ViewRow> {
     if config == ConfigurationTarget::Permanent {
         // Permanent bindings live in the zone definitions, not the active map.
-        return snap
-            .permanent
+        return permanent_zones
             .iter()
             .flat_map(|(zone, details)| {
                 details.interfaces.iter().map(move |iface| {
@@ -821,7 +926,7 @@ fn interfaces_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<
             })
             .collect();
     }
-    snap.active
+    active_zones
         .iter()
         .flat_map(|(zone, active)| {
             active.interfaces.iter().map(move |iface| {
@@ -838,10 +943,13 @@ fn interfaces_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<
         .collect()
 }
 
-fn sources_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<ViewRow> {
+fn sources_rows(
+    active_zones: &BTreeMap<ZoneName, ActiveZone>,
+    permanent_zones: &BTreeMap<ZoneName, ZoneDetails>,
+    config: ConfigurationTarget,
+) -> Vec<ViewRow> {
     if config == ConfigurationTarget::Permanent {
-        return snap
-            .permanent
+        return permanent_zones
             .iter()
             .flat_map(|(zone, details)| {
                 details.sources.iter().map(move |source| {
@@ -861,7 +969,7 @@ fn sources_rows(snap: &FirewallSnapshot, config: ConfigurationTarget) -> Vec<Vie
             })
             .collect();
     }
-    snap.active
+    active_zones
         .iter()
         .flat_map(|(zone, active)| {
             active.sources.iter().map(move |source| {

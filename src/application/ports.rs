@@ -2,9 +2,12 @@
 //! infrastructure implements this trait, the UI never sees it.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus, RefreshObservation};
+
+use super::api::{RefreshOverview, RefreshPrioritySource};
 
 /// Stable identity for one rollback guard. It is assigned immediately before
 /// the matching operation runs, so duplicate operations never share lifecycle
@@ -210,6 +213,15 @@ pub struct SnapshotRead {
     pub observation: RefreshObservation,
 }
 
+/// Result of the low-latency overview phase of a staged refresh.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverviewRead {
+    /// Overview state, when the backend supports staged refresh reads.
+    pub result: Result<Option<Arc<RefreshOverview>>, FirewallError>,
+    /// Exact latency plus adapter-specific process/section measurements.
+    pub observation: RefreshObservation,
+}
+
 /// The firewalld backend: reads (`probe`, `snapshot`) and mutations (`apply`,
 /// `reload`). Native async-fn-in-trait with explicit `Send` bounds (ADR-1).
 pub trait FirewallBackend: Send + Sync + 'static {
@@ -233,6 +245,28 @@ pub trait FirewallBackend: Send + Sync + 'static {
                 observation: RefreshObservation::total_only(started.elapsed()),
             }
         }
+    }
+
+    /// Reads the low-latency overview stage, when the backend supports it.
+    fn snapshot_overview(
+        &self,
+        _priority: &RefreshPrioritySource,
+    ) -> impl Future<Output = OverviewRead> + Send {
+        async {
+            OverviewRead {
+                result: Ok(None),
+                observation: RefreshObservation::total_only(Duration::ZERO),
+            }
+        }
+    }
+
+    /// Hydrates a staged overview into the complete firewall snapshot.
+    fn snapshot_hydrated(
+        &self,
+        _overview: Option<Arc<RefreshOverview>>,
+        _priority: &RefreshPrioritySource,
+    ) -> impl Future<Output = SnapshotRead> + Send {
+        self.snapshot_observed()
     }
 
     /// Reads state for a mutation precondition, bypassing any refresh cache.

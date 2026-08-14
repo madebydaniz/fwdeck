@@ -10,18 +10,18 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep};
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::domain::FirewallSnapshot;
 
 use super::api::{
     EngineEvent, EngineRequest, ManualRefreshRequest, MutationPlan, MutationRequest,
-    OperationResult, REQUEST_CAPACITY, RefreshCancellationReason, RefreshScheduleObservation,
-    RefreshTrigger, RollbackRegistration, RollbackRequest,
+    OperationResult, REQUEST_CAPACITY, RefreshCancellationReason, RefreshId, RefreshPrioritySource,
+    RefreshScheduleObservation, RefreshTrigger, RollbackRegistration, RollbackRequest,
 };
 use super::ports::{
-    FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId, SnapshotRead,
-    StepReport,
+    FirewallBackend, FirewallError, OperationOutcome, OverviewRead, RollbackGuard, RollbackGuardId,
+    SnapshotRead, StepReport,
 };
 use super::refresh_scheduler::{
     ManualDemandOverflow, RefreshCancellation, RefreshCompletion, RefreshDemand, RefreshScheduler,
@@ -40,11 +40,12 @@ pub fn next_op_id() -> u64 {
 }
 
 enum OrdinaryRefreshOutcome {
-    Completed(SnapshotRead),
+    Completed(Box<StagedSnapshotRead>),
     Preempted {
         work: EngineWork,
         schedule: RefreshScheduleObservation,
         reason: RefreshCancellationReason,
+        stage: RefreshStage,
         elapsed: Duration,
     },
     Shutdown,
@@ -58,13 +59,14 @@ enum OrdinaryLifecycleOutcome {
 
 enum MandatoryRefreshOutcome {
     Completed {
-        read: Box<SnapshotRead>,
+        read: Box<StagedSnapshotRead>,
         completion: RefreshCompletion,
         priority_rollback: Option<RollbackRequest>,
     },
     RollbackPreempted {
         request: RollbackRequest,
         cancellation: RefreshCancellation,
+        stage: RefreshStage,
         elapsed: Duration,
     },
     Shutdown,
@@ -78,6 +80,50 @@ enum ReconciliationOutcome {
 enum EngineWork {
     Normal(EngineRequest),
     Rollback(RollbackRequest),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshStage {
+    Overview,
+    Hydration,
+}
+
+impl RefreshStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Hydration => "hydration",
+        }
+    }
+}
+
+struct RefreshStageTracker(AtomicU8);
+
+impl RefreshStageTracker {
+    const fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+
+    fn set(&self, stage: RefreshStage) {
+        let value = match stage {
+            RefreshStage::Overview => 0,
+            RefreshStage::Hydration => 1,
+        };
+        self.0.store(value, Ordering::Relaxed);
+    }
+
+    fn current(&self) -> RefreshStage {
+        match self.0.load(Ordering::Relaxed) {
+            0 => RefreshStage::Overview,
+            _ => RefreshStage::Hydration,
+        }
+    }
+}
+
+struct StagedSnapshotRead {
+    read: SnapshotRead,
+    overview_elapsed: Duration,
+    hydration_elapsed: Duration,
 }
 
 pub(crate) struct EngineReceivers {
@@ -206,12 +252,13 @@ impl<'a> PeriodicDeadline<'a> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
     backend: B,
     rollback_guard: G,
     mut inputs: EngineReceivers,
     events: mpsc::Sender<EngineEvent>,
+    refresh_priority: RefreshPrioritySource,
     refresh_interval: Duration,
     read_only: bool,
     rollback_timeout: Duration,
@@ -248,6 +295,7 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
                 &backend,
                 &rollback_guard,
                 &events,
+                &refresh_priority,
                 &mut inputs,
                 &mut pending_requests,
                 &mut scheduler,
@@ -321,6 +369,7 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
             &backend,
             &mut inputs,
             &events,
+            &refresh_priority,
             &mut scheduler,
             &mut periodic_deadline,
             start,
@@ -393,6 +442,7 @@ async fn drive_ordinary_lifecycle<B: FirewallBackend>(
     backend: &B,
     inputs: &mut EngineReceivers,
     events: &mpsc::Sender<EngineEvent>,
+    refresh_priority: &RefreshPrioritySource,
     scheduler: &mut RefreshScheduler,
     periodic_deadline: &mut PeriodicDeadline<'_>,
     start: RefreshStart,
@@ -400,9 +450,19 @@ async fn drive_ordinary_lifecycle<B: FirewallBackend>(
     if send_refresh_started(events, start).await.is_err() {
         return OrdinaryLifecycleOutcome::Shutdown;
     }
-    match drive_ordinary_refresh(backend, inputs, events, scheduler, periodic_deadline).await {
+    match drive_ordinary_refresh(
+        backend,
+        inputs,
+        events,
+        refresh_priority,
+        scheduler,
+        periodic_deadline,
+        start.id,
+    )
+    .await
+    {
         OrdinaryRefreshOutcome::Completed(read) => {
-            match finish_ordinary_refresh(events, scheduler, start, read).await {
+            match finish_ordinary_refresh(events, scheduler, start, *read).await {
                 Ok(trailing_manual) => OrdinaryLifecycleOutcome::Completed { trailing_manual },
                 Err(()) => OrdinaryLifecycleOutcome::Shutdown,
             }
@@ -411,9 +471,10 @@ async fn drive_ordinary_lifecycle<B: FirewallBackend>(
             work,
             schedule,
             reason,
+            stage,
             elapsed,
         } => {
-            if send_refresh_cancelled(events, schedule, reason, elapsed)
+            if send_refresh_cancelled(events, schedule, reason, stage, elapsed)
                 .await
                 .is_err()
             {
@@ -430,11 +491,14 @@ async fn drive_ordinary_refresh<B: FirewallBackend>(
     backend: &B,
     inputs: &mut EngineReceivers,
     events: &mpsc::Sender<EngineEvent>,
+    refresh_priority: &RefreshPrioritySource,
     scheduler: &mut RefreshScheduler,
     periodic_deadline: &mut PeriodicDeadline<'_>,
+    id: RefreshId,
 ) -> OrdinaryRefreshOutcome {
     let started = Instant::now();
-    let snapshot = backend.snapshot_observed();
+    let stage = RefreshStageTracker::new();
+    let snapshot = read_staged_snapshot(backend, refresh_priority, events, id, &stage);
     tokio::pin!(snapshot);
 
     loop {
@@ -457,6 +521,7 @@ async fn drive_ordinary_refresh<B: FirewallBackend>(
                     work: EngineWork::Rollback(rollback),
                     schedule,
                     reason: RefreshCancellationReason::RollbackPreempted,
+                    stage: stage.current(),
                     elapsed: started.elapsed(),
                 };
             }
@@ -473,6 +538,7 @@ async fn drive_ordinary_refresh<B: FirewallBackend>(
                     work: EngineWork::Normal(request),
                     schedule,
                     reason: RefreshCancellationReason::MutationPreempted,
+                    stage: stage.current(),
                     elapsed: started.elapsed(),
                 };
             }
@@ -492,23 +558,81 @@ async fn drive_ordinary_refresh<B: FirewallBackend>(
                 if periodic_deadline.observe_due(scheduler, "ordinary").is_err() {
                     return OrdinaryRefreshOutcome::Shutdown;
                 }
-                return OrdinaryRefreshOutcome::Completed(read);
+                return match read {
+                    Some(read) => OrdinaryRefreshOutcome::Completed(Box::new(read)),
+                    None => OrdinaryRefreshOutcome::Shutdown,
+                };
             }
         }
     }
 }
 
+async fn read_staged_snapshot<B: FirewallBackend>(
+    backend: &B,
+    refresh_priority: &RefreshPrioritySource,
+    events: &mpsc::Sender<EngineEvent>,
+    id: RefreshId,
+    stage: &RefreshStageTracker,
+) -> Option<StagedSnapshotRead> {
+    stage.set(RefreshStage::Overview);
+    let OverviewRead {
+        result,
+        observation: overview_observation,
+    } = backend.snapshot_overview(refresh_priority).await;
+    let overview_elapsed = overview_observation.elapsed;
+    let overview = match result {
+        Ok(overview) => overview,
+        Err(error) => {
+            return Some(StagedSnapshotRead {
+                read: SnapshotRead {
+                    result: Err(error),
+                    observation: overview_observation,
+                },
+                overview_elapsed,
+                hydration_elapsed: Duration::ZERO,
+            });
+        }
+    };
+
+    if let Some(value) = overview.as_ref()
+        && events
+            .send(EngineEvent::RefreshOverviewReady {
+                id,
+                overview: Arc::clone(value),
+            })
+            .await
+            .is_err()
+    {
+        return None;
+    }
+
+    stage.set(RefreshStage::Hydration);
+    let hydration = backend.snapshot_hydrated(overview, refresh_priority).await;
+    let hydration_elapsed = hydration.observation.elapsed;
+    Some(StagedSnapshotRead {
+        read: SnapshotRead {
+            result: hydration.result,
+            observation: overview_observation.merge_sequential(hydration.observation),
+        },
+        overview_elapsed,
+        hydration_elapsed,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn drive_mandatory_refresh<B: FirewallBackend>(
     backend: &B,
     inputs: &mut EngineReceivers,
     events: &mpsc::Sender<EngineEvent>,
+    refresh_priority: &RefreshPrioritySource,
     pending_requests: &mut VecDeque<EngineRequest>,
     scheduler: &mut RefreshScheduler,
     start: RefreshStart,
     periodic_deadline: &mut PeriodicDeadline<'_>,
 ) -> MandatoryRefreshOutcome {
     let started = Instant::now();
-    let snapshot = backend.snapshot_observed();
+    let stage = RefreshStageTracker::new();
+    let snapshot = read_staged_snapshot(backend, refresh_priority, events, start.id, &stage);
     tokio::pin!(snapshot);
 
     loop {
@@ -523,6 +647,9 @@ async fn drive_mandatory_refresh<B: FirewallBackend>(
                 if periodic_deadline.observe_due(scheduler, "mandatory").is_err() {
                     return MandatoryRefreshOutcome::Shutdown;
                 }
+                let Some(read) = read else {
+                    return MandatoryRefreshOutcome::Shutdown;
+                };
                 if inputs.all_closed_and_empty() || events.is_closed() {
                     return MandatoryRefreshOutcome::Shutdown;
                 }
@@ -572,6 +699,7 @@ async fn drive_mandatory_refresh<B: FirewallBackend>(
                 return MandatoryRefreshOutcome::RollbackPreempted {
                     request,
                     cancellation,
+                    stage: stage.current(),
                     elapsed: started.elapsed(),
                 };
             }
@@ -657,6 +785,7 @@ async fn reconcile_after_request<B: FirewallBackend, G: RollbackGuard>(
     backend: &B,
     rollback_guard: &G,
     events: &mpsc::Sender<EngineEvent>,
+    refresh_priority: &RefreshPrioritySource,
     inputs: &mut EngineReceivers,
     pending_requests: &mut VecDeque<EngineRequest>,
     scheduler: &mut RefreshScheduler,
@@ -673,6 +802,7 @@ async fn reconcile_after_request<B: FirewallBackend, G: RollbackGuard>(
             backend,
             inputs,
             events,
+            refresh_priority,
             pending_requests,
             scheduler,
             start,
@@ -705,6 +835,7 @@ async fn reconcile_after_request<B: FirewallBackend, G: RollbackGuard>(
             MandatoryRefreshOutcome::RollbackPreempted {
                 request,
                 cancellation,
+                stage,
                 elapsed,
             } => {
                 trailing_manual |= cancellation.trailing_manual;
@@ -712,6 +843,7 @@ async fn reconcile_after_request<B: FirewallBackend, G: RollbackGuard>(
                     events,
                     cancellation.schedule,
                     RefreshCancellationReason::RollbackPreempted,
+                    stage,
                     elapsed,
                 )
                 .await?;
@@ -736,7 +868,7 @@ async fn finish_ordinary_refresh(
     events: &mpsc::Sender<EngineEvent>,
     scheduler: &mut RefreshScheduler,
     start: RefreshStart,
-    read: SnapshotRead,
+    read: StagedSnapshotRead,
 ) -> Result<bool, ()> {
     let Some(completion) = scheduler.finish(start.id) else {
         tracing::error!(refresh_id = start.id.get(), "refresh completion was lost");
@@ -764,6 +896,7 @@ async fn send_refresh_cancelled(
     events: &mpsc::Sender<EngineEvent>,
     schedule: RefreshScheduleObservation,
     reason: RefreshCancellationReason,
+    stage: RefreshStage,
     elapsed: Duration,
 ) -> Result<(), ()> {
     tracing::debug!(
@@ -773,6 +906,7 @@ async fn send_refresh_cancelled(
         coalesced_periodic_ticks = schedule.coalesced_periodic_ticks,
         elapsed_ms = elapsed.as_millis(),
         reason = ?reason,
+        cancellation_stage = stage.as_str(),
         "refresh cancelled"
     );
     events
@@ -1216,8 +1350,13 @@ fn append_warning(current: &mut Option<String>, warning: String) {
 async fn send_refresh_finished(
     events: &mpsc::Sender<EngineEvent>,
     completion: RefreshCompletion,
-    read: SnapshotRead,
+    staged: StagedSnapshotRead,
 ) -> Result<(), ()> {
+    let StagedSnapshotRead {
+        read,
+        overview_elapsed,
+        hydration_elapsed,
+    } = staged;
     let result = read.result.map(Arc::new);
     let observation = read.observation;
     match &result {
@@ -1227,6 +1366,8 @@ async fn send_refresh_finished(
             merged_manual_requests = completion.schedule.merged_manual_requests,
             coalesced_periodic_ticks = completion.schedule.coalesced_periodic_ticks,
             backend_elapsed_ms = observation.elapsed.as_millis(),
+            overview_elapsed_ms = overview_elapsed.as_millis(),
+            hydration_elapsed_ms = hydration_elapsed.as_millis(),
             process_count = observation.process_count,
             success = true,
             zones = snapshot.runtime.len(),
@@ -1238,6 +1379,8 @@ async fn send_refresh_finished(
             merged_manual_requests = completion.schedule.merged_manual_requests,
             coalesced_periodic_ticks = completion.schedule.coalesced_periodic_ticks,
             backend_elapsed_ms = observation.elapsed.as_millis(),
+            overview_elapsed_ms = overview_elapsed.as_millis(),
+            hydration_elapsed_ms = hydration_elapsed.as_millis(),
             process_count = observation.process_count,
             success = false,
             error = %err,
@@ -1259,13 +1402,41 @@ async fn send_refresh_finished(
 mod tests {
     use super::*;
     use crate::application::ports::{
-        FirewallBackend, FirewallError, RollbackGuardError, RollbackGuardId, SnapshotRead,
+        FirewallBackend, FirewallError, OverviewRead, RollbackGuardError, RollbackGuardId,
+        SnapshotRead,
     };
-    use crate::application::{RefreshCancellationReason, RefreshTrigger};
-    use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus, mock};
+    use crate::application::{
+        RefreshCancellationReason, RefreshOverview, RefreshPrioritySource, RefreshTrigger,
+    };
+    use crate::domain::{
+        FirewallOperation, FirewallSnapshot, FirewallStatus, RefreshObservation, Scoped, mock,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::Semaphore;
+
+    async fn run<B: FirewallBackend, G: RollbackGuard>(
+        backend: B,
+        rollback_guard: G,
+        inputs: EngineReceivers,
+        events: mpsc::Sender<EngineEvent>,
+        refresh_interval: Duration,
+        read_only: bool,
+        rollback_timeout: Duration,
+    ) {
+        let (_publisher, refresh_priority) = crate::application::refresh_priority_channel();
+        super::run(
+            backend,
+            rollback_guard,
+            inputs,
+            events,
+            refresh_priority,
+            refresh_interval,
+            read_only,
+            rollback_timeout,
+        )
+        .await;
+    }
 
     #[derive(Default)]
     struct TestRollbackGuard;
@@ -1390,11 +1561,20 @@ mod tests {
 
     #[derive(Clone)]
     struct ControlledSnapshotBackend {
+        active_overviews: Arc<AtomicUsize>,
         active_snapshots: Arc<AtomicUsize>,
         max_active_snapshots: Arc<AtomicUsize>,
         snapshot_calls: Arc<AtomicUsize>,
         snapshot_started: Arc<Semaphore>,
         snapshot_release: Arc<Semaphore>,
+        overview_enabled: Arc<AtomicBool>,
+        overview_blocked: Arc<AtomicBool>,
+        overview_started: Arc<Semaphore>,
+        overview_release: Arc<Semaphore>,
+        overview_calls: Arc<AtomicUsize>,
+        overview_completions: Arc<AtomicUsize>,
+        hydration_starts: Arc<AtomicUsize>,
+        hydration_completions: Arc<AtomicUsize>,
         apply_observed_zero_active: Arc<AtomicBool>,
         active_snapshots_at_apply: Arc<Mutex<Vec<usize>>>,
         applied_operations: Arc<Mutex<Vec<FirewallOperation>>>,
@@ -1403,15 +1583,37 @@ mod tests {
     impl ControlledSnapshotBackend {
         fn new() -> Self {
             Self {
+                active_overviews: Arc::new(AtomicUsize::new(0)),
                 active_snapshots: Arc::new(AtomicUsize::new(0)),
                 max_active_snapshots: Arc::new(AtomicUsize::new(0)),
                 snapshot_calls: Arc::new(AtomicUsize::new(0)),
                 snapshot_started: Arc::new(Semaphore::new(0)),
                 snapshot_release: Arc::new(Semaphore::new(0)),
+                overview_enabled: Arc::new(AtomicBool::new(false)),
+                overview_blocked: Arc::new(AtomicBool::new(false)),
+                overview_started: Arc::new(Semaphore::new(0)),
+                overview_release: Arc::new(Semaphore::new(0)),
+                overview_calls: Arc::new(AtomicUsize::new(0)),
+                overview_completions: Arc::new(AtomicUsize::new(0)),
+                hydration_starts: Arc::new(AtomicUsize::new(0)),
+                hydration_completions: Arc::new(AtomicUsize::new(0)),
                 apply_observed_zero_active: Arc::new(AtomicBool::new(false)),
                 active_snapshots_at_apply: Arc::new(Mutex::new(Vec::new())),
                 applied_operations: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn enable_blocked_overview(&self) {
+            self.overview_enabled.store(true, Ordering::SeqCst);
+            self.overview_blocked.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_for_overview_start(&self) {
+            self.overview_started.acquire().await.unwrap().forget();
+        }
+
+        fn release_overview(&self) {
+            self.overview_release.add_permits(1);
         }
 
         async fn wait_for_snapshot_start(&self) {
@@ -1420,6 +1622,18 @@ mod tests {
 
         fn release_snapshot(&self) {
             self.snapshot_release.add_permits(1);
+        }
+
+        fn hydration_completions(&self) -> usize {
+            self.hydration_completions.load(Ordering::SeqCst)
+        }
+
+        fn hydration_starts(&self) -> usize {
+            self.hydration_starts.load(Ordering::SeqCst)
+        }
+
+        fn overview_completions(&self) -> usize {
+            self.overview_completions.load(Ordering::SeqCst)
         }
     }
 
@@ -1452,8 +1666,77 @@ mod tests {
             }
         }
 
+        fn snapshot_overview(
+            &self,
+            _priority: &RefreshPrioritySource,
+        ) -> impl std::future::Future<Output = OverviewRead> + Send {
+            let enabled = Arc::clone(&self.overview_enabled);
+            let blocked = Arc::clone(&self.overview_blocked);
+            let active = Arc::clone(&self.active_overviews);
+            let started = Arc::clone(&self.overview_started);
+            let release = Arc::clone(&self.overview_release);
+            let calls = Arc::clone(&self.overview_calls);
+            let completions = Arc::clone(&self.overview_completions);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if !enabled.load(Ordering::SeqCst) {
+                    return OverviewRead {
+                        result: Ok(None),
+                        observation: RefreshObservation::total_only(Duration::ZERO),
+                    };
+                }
+
+                active.fetch_add(1, Ordering::SeqCst);
+                let _guard = ActiveSnapshotGuard { active };
+                started.add_permits(1);
+                if blocked.load(Ordering::SeqCst) {
+                    release.acquire().await.unwrap().forget();
+                }
+                let result = mock::sample()
+                    .map_err(|error| FirewallError::Parse(error.to_string()))
+                    .map(|snapshot| {
+                        Arc::new(RefreshOverview {
+                            status: snapshot.status,
+                            default_zone: snapshot.default_zone,
+                            active: snapshot.active,
+                            runtime: snapshot.runtime,
+                            permanent: snapshot.permanent,
+                            available_services: snapshot.available_services,
+                            policy_names: Scoped {
+                                runtime: snapshot.policies.runtime.into_keys().collect(),
+                                permanent: snapshot.policies.permanent.into_keys().collect(),
+                            },
+                            degraded: snapshot.degraded,
+                        })
+                    })
+                    .map(Some);
+                completions.fetch_add(1, Ordering::SeqCst);
+                OverviewRead {
+                    result,
+                    observation: RefreshObservation::total_only(Duration::ZERO),
+                }
+            }
+        }
+
+        fn snapshot_hydrated(
+            &self,
+            _overview: Option<Arc<RefreshOverview>>,
+            _priority: &RefreshPrioritySource,
+        ) -> impl std::future::Future<Output = SnapshotRead> + Send {
+            let hydration = self.snapshot_observed();
+            let starts = Arc::clone(&self.hydration_starts);
+            let completions = Arc::clone(&self.hydration_completions);
+            async move {
+                starts.fetch_add(1, Ordering::SeqCst);
+                let read = hydration.await;
+                completions.fetch_add(1, Ordering::SeqCst);
+                read
+            }
+        }
+
         async fn apply(&self, operation: &FirewallOperation) -> OperationOutcome {
-            let active_snapshots = self.active_snapshots.load(Ordering::SeqCst);
+            let active_snapshots = self.active_snapshots.load(Ordering::SeqCst)
+                + self.active_overviews.load(Ordering::SeqCst);
             self.apply_observed_zero_active
                 .store(active_snapshots == 0, Ordering::SeqCst);
             self.active_snapshots_at_apply
@@ -1475,7 +1758,138 @@ mod tests {
         }
     }
 
-    struct LargeBackend;
+    struct ObservationBackend {
+        fail_overview: bool,
+        hydration_calls: AtomicUsize,
+    }
+
+    impl ObservationBackend {
+        const fn successful() -> Self {
+            Self {
+                fail_overview: false,
+                hydration_calls: AtomicUsize::new(0),
+            }
+        }
+
+        const fn failing_overview() -> Self {
+            Self {
+                fail_overview: true,
+                hydration_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl FirewallBackend for ObservationBackend {
+        async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
+            Err(FirewallError::DaemonNotRunning)
+        }
+
+        async fn snapshot(&self) -> Result<FirewallSnapshot, FirewallError> {
+            mock::sample().map_err(|error| FirewallError::Parse(error.to_string()))
+        }
+
+        async fn snapshot_overview(&self, _priority: &RefreshPrioritySource) -> OverviewRead {
+            let observation = RefreshObservation::new(
+                Duration::from_millis(12),
+                3,
+                vec![crate::domain::RefreshSectionObservation {
+                    section: crate::domain::RefreshSection::Status,
+                    elapsed: Duration::from_millis(4),
+                    process_count: 1,
+                }],
+            );
+            if self.fail_overview {
+                return OverviewRead {
+                    result: Err(FirewallError::DaemonNotRunning),
+                    observation,
+                };
+            }
+            OverviewRead {
+                result: mock::sample()
+                    .map_err(|error| FirewallError::Parse(error.to_string()))
+                    .map(|snapshot| {
+                        Some(Arc::new(RefreshOverview {
+                            status: snapshot.status,
+                            default_zone: snapshot.default_zone,
+                            active: snapshot.active,
+                            runtime: snapshot.runtime,
+                            permanent: snapshot.permanent,
+                            available_services: snapshot.available_services,
+                            policy_names: Scoped {
+                                runtime: snapshot.policies.runtime.into_keys().collect(),
+                                permanent: snapshot.policies.permanent.into_keys().collect(),
+                            },
+                            degraded: snapshot.degraded,
+                        }))
+                    }),
+                observation,
+            }
+        }
+
+        async fn snapshot_hydrated(
+            &self,
+            _overview: Option<Arc<RefreshOverview>>,
+            _priority: &RefreshPrioritySource,
+        ) -> SnapshotRead {
+            self.hydration_calls.fetch_add(1, Ordering::SeqCst);
+            SnapshotRead {
+                result: mock::sample().map_err(|error| FirewallError::Parse(error.to_string())),
+                observation: RefreshObservation::new(
+                    Duration::from_millis(20),
+                    5,
+                    vec![crate::domain::RefreshSectionObservation {
+                        section: crate::domain::RefreshSection::Services,
+                        elapsed: Duration::from_millis(7),
+                        process_count: 2,
+                    }],
+                ),
+            }
+        }
+
+        async fn apply(&self, operation: &FirewallOperation) -> OperationOutcome {
+            OperationOutcome::Applied {
+                operation: operation.clone(),
+                steps: Vec::new(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct LargeBackend {
+        active_snapshots: Arc<AtomicUsize>,
+        max_active_snapshots: Arc<AtomicUsize>,
+        hydration_started: Arc<Semaphore>,
+        hydration_release: Arc<Semaphore>,
+        observed_priorities: Arc<Mutex<Vec<crate::application::RefreshPriority>>>,
+    }
+
+    impl LargeBackend {
+        fn new() -> Self {
+            Self {
+                active_snapshots: Arc::new(AtomicUsize::new(0)),
+                max_active_snapshots: Arc::new(AtomicUsize::new(0)),
+                hydration_started: Arc::new(Semaphore::new(0)),
+                hydration_release: Arc::new(Semaphore::new(0)),
+                observed_priorities: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        async fn wait_for_hydration_start(&self) {
+            self.hydration_started.acquire().await.unwrap().forget();
+        }
+
+        fn release_hydration(&self) {
+            self.hydration_release.add_permits(1);
+        }
+
+        fn observed_priorities(&self) -> Vec<crate::application::RefreshPriority> {
+            self.observed_priorities.lock().unwrap().clone()
+        }
+
+        fn max_active_snapshots(&self) -> usize {
+            self.max_active_snapshots.load(Ordering::SeqCst)
+        }
+    }
 
     impl FirewallBackend for LargeBackend {
         async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
@@ -1486,6 +1900,52 @@ mod tests {
 
         async fn snapshot(&self) -> Result<FirewallSnapshot, FirewallError> {
             mock::large().map_err(|error| FirewallError::Parse(error.to_string()))
+        }
+
+        async fn snapshot_overview(&self, _priority: &RefreshPrioritySource) -> OverviewRead {
+            OverviewRead {
+                result: mock::large()
+                    .map_err(|error| FirewallError::Parse(error.to_string()))
+                    .map(|snapshot| {
+                        Some(Arc::new(RefreshOverview {
+                            status: snapshot.status,
+                            default_zone: snapshot.default_zone,
+                            active: snapshot.active,
+                            runtime: snapshot.runtime,
+                            permanent: snapshot.permanent,
+                            available_services: snapshot.available_services,
+                            policy_names: Scoped {
+                                runtime: snapshot.policies.runtime.into_keys().collect(),
+                                permanent: snapshot.policies.permanent.into_keys().collect(),
+                            },
+                            degraded: snapshot.degraded,
+                        }))
+                    }),
+                observation: RefreshObservation::total_only(Duration::ZERO),
+            }
+        }
+
+        async fn snapshot_hydrated(
+            &self,
+            _overview: Option<Arc<RefreshOverview>>,
+            priority: &RefreshPrioritySource,
+        ) -> SnapshotRead {
+            let active_now = self.active_snapshots.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_snapshots
+                .fetch_max(active_now, Ordering::SeqCst);
+            let _guard = ActiveSnapshotGuard {
+                active: Arc::clone(&self.active_snapshots),
+            };
+            self.hydration_started.add_permits(1);
+            self.hydration_release.acquire().await.unwrap().forget();
+            self.observed_priorities
+                .lock()
+                .unwrap()
+                .push(priority.latest());
+            SnapshotRead {
+                result: mock::large().map_err(|error| FirewallError::Parse(error.to_string())),
+                observation: RefreshObservation::total_only(Duration::ZERO),
+            }
         }
 
         async fn apply(&self, operation: &FirewallOperation) -> OperationOutcome {
@@ -2304,6 +2764,414 @@ mod tests {
     async fn drain_initial_refresh(rx: &mut mpsc::Receiver<EngineEvent>) {
         rx.recv().await.unwrap(); // RefreshStarted
         rx.recv().await.unwrap(); // RefreshFinished
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overview_event_arrives_before_hydration_finishes() {
+        let (_request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        backend.enable_blocked_overview();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            test_receivers(request_rx),
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        let refresh_id = match event_rx.recv().await.unwrap() {
+            EngineEvent::RefreshStarted {
+                id,
+                trigger: RefreshTrigger::Initial,
+            } => id,
+            other => panic!("expected initial refresh start, got {other:?}"),
+        };
+        backend.wait_for_overview_start().await;
+        assert_eq!(backend.overview_completions(), 0);
+
+        backend.release_overview();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshOverviewReady { id, .. } if id == refresh_id && id.get() == 1
+        ));
+        assert_eq!(backend.hydration_completions(), 0);
+        assert_eq!(backend.hydration_starts(), 1);
+    }
+
+    #[tokio::test]
+    async fn overview_error_skips_hydration_and_preserves_exact_observation() {
+        let backend = ObservationBackend::failing_overview();
+        let (_publisher, priority) = crate::application::refresh_priority_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let stage = RefreshStageTracker::new();
+
+        let staged =
+            read_staged_snapshot(&backend, &priority, &event_tx, RefreshId::new(71), &stage)
+                .await
+                .unwrap();
+
+        assert_eq!(staged.read.result, Err(FirewallError::DaemonNotRunning));
+        assert_eq!(staged.overview_elapsed, Duration::from_millis(12));
+        assert_eq!(staged.hydration_elapsed, Duration::ZERO);
+        assert_eq!(staged.read.observation.elapsed, Duration::from_millis(12));
+        assert_eq!(staged.read.observation.process_count, Some(3));
+        assert_eq!(backend.hydration_calls.load(Ordering::SeqCst), 0);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_staged_read_merges_observations_and_keeps_stage_elapsed() {
+        let backend = ObservationBackend::successful();
+        let (_publisher, priority) = crate::application::refresh_priority_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let stage = RefreshStageTracker::new();
+        let id = RefreshId::new(72);
+
+        let staged = read_staged_snapshot(&backend, &priority, &event_tx, id, &stage)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            EngineEvent::RefreshOverviewReady { id: event_id, .. } if event_id == id
+        ));
+        assert!(staged.read.result.is_ok());
+        assert_eq!(staged.overview_elapsed, Duration::from_millis(12));
+        assert_eq!(staged.hydration_elapsed, Duration::from_millis(20));
+        assert_eq!(staged.read.observation.elapsed, Duration::from_millis(32));
+        assert_eq!(staged.read.observation.process_count, Some(8));
+        assert_eq!(staged.read.observation.sections.len(), 2);
+        assert_eq!(backend.hydration_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn default_staged_backend_falls_back_to_one_final_snapshot() {
+        let backend = FakeBackend {
+            calls: AtomicUsize::new(0),
+            fail: false,
+        };
+        let (_publisher, priority) = crate::application::refresh_priority_channel();
+        let (event_tx, mut event_rx) = mpsc::channel(2);
+        let stage = RefreshStageTracker::new();
+
+        let staged =
+            read_staged_snapshot(&backend, &priority, &event_tx, RefreshId::new(73), &stage)
+                .await
+                .unwrap();
+
+        assert!(staged.read.result.is_ok());
+        assert_eq!(staged.overview_elapsed, Duration::ZERO);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn staged_refresh_stage_tracks_overview_then_hydration() {
+        let backend = ControlledSnapshotBackend::new();
+        backend.enable_blocked_overview();
+        let (_publisher, priority) = crate::application::refresh_priority_channel();
+        let (event_tx, _event_rx) = mpsc::channel(2);
+        let stage = RefreshStageTracker::new();
+        let staged =
+            read_staged_snapshot(&backend, &priority, &event_tx, RefreshId::new(74), &stage);
+        tokio::pin!(staged);
+
+        assert!(futures_util::poll!(&mut staged).is_pending());
+        backend.wait_for_overview_start().await;
+        assert_eq!(stage.current(), RefreshStage::Overview);
+
+        backend.release_overview();
+        assert!(futures_util::poll!(&mut staged).is_pending());
+        backend.wait_for_snapshot_start().await;
+        assert_eq!(stage.current(), RefreshStage::Hydration);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_staged_refresh_cannot_publish_stale_overview() {
+        let (request_tx, request_rx) = mpsc::channel(REQUEST_CAPACITY);
+        let (inputs, _manual_tx, rollback_tx) = test_receiver_lanes(request_rx);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let backend = ControlledSnapshotBackend::new();
+        backend.enable_blocked_overview();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            inputs,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        let overview_cancelled_id = match event_rx.recv().await.unwrap() {
+            EngineEvent::RefreshStarted {
+                id,
+                trigger: RefreshTrigger::Initial,
+            } => id,
+            other => panic!("expected initial refresh start, got {other:?}"),
+        };
+        backend.wait_for_overview_start().await;
+        request_tx
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled { schedule, .. }
+                if schedule.id == overview_cancelled_id
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(_)
+        ));
+
+        let hydration_cancelled_id = match event_rx.recv().await.unwrap() {
+            EngineEvent::RefreshStarted {
+                id,
+                trigger: RefreshTrigger::PostMutation,
+            } => id,
+            other => panic!("expected post-mutation refresh start, got {other:?}"),
+        };
+        assert_ne!(hydration_cancelled_id, overview_cancelled_id);
+        backend.wait_for_overview_start().await;
+        backend.release_overview();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshOverviewReady { id, .. } if id == hydration_cancelled_id
+        ));
+        backend.wait_for_snapshot_start().await;
+        let rollback_id = RollbackGuardId::new(916);
+        rollback_tx
+            .send(RollbackRequest {
+                id: rollback_id,
+                operation: FirewallOperation::SetPanicMode { enabled: true },
+                watchdog_unit: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled { schedule, .. }
+                if schedule.id == hydration_cancelled_id
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if result.completed_rollback == Some(rollback_id)
+        ));
+
+        let completed_id = match event_rx.recv().await.unwrap() {
+            EngineEvent::RefreshStarted {
+                id,
+                trigger: RefreshTrigger::PostMutation,
+            } => id,
+            other => panic!("expected replacement refresh start, got {other:?}"),
+        };
+        assert_ne!(completed_id, hydration_cancelled_id);
+        backend.wait_for_overview_start().await;
+        backend.release_overview();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshOverviewReady { id, .. } if id == completed_id
+        ));
+        backend.wait_for_snapshot_start().await;
+        backend.release_snapshot();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished { schedule, result: Ok(_), .. }
+                if schedule.id == completed_id
+        ));
+        assert_eq!(backend.max_active_snapshots.load(Ordering::SeqCst), 1);
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mutation_cancels_overview_before_apply() {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        backend.enable_blocked_overview();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            test_receivers(request_rx),
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_overview_start().await;
+        request_tx
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled {
+                reason: RefreshCancellationReason::MutationPreempted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(_)
+        ));
+        assert_eq!(backend.overview_completions(), 0);
+        assert_eq!(backend.active_snapshots_at_apply.lock().unwrap()[0], 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mutation_cancels_hydration_before_apply() {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            test_receivers(request_rx),
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        assert_eq!(backend.hydration_starts(), 1);
+        request_tx
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled {
+                reason: RefreshCancellationReason::MutationPreempted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(_)
+        ));
+        assert_eq!(backend.hydration_completions(), 0);
+        assert_eq!(backend.active_snapshots_at_apply.lock().unwrap()[0], 0);
+        assert_eq!(backend.applied_operations.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rollback_preempts_mandatory_hydration_and_restarts_it() {
+        let (request_tx, request_rx) = mpsc::channel(REQUEST_CAPACITY);
+        let (inputs, _manual_tx, rollback_tx) = test_receiver_lanes(request_rx);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let backend = ControlledSnapshotBackend::new();
+        let rollback = FirewallOperation::SetPanicMode { enabled: true };
+        let rollback_id = RollbackGuardId::new(915);
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            inputs,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        request_tx
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled { .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(_)
+        ));
+
+        let mut post_mutation_starts = 0;
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        post_mutation_starts += 1;
+        backend.wait_for_snapshot_start().await;
+        rollback_tx
+            .send(RollbackRequest {
+                id: rollback_id,
+                operation: rollback.clone(),
+                watchdog_unit: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled {
+                reason: RefreshCancellationReason::RollbackPreempted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if result.completed_rollback == Some(rollback_id)
+                    && result.outcome.operation() == &rollback
+        ));
+        assert_eq!(backend.hydration_completions(), 0);
+        assert_eq!(backend.active_snapshots_at_apply.lock().unwrap()[1], 0);
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        post_mutation_starts += 1;
+        backend.wait_for_snapshot_start().await;
+
+        assert_eq!(post_mutation_starts, 2);
+        assert_eq!(backend.hydration_starts(), 3);
+        assert_eq!(
+            backend
+                .applied_operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|operation| *operation == &rollback)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -4444,36 +5312,91 @@ mod tests {
 
     #[tokio::test]
     async fn performance_budget_large_snapshot_refresh_stays_under_two_seconds() {
-        let (_request_tx, request_rx) = mpsc::channel(8);
-        let (event_tx, mut event_rx) = mpsc::channel(8);
-        let started = std::time::Instant::now();
-        tokio::spawn(run(
-            LargeBackend,
+        let backend = LargeBackend::new();
+        let mut engine = crate::application::api::spawn(
+            backend.clone(),
             TestRollbackGuard,
-            test_receivers(request_rx),
-            event_tx,
             Duration::from_secs(3600),
             false,
             Duration::from_secs(30),
-        ));
+        );
+        let mut state = crate::ui::state::UiState::new(
+            &crate::config::Config::default(),
+            "performance-fixture".to_owned(),
+            false,
+            None,
+        );
+        let started = std::time::Instant::now();
+        let refresh_id = match engine.events.recv().await.unwrap() {
+            EngineEvent::RefreshStarted { id, trigger } => {
+                crate::ui::update::update(
+                    &mut state,
+                    crate::ui::action::UiAction::RefreshStarted { id, trigger },
+                );
+                id
+            }
+            other => panic!("expected refresh start, got {other:?}"),
+        };
+        let overview = match engine.events.recv().await.unwrap() {
+            EngineEvent::RefreshOverviewReady { id, overview } if id == refresh_id => overview,
+            other => panic!("expected matching overview, got {other:?}"),
+        };
+        let reducer_started = std::time::Instant::now();
+        crate::ui::update::update(
+            &mut state,
+            crate::ui::action::UiAction::RefreshOverviewReady {
+                id: refresh_id,
+                overview,
+            },
+        );
+        let overview_reducer_elapsed = reducer_started.elapsed();
 
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            assert!(matches!(
-                event_rx.recv().await.unwrap(),
-                EngineEvent::RefreshStarted { .. }
-            ));
-            event_rx.recv().await.unwrap()
+        backend.wait_for_hydration_start().await;
+        for index in 0..100 {
+            engine
+                .refresh_priority
+                .publish(crate::application::RefreshPriority {
+                    zone: None,
+                    service: Some(
+                        crate::domain::ServiceName::parse(&format!("svc-{index:04}")).unwrap(),
+                    ),
+                    policy: None,
+                });
+        }
+        backend.release_hydration();
+        let final_snapshot = match tokio::time::timeout(Duration::from_secs(2), async {
+            engine.events.recv().await.unwrap()
         })
         .await
-        .unwrap();
-
-        assert!(matches!(
-            result,
+        .unwrap()
+        {
             EngineEvent::RefreshFinished {
+                schedule,
                 result: Ok(snapshot),
                 ..
-            } if snapshot.zone_names().len() == 100
-        ));
+            } if schedule.id == refresh_id => snapshot,
+            other => panic!("expected matching final snapshot, got {other:?}"),
+        };
+        let observed_priorities = backend.observed_priorities();
+        let priority_source_buffered_generations = observed_priorities.len();
+        let max_active_snapshots = backend.max_active_snapshots();
+        let expected_service_count = mock::LARGE_SERVICE_COUNT;
+
+        assert!(overview_reducer_elapsed < Duration::from_millis(50));
+        assert_eq!(priority_source_buffered_generations, 1);
+        assert_eq!(
+            observed_priorities[0]
+                .service
+                .as_ref()
+                .map(crate::domain::ServiceName::as_str),
+            Some("svc-0099")
+        );
+        assert_eq!(max_active_snapshots, 1);
+        assert_eq!(
+            final_snapshot.service_definitions.len(),
+            expected_service_count
+        );
+        assert_eq!(final_snapshot.zone_names().len(), mock::LARGE_ZONE_COUNT);
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

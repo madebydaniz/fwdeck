@@ -6,6 +6,7 @@
 pub mod command;
 #[cfg(feature = "dbus")]
 pub mod dbus;
+mod detail_priority;
 pub mod errors;
 pub mod parse;
 
@@ -13,8 +14,9 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use crate::application::ports::{
-    FirewallBackend, FirewallError, OperationOutcome, SnapshotRead, StepReport,
+    FirewallBackend, FirewallError, OperationOutcome, OverviewRead, SnapshotRead, StepReport,
 };
+use crate::application::{RefreshOverview, RefreshPriority, RefreshPrioritySource};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +27,7 @@ use crate::domain::{
     RefreshObservation, RefreshSection, RefreshSectionObservation, Scoped, ServiceDefinition,
     ServiceName, SnapshotSection, ZoneDetails, ZoneName,
 };
+use detail_priority::{DetailBatch, DetailBatchObservation, DetailQueue, DetailWork};
 
 /// Fallback so the browse overlay is never empty if `--get-services` fails.
 use super::process::{CommandOutput, CommandRequest, CommandRunner, DEFAULT_TIMEOUT};
@@ -129,6 +132,47 @@ type ZoneSections = (
     BTreeMap<ZoneName, ZoneDetails>,
     Vec<DegradedSection>,
 );
+
+type ServiceDetail = (
+    Option<(ServiceName, ServiceDefinition)>,
+    Option<DegradedSection>,
+);
+type PolicyDetail = (Option<(PolicyName, PolicyDetails)>, Option<DegradedSection>);
+
+enum DetailResult {
+    Service(ServiceDetail),
+    Policy {
+        target: ConfigurationTarget,
+        detail: Box<PolicyDetail>,
+    },
+}
+
+struct HydratedDetails {
+    service_definitions: BTreeMap<ServiceName, ServiceDefinition>,
+    policies: Scoped<BTreeMap<PolicyName, PolicyDetails>>,
+    service_degraded: Vec<DegradedSection>,
+    policy_degraded: Vec<DegradedSection>,
+}
+
+fn trace_detail_hydration(preferred_details: usize, background_details: usize) {
+    tracing::debug!(
+        preferred_details,
+        background_details,
+        "refresh detail hydration finished"
+    );
+}
+
+fn trace_detail_batch(priority: &RefreshPriority, batch: &DetailBatch) {
+    let observation = DetailBatchObservation::new(priority, batch);
+    tracing::debug!(
+        zone = ?observation.zone,
+        service = ?observation.service,
+        policy = ?observation.policy,
+        preferred_details = observation.preferred_details,
+        background_details = observation.background_details,
+        "refresh detail batch dispatched"
+    );
+}
 
 /// The `firewall-cmd` backend: the full-featured reference implementation of
 /// `FirewallBackend`. Sections that fail to fetch degrade with an honest
@@ -310,6 +354,316 @@ impl<R: CommandRunner> CliBackend<R> {
         )
     }
 
+    /// Fetches heavy snapshot sections using the exact policy names captured
+    /// by an earlier overview read, repopulating the existing tier cache.
+    #[allow(clippy::type_complexity)]
+    async fn fetch_hydrated_sections(
+        &self,
+        overview: &RefreshOverview,
+        priority: &RefreshPrioritySource,
+    ) -> (
+        Scoped<BTreeMap<IpSetName, IpSetInfo>>,
+        Scoped<BTreeMap<PolicyName, PolicyDetails>>,
+        Vec<String>,
+        Vec<DegradedSection>,
+        BTreeMap<ServiceName, ServiceDefinition>,
+        Vec<DegradedSection>,
+    ) {
+        let cached = {
+            let mut heavy = self
+                .heavy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(age) = heavy.age.as_mut()
+                && *age < HEAVY_SECTION_EVERY
+            {
+                *age += 1;
+                Some((
+                    heavy.ipsets.clone(),
+                    heavy.policies.clone(),
+                    heavy.direct_rules.clone(),
+                    heavy.degraded.clone(),
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((ipsets, policies, direct_rules, degraded)) = cached {
+            let details = self
+                .hydrate_detail_work(overview, priority, overview.referenced_services(), None)
+                .await;
+            return (
+                ipsets,
+                policies,
+                direct_rules,
+                degraded,
+                details.service_definitions,
+                details.service_degraded,
+            );
+        }
+
+        let (ipsets, mut degraded) = observe_section(RefreshSection::IpSets, self.ipsets()).await;
+        let (direct_rules, direct_err) =
+            observe_section(RefreshSection::DirectRules, self.direct_rules()).await;
+        let details = self
+            .hydrate_detail_work(
+                overview,
+                priority,
+                overview.referenced_services(),
+                Some(&overview.policy_names),
+            )
+            .await;
+        degraded.extend(direct_err);
+        degraded.extend(details.policy_degraded);
+        let mut heavy = self
+            .heavy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        heavy.age = Some(1);
+        heavy.ipsets = ipsets.clone();
+        heavy.policies = details.policies.clone();
+        heavy.direct_rules.clone_from(&direct_rules);
+        heavy.degraded.clone_from(&degraded);
+        drop(heavy);
+        (
+            ipsets,
+            details.policies,
+            direct_rules,
+            degraded,
+            details.service_definitions,
+            details.service_degraded,
+        )
+    }
+
+    async fn hydrate_detail_work(
+        &self,
+        overview: &RefreshOverview,
+        priority: &RefreshPrioritySource,
+        service_names: Vec<ServiceName>,
+        policy_names: Option<&Scoped<Vec<PolicyName>>>,
+    ) -> HydratedDetails {
+        let mut pending: Vec<DetailWork> = {
+            let cache = self
+                .definitions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            service_names
+                .iter()
+                .filter(|name| !cache.contains_key(*name))
+                .cloned()
+                .map(DetailWork::Service)
+                .collect()
+        };
+        if let Some(policy_names) = policy_names {
+            pending.extend(
+                policy_names
+                    .runtime
+                    .iter()
+                    .cloned()
+                    .map(|name| DetailWork::Policy {
+                        target: ConfigurationTarget::Runtime,
+                        name,
+                    }),
+            );
+            pending.extend(
+                policy_names
+                    .permanent
+                    .iter()
+                    .cloned()
+                    .map(|name| DetailWork::Policy {
+                        target: ConfigurationTarget::Permanent,
+                        name,
+                    }),
+            );
+        }
+
+        let mut queue = DetailQueue::new(pending);
+        let mut policies: Scoped<BTreeMap<PolicyName, PolicyDetails>> = Scoped::default();
+        let mut definitions = Vec::new();
+        let mut service_degraded = Vec::new();
+        let mut policy_degraded = Vec::new();
+        let mut preferred_details = 0usize;
+        let mut background_details = 0usize;
+        while !queue.is_empty() {
+            let latest = priority.latest();
+            let batch = queue.take_batch(8, overview, &latest);
+            trace_detail_batch(&latest, &batch);
+            preferred_details = preferred_details.saturating_add(batch.preferred_details);
+            background_details = background_details.saturating_add(batch.background_details);
+            let completed = bounded_fan_out(
+                batch
+                    .work
+                    .into_iter()
+                    .map(|work| async move { self.fetch_detail(work).await }),
+            )
+            .await;
+            for result in completed {
+                match result {
+                    DetailResult::Service((definition, failure)) => {
+                        definitions.extend(definition);
+                        service_degraded.extend(failure);
+                    }
+                    DetailResult::Policy { target, detail } => {
+                        let (definition, failure) = *detail;
+                        if let Some((name, details)) = definition {
+                            match target {
+                                ConfigurationTarget::Runtime => {
+                                    policies.runtime.insert(name, details);
+                                }
+                                ConfigurationTarget::Permanent => {
+                                    policies.permanent.insert(name, details);
+                                }
+                                ConfigurationTarget::RuntimeAndPermanent => {
+                                    policies.runtime.insert(name.clone(), details.clone());
+                                    policies.permanent.insert(name, details);
+                                }
+                            }
+                        }
+                        policy_degraded.extend(failure);
+                    }
+                }
+            }
+        }
+        trace_detail_hydration(preferred_details, background_details);
+
+        let mut cache = self
+            .definitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.extend(definitions);
+        let service_definitions = service_names
+            .into_iter()
+            .filter_map(|name| cache.get(&name).cloned().map(|details| (name, details)))
+            .collect();
+        HydratedDetails {
+            service_definitions,
+            policies,
+            service_degraded,
+            policy_degraded,
+        }
+    }
+
+    async fn fetch_detail(&self, work: DetailWork) -> DetailResult {
+        match work {
+            DetailWork::Service(name) => DetailResult::Service(
+                observe_section(RefreshSection::Services, self.fetch_service_detail(name)).await,
+            ),
+            DetailWork::Policy { target, name } => DetailResult::Policy {
+                target,
+                detail: Box::new(
+                    observe_section(
+                        RefreshSection::Policies,
+                        self.fetch_policy_detail(target, name),
+                    )
+                    .await,
+                ),
+            },
+        }
+    }
+
+    async fn fetch_service_detail(&self, name: ServiceName) -> ServiceDetail {
+        let arg = format!("--info-service={name}");
+        match self.run_ok(self.request(&[&arg])).await {
+            Ok(raw) => (Some((name, parse::parse_service_info(&raw))), None),
+            Err(err) => {
+                tracing::warn!(service = %name, error = %err, "service info failed");
+                let degraded = DegradedSection::new(
+                    SnapshotSection::ServiceDefinitions,
+                    None,
+                    err.to_string(),
+                )
+                .with_object(name.to_string());
+                (None, Some(degraded))
+            }
+        }
+    }
+
+    async fn fetch_policy_detail(
+        &self,
+        target: ConfigurationTarget,
+        name: PolicyName,
+    ) -> PolicyDetail {
+        let arg = format!("--info-policy={name}");
+        let request = if target == ConfigurationTarget::Permanent && !self.is_offline() {
+            self.request(&["--permanent", &arg])
+        } else {
+            self.request(&[&arg])
+        };
+        match self.run_ok(request).await {
+            Ok(raw) => match parse::parse_policy_info(&raw) {
+                Ok(details) => (Some((name, details)), None),
+                Err(err) => {
+                    tracing::warn!(policy = %name, error = %err, "policy parse failed");
+                    let failure = DegradedSection::new(
+                        SnapshotSection::Policies,
+                        Some(target),
+                        format!("unparseable details: {err}"),
+                    )
+                    .with_object(name.to_string());
+                    (None, Some(failure))
+                }
+            },
+            Err(err) => {
+                tracing::warn!(policy = %name, error = %err, "policy info failed");
+                let failure =
+                    DegradedSection::new(SnapshotSection::Policies, Some(target), err.to_string())
+                        .with_object(name.to_string());
+                (None, Some(failure))
+            }
+        }
+    }
+
+    async fn refresh_overview(&self) -> Result<RefreshOverview, FirewallError> {
+        let status = observe_section(RefreshSection::Status, self.probe()).await?;
+        if !status.daemon_running && !self.is_offline() {
+            return Err(FirewallError::DaemonNotRunning);
+        }
+        let (default_zone, active, runtime, permanent, mut degraded) =
+            self.fetch_zone_overview().await?;
+        let (available_services, service_error) =
+            observe_section(RefreshSection::Services, self.available_services()).await;
+        if let Some(service_error) = service_error {
+            degraded.push(service_error);
+        }
+        let (policy_names, policy_errors) =
+            observe_section(RefreshSection::Policies, self.policy_names()).await;
+        degraded.extend(policy_errors);
+        Ok(RefreshOverview {
+            status,
+            default_zone,
+            active,
+            runtime,
+            permanent,
+            available_services,
+            policy_names,
+            degraded,
+        })
+    }
+
+    async fn hydrate_overview(
+        &self,
+        overview: Arc<RefreshOverview>,
+        priority: &RefreshPrioritySource,
+    ) -> Result<FirewallSnapshot, FirewallError> {
+        let (ipsets, policies, direct_rules, mut degraded, service_definitions, service_degraded) =
+            self.fetch_hydrated_sections(&overview, priority).await;
+        degraded.extend(service_degraded);
+        degraded.extend(overview.degraded.clone());
+        Ok(FirewallSnapshot {
+            status: overview.status.clone(),
+            default_zone: overview.default_zone.clone(),
+            active: overview.active.clone(),
+            runtime: overview.runtime.clone(),
+            permanent: overview.permanent.clone(),
+            ipsets,
+            service_definitions,
+            available_services: overview.available_services.clone(),
+            policies,
+            direct_rules,
+            degraded,
+        })
+    }
+
     /// `firewall-cmd --check-config`: firewalld's own permanent-config lint.
     pub async fn check_config(&self) -> Result<(), FirewallError> {
         self.run_ok(self.request(&["--check-config"]))
@@ -451,43 +805,76 @@ impl<R: CommandRunner> CliBackend<R> {
         }
     }
 
-    /// Fetches one scope of policies, recording list, info, and parse failures.
-    async fn policies_for(
+    /// Fetches policy names for one configuration scope.
+    async fn policy_names_for(
         &self,
         target: ConfigurationTarget,
-    ) -> (BTreeMap<PolicyName, PolicyDetails>, Vec<DegradedSection>) {
+    ) -> (Vec<PolicyName>, Vec<DegradedSection>) {
         let request = if target == ConfigurationTarget::Permanent && !self.is_offline() {
             self.request(&["--permanent", "--get-policies"])
         } else {
             self.request(&["--get-policies"])
         };
-        let names = match self.run_ok(request).await {
+        match self.run_ok(request).await {
             Ok(raw) => match parse::parse_policy_names(&raw) {
-                Ok(names) => names,
+                Ok(names) => (names, Vec::new()),
                 Err(err) => {
                     tracing::warn!(error = %err, "policy listing unparseable");
-                    return (
-                        BTreeMap::new(),
+                    (
+                        Vec::new(),
                         vec![DegradedSection::new(
                             SnapshotSection::Policies,
                             Some(target),
                             format!("unparseable listing: {err}"),
                         )],
-                    );
+                    )
                 }
             },
             Err(err) => {
                 tracing::warn!(error = %err, "policy listing failed");
-                return (
-                    BTreeMap::new(),
+                (
+                    Vec::new(),
                     vec![DegradedSection::new(
                         SnapshotSection::Policies,
                         Some(target),
                         err.to_string(),
                     )],
-                );
+                )
             }
-        };
+        }
+    }
+
+    /// Fetches policy names for each available configuration scope.
+    async fn policy_names(&self) -> (Scoped<Vec<PolicyName>>, Vec<DegradedSection>) {
+        if self.is_offline() {
+            let (permanent, mut degraded) =
+                self.policy_names_for(ConfigurationTarget::Permanent).await;
+            degraded.push(DegradedSection::new(
+                SnapshotSection::Policies,
+                Some(ConfigurationTarget::Runtime),
+                "runtime configuration is unavailable in offline mode",
+            ));
+            return (
+                Scoped {
+                    runtime: Vec::new(),
+                    permanent,
+                },
+                degraded,
+            );
+        }
+        let (runtime, mut degraded) = self.policy_names_for(ConfigurationTarget::Runtime).await;
+        let (permanent, permanent_degraded) =
+            self.policy_names_for(ConfigurationTarget::Permanent).await;
+        degraded.extend(permanent_degraded);
+        (Scoped { runtime, permanent }, degraded)
+    }
+
+    /// Fetches policy details for the exact names captured by policy listing.
+    async fn policies_for(
+        &self,
+        target: ConfigurationTarget,
+        names: Vec<PolicyName>,
+    ) -> (BTreeMap<PolicyName, PolicyDetails>, Vec<DegradedSection>) {
         let infos = bounded_fan_out(names.into_iter().map(|name| async move {
             let arg = format!("--info-policy={name}");
             let request = if target == ConfigurationTarget::Permanent && !self.is_offline() {
@@ -537,24 +924,14 @@ impl<R: CommandRunner> CliBackend<R> {
         Scoped<BTreeMap<PolicyName, PolicyDetails>>,
         Vec<DegradedSection>,
     ) {
-        if self.is_offline() {
-            let (permanent, mut degraded) = self.policies_for(ConfigurationTarget::Permanent).await;
-            degraded.push(DegradedSection::new(
-                SnapshotSection::Policies,
-                Some(ConfigurationTarget::Runtime),
-                "runtime configuration is unavailable in offline mode",
-            ));
-            return (
-                Scoped {
-                    runtime: BTreeMap::new(),
-                    permanent,
-                },
-                degraded,
-            );
-        }
-        let (runtime, mut degraded) = self.policies_for(ConfigurationTarget::Runtime).await;
-        let (permanent, permanent_degraded) =
-            self.policies_for(ConfigurationTarget::Permanent).await;
+        let (names, mut degraded) = self.policy_names().await;
+        let (runtime, runtime_degraded) = self
+            .policies_for(ConfigurationTarget::Runtime, names.runtime)
+            .await;
+        let (permanent, permanent_degraded) = self
+            .policies_for(ConfigurationTarget::Permanent, names.permanent)
+            .await;
+        degraded.extend(runtime_degraded);
         degraded.extend(permanent_degraded);
         (Scoped { runtime, permanent }, degraded)
     }
@@ -577,6 +954,27 @@ impl<R: CommandRunner> CliBackend<R> {
                 )
             }
         }
+    }
+
+    async fn fetch_zone_overview(
+        &self,
+    ) -> Result<
+        (
+            ZoneName,
+            BTreeMap<ZoneName, ActiveZone>,
+            BTreeMap<ZoneName, ZoneDetails>,
+            BTreeMap<ZoneName, ZoneDetails>,
+            Vec<DegradedSection>,
+        ),
+        FirewallError,
+    > {
+        observe_section(RefreshSection::Zones, async {
+            let default_zone = self.run_ok(self.request(&["--get-default-zone"])).await?;
+            let default_zone = parse::parse_default_zone(&default_zone)?;
+            let (active, runtime, permanent, degraded) = self.zone_sections().await?;
+            Ok((default_zone, active, runtime, permanent, degraded))
+        })
+        .await
     }
 
     /// Fetches runtime/permanent zones and records malformed individual zone
@@ -710,13 +1108,7 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
         }
 
         let (default_zone, active, runtime, permanent, zone_degraded) =
-            observe_section(RefreshSection::Zones, async {
-                let default_zone = self.run_ok(self.request(&["--get-default-zone"])).await?;
-                let default_zone = parse::parse_default_zone(&default_zone)?;
-                let (active, runtime, permanent, zone_degraded) = self.zone_sections().await?;
-                Ok::<_, FirewallError>((default_zone, active, runtime, permanent, zone_degraded))
-            })
-            .await?;
+            self.fetch_zone_overview().await?;
         // Tiered refresh: the per-object sections (one subprocess each) are
         // reused for a few refreshes; mutations invalidate the cache.
         let cached = {
@@ -784,6 +1176,41 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
         let started = Instant::now();
         let result = REFRESH_RECORDER
             .scope(Arc::clone(&recorder), self.snapshot())
+            .await;
+        SnapshotRead {
+            result,
+            observation: recorder.finish(started.elapsed()),
+        }
+    }
+
+    async fn snapshot_overview(&self, _priority: &RefreshPrioritySource) -> OverviewRead {
+        let recorder = Arc::new(RefreshRecorder::default());
+        let started = Instant::now();
+        let result = REFRESH_RECORDER
+            .scope(Arc::clone(&recorder), self.refresh_overview())
+            .await
+            .map(|overview| Some(Arc::new(overview)));
+        OverviewRead {
+            result,
+            observation: recorder.finish(started.elapsed()),
+        }
+    }
+
+    async fn snapshot_hydrated(
+        &self,
+        overview: Option<Arc<RefreshOverview>>,
+        priority: &RefreshPrioritySource,
+    ) -> SnapshotRead {
+        let Some(overview) = overview else {
+            return self.snapshot_observed().await;
+        };
+        let recorder = Arc::new(RefreshRecorder::default());
+        let started = Instant::now();
+        let result = REFRESH_RECORDER
+            .scope(
+                Arc::clone(&recorder),
+                self.hydrate_overview(overview, priority),
+            )
             .await;
         SnapshotRead {
             result,

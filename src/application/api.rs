@@ -1,13 +1,17 @@
 //! Channel-based handle connecting the UI loop to the engine task. The UI
 //! depends on these types only — never on `FirewallBackend` implementations.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-use crate::domain::{FirewallOperation, FirewallSnapshot, RefreshObservation};
+use crate::domain::{
+    ActiveZone, DegradedSection, FirewallOperation, FirewallSnapshot, FirewallStatus, PolicyName,
+    RefreshObservation, Scoped, ServiceName, ZoneDetails, ZoneName,
+};
 
 use super::engine;
 use super::ports::{
@@ -129,6 +133,76 @@ pub struct RefreshScheduleObservation {
     pub coalesced_periodic_ticks: u64,
 }
 
+/// UI selection that should be fetched first while a staged refresh hydrates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefreshPriority {
+    pub zone: Option<ZoneName>,
+    pub service: Option<ServiceName>,
+    pub policy: Option<PolicyName>,
+}
+
+/// Sends the most recent refresh target without accumulating stale demand.
+#[derive(Clone)]
+pub struct RefreshPriorityPublisher(watch::Sender<RefreshPriority>);
+
+/// Reads the most recently requested refresh target.
+#[derive(Clone)]
+pub struct RefreshPrioritySource(watch::Receiver<RefreshPriority>);
+
+/// Creates the single-latest-value channel used by staged refresh consumers.
+#[must_use]
+pub fn refresh_priority_channel() -> (RefreshPriorityPublisher, RefreshPrioritySource) {
+    let (publisher, source) = watch::channel(RefreshPriority::default());
+    (
+        RefreshPriorityPublisher(publisher),
+        RefreshPrioritySource(source),
+    )
+}
+
+impl RefreshPriorityPublisher {
+    /// Replaces any previously requested target with the current UI priority.
+    pub fn publish(&self, priority: RefreshPriority) {
+        self.0.send_replace(priority);
+    }
+}
+
+impl RefreshPrioritySource {
+    /// Returns the current priority without waiting for a future update.
+    #[must_use]
+    pub fn latest(&self) -> RefreshPriority {
+        self.0.borrow().clone()
+    }
+}
+
+/// The cheap snapshot stage used to decide which details need hydration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshOverview {
+    pub status: FirewallStatus,
+    pub default_zone: ZoneName,
+    pub active: BTreeMap<ZoneName, ActiveZone>,
+    pub runtime: BTreeMap<ZoneName, ZoneDetails>,
+    pub permanent: BTreeMap<ZoneName, ZoneDetails>,
+    pub available_services: Vec<ServiceName>,
+    pub policy_names: Scoped<Vec<PolicyName>>,
+    pub degraded: Vec<DegradedSection>,
+}
+
+impl RefreshOverview {
+    /// Sorted union of service names referenced by any overview zone.
+    #[must_use]
+    pub fn referenced_services(&self) -> Vec<ServiceName> {
+        let mut names: Vec<ServiceName> = self
+            .runtime
+            .values()
+            .chain(self.permanent.values())
+            .flat_map(|zone| zone.services.iter().cloned())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshCancellationReason {
     MutationPreempted,
@@ -185,6 +259,13 @@ pub enum EngineEvent {
         /// Demand that started this refresh.
         trigger: RefreshTrigger,
     },
+    /// A low-latency staged overview is ready while full hydration continues.
+    RefreshOverviewReady {
+        /// Identity of the lifecycle that owns this overview and its hydration.
+        id: RefreshId,
+        /// Authoritative overview captured for this lifecycle.
+        overview: Arc<RefreshOverview>,
+    },
     /// The snapshot pass ended. `Arc` because the UI keeps the previous
     /// snapshot alive while diffing against the new one.
     RefreshFinished {
@@ -236,6 +317,8 @@ pub struct EngineHandle {
     pub rollbacks: mpsc::Sender<RollbackRequest>,
     /// Bounded event channel out of the engine (capacity 64).
     pub events: mpsc::Receiver<EngineEvent>,
+    /// Latest-value staged refresh priority publisher owned by this engine.
+    pub refresh_priority: RefreshPriorityPublisher,
 }
 
 /// Spawns the engine task owning `backend`. Bounded channels: a slow UI applies
@@ -252,11 +335,13 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
     let (manual_refresh_tx, manual_refresh_rx) = mpsc::channel(MANUAL_REFRESH_CAPACITY);
     let (rollback_tx, rollback_rx) = mpsc::channel(ROLLBACK_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
+    let (refresh_priority, refresh_priority_source) = refresh_priority_channel();
     tokio::spawn(engine::run(
         backend,
         rollback_guard,
         engine::EngineReceivers::new(request_rx, manual_refresh_rx, rollback_rx),
         event_tx,
+        refresh_priority_source,
         refresh_interval,
         read_only,
         rollback_timeout,
@@ -266,12 +351,36 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
         manual_refreshes: manual_refresh_tx,
         rollbacks: rollback_tx,
         events: event_rx,
+        refresh_priority,
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::domain::ZoneName;
+
     use super::*;
+
+    #[test]
+    fn refresh_priority_source_keeps_only_the_latest_value() {
+        let (publisher, source) = refresh_priority_channel();
+        let public = ZoneName::parse("public").unwrap();
+        let work = ZoneName::parse("work").unwrap();
+
+        publisher.publish(RefreshPriority {
+            zone: Some(public),
+            service: None,
+            policy: None,
+        });
+        publisher.publish(RefreshPriority {
+            zone: Some(work.clone()),
+            service: None,
+            policy: None,
+        });
+
+        assert_eq!(source.latest().zone, Some(work));
+    }
 
     #[test]
     fn refresh_schedule_observation_preserves_identity_trigger_and_counts() {

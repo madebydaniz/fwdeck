@@ -655,7 +655,17 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }
         }
         UiAction::RefreshStarted { id, .. } => {
+            let selected = selected_row_id(state);
             state.active_refresh = Some(id);
+            state.refresh_overview = None;
+            reconcile_selection(state, selected);
+        }
+        UiAction::RefreshOverviewReady { id, overview } => {
+            if state.active_refresh == Some(id) {
+                let selected = selected_row_id(state);
+                state.refresh_overview = Some(super::state::RefreshOverviewState { id, overview });
+                reconcile_selection(state, selected);
+            }
         }
         UiAction::RefreshCompleted {
             schedule,
@@ -667,6 +677,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }
             let selected = selected_row_id(state);
             state.active_refresh = None;
+            state.refresh_overview = None;
             state.last_refresh = Some(observation);
             match result {
                 Ok(snapshot) => {
@@ -705,16 +716,19 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                         state.session_baseline = Some(std::sync::Arc::clone(&snapshot));
                     }
                     state.snapshot = Some(snapshot);
-                    reconcile_selection(state, selected);
                 }
                 // Keep the stale snapshot: outdated data plus a visible error
                 // beats an empty screen.
                 Err(error) => state.backend_error = Some(error),
             }
+            reconcile_selection(state, selected);
         }
         UiAction::RefreshCancelled { schedule, .. } => {
             if state.active_refresh == Some(schedule.id) {
+                let selected = selected_row_id(state);
                 state.active_refresh = None;
+                state.refresh_overview = None;
+                reconcile_selection(state, selected);
             }
         }
         UiAction::EngineOutboxChanged {
@@ -739,6 +753,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         ),
         UiAction::EngineStopped(error) => {
             state.active_refresh = None;
+            state.refresh_overview = None;
             state.backend_error = Some(error);
         }
     }
@@ -1393,6 +1408,23 @@ mod tests {
         state
     }
 
+    fn refresh_overview() -> crate::application::RefreshOverview {
+        let snapshot = mock::sample().unwrap();
+        crate::application::RefreshOverview {
+            status: snapshot.status,
+            default_zone: snapshot.default_zone,
+            active: snapshot.active,
+            runtime: snapshot.runtime,
+            permanent: snapshot.permanent,
+            available_services: snapshot.available_services,
+            policy_names: crate::domain::Scoped {
+                runtime: snapshot.policies.runtime.into_keys().collect(),
+                permanent: snapshot.policies.permanent.into_keys().collect(),
+            },
+            degraded: snapshot.degraded,
+        }
+    }
+
     fn refresh_schedule_for(
         id: crate::application::RefreshId,
         trigger: crate::application::RefreshTrigger,
@@ -1795,6 +1827,395 @@ mod tests {
     }
 
     #[test]
+    fn matching_refresh_overview_becomes_visible() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(9);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert_eq!(
+            state.refresh_overview.as_ref().map(|preview| preview.id),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn stale_refresh_overview_is_ignored() {
+        let mut state = state();
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: crate::application::RefreshId::new(9),
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id: crate::application::RefreshId::new(8),
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert!(state.refresh_overview.is_none());
+    }
+
+    #[test]
+    fn authoritative_snapshot_remains_the_mutation_precondition_during_preview() {
+        let mut state = state();
+        let authoritative = std::sync::Arc::clone(state.snapshot.as_ref().unwrap());
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert!(update(&mut state, UiAction::ToggleMasqueradeRequested).is_empty());
+        let effects = update(&mut state, UiAction::ConfirmAccept);
+
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::Apply(request) if std::sync::Arc::ptr_eq(&request.expected, &authoritative))
+        }));
+    }
+
+    #[test]
+    fn newer_refresh_start_clears_the_previous_preview() {
+        let mut state = state();
+        let first = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: first,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id: first,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: crate::application::RefreshId::new(4),
+                trigger: crate::application::RefreshTrigger::Manual,
+            },
+        );
+
+        assert!(state.refresh_overview.is_none());
+    }
+
+    #[test]
+    fn matching_refresh_cancellation_clears_the_preview() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshCancelled {
+                schedule: refresh_schedule_for(id, crate::application::RefreshTrigger::Periodic),
+                reason: crate::application::RefreshCancellationReason::MutationPreempted,
+                elapsed: std::time::Duration::from_millis(10),
+            },
+        );
+
+        assert!(state.refresh_overview.is_none());
+    }
+
+    #[test]
+    fn matching_refresh_completion_clears_the_preview() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(id, crate::application::RefreshTrigger::Periodic),
+                result: Ok(std::sync::Arc::new(mock::sample().unwrap())),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::from_millis(20),
+                ),
+            },
+        );
+
+        assert!(state.refresh_overview.is_none());
+    }
+
+    #[test]
+    fn stale_refresh_completion_keeps_the_newer_preview() {
+        let mut state = state();
+        let stale_id = crate::application::RefreshId::new(3);
+        let current = crate::application::RefreshId::new(4);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: current,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id: current,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(
+                    stale_id,
+                    crate::application::RefreshTrigger::Manual,
+                ),
+                result: Ok(std::sync::Arc::new(mock::sample().unwrap())),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::from_millis(20),
+                ),
+            },
+        );
+
+        assert_eq!(
+            state.refresh_overview.as_ref().map(|preview| preview.id),
+            Some(current)
+        );
+    }
+
+    #[test]
+    fn preview_zone_rows_are_visible_before_the_first_full_snapshot() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Initial,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert!(!state.all_rows(ViewId::Zones).is_empty());
+    }
+
+    #[test]
+    fn startup_preview_does_not_enable_mutation_without_an_authoritative_snapshot() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Initial,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert!(update(&mut state, UiAction::ToggleMasqueradeRequested).is_empty());
+        assert!(!matches!(state.overlays.last(), Some(Overlay::Confirm(_))));
+    }
+
+    #[test]
+    fn preview_only_cross_zone_row_activation_reports_loading_details() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(3);
+        let work = ZoneName::parse("work").unwrap();
+        let port = "42424/tcp".parse().unwrap();
+        let mut overview = refresh_overview();
+        overview.default_zone = work.clone();
+        overview.runtime.get_mut(&work).unwrap().ports.push(port);
+        state.view = ViewId::Ports;
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+        state.view_state_mut().selected = state
+            .visible_rows()
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.id,
+                    RowId::Port { zone, port: row_port }
+                        if zone == &work && row_port == &port
+                )
+            })
+            .unwrap();
+
+        update(&mut state, UiAction::ActivateRow);
+
+        assert!(!matches!(state.overlays.last(), Some(Overlay::Details(_))));
+        assert!(
+            state
+                .toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("loading details"))
+        );
+    }
+
+    #[test]
+    fn preview_port_rows_replace_the_stale_authoritative_rows() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(3);
+        let mut overview = refresh_overview();
+        let public = ZoneName::parse("public").unwrap();
+        overview
+            .runtime
+            .get_mut(&public)
+            .unwrap()
+            .ports
+            .push("42424/tcp".parse().unwrap());
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+
+        let rows = state.all_rows(ViewId::Ports);
+        assert!(rows.iter().any(|row| {
+            matches!(&row.id, RowId::Port { port, .. } if port.to_string() == "42424/tcp")
+        }));
+    }
+
+    #[test]
+    fn service_rows_keep_authoritative_definition_details_during_preview() {
+        let mut state = state();
+        let authoritative = state.all_rows(ViewId::Services);
+        let id = crate::application::RefreshId::new(3);
+        let mut overview = refresh_overview();
+        overview.default_zone = ZoneName::parse("work").unwrap();
+        overview
+            .runtime
+            .get_mut(&ZoneName::parse("public").unwrap())
+            .unwrap()
+            .services
+            .clear();
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+
+        assert_eq!(state.all_rows(ViewId::Services), authoritative);
+    }
+
+    #[test]
+    fn unsupported_ipset_rows_keep_the_authoritative_snapshot_during_preview() {
+        let mut state = state();
+        let authoritative = state.all_rows(ViewId::IpSets);
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert_eq!(state.all_rows(ViewId::IpSets), authoritative);
+    }
+
+    #[test]
     fn stale_refresh_completion_cannot_replace_newer_lifecycle() {
         use crate::application::{FirewallError, RefreshId, RefreshTrigger};
         use crate::domain::RefreshObservation;
@@ -1870,6 +2291,74 @@ mod tests {
     }
 
     #[test]
+    fn refresh_error_reconciles_reordered_preview_selection_marks_and_priority() {
+        use crate::application::ports::FirewallError;
+
+        let mut state = state();
+        state.view = ViewId::Zones;
+        let id = crate::application::RefreshId::new(3);
+        let public = ZoneName::parse("public").unwrap();
+        let preview_only = ZoneName::parse("aaa-preview").unwrap();
+        let public_row = RowId::Zone(public.clone());
+        let preview_only_row = RowId::Zone(preview_only.clone());
+        let mut overview = refresh_overview();
+        overview.runtime.insert(
+            preview_only.clone(),
+            crate::domain::ZoneDetails::empty(preview_only.clone()),
+        );
+        overview.permanent.insert(
+            preview_only.clone(),
+            crate::domain::ZoneDetails::empty(preview_only),
+        );
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+        state.view_state_mut().selected = state
+            .visible_rows()
+            .iter()
+            .position(|row| row.id == public_row)
+            .unwrap();
+        state
+            .view_state_mut()
+            .marked
+            .extend([public_row.clone(), preview_only_row.clone()]);
+
+        update(
+            &mut state,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(id, crate::application::RefreshTrigger::Periodic),
+                result: Err(FirewallError::DaemonNotRunning),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::ZERO,
+                ),
+            },
+        );
+
+        assert_eq!(selected_row_id(&state), Some(public_row.clone()));
+        assert_eq!(
+            state
+                .view_state()
+                .marked
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![public_row]
+        );
+        assert_eq!(state.refresh_priority().zone, Some(public));
+    }
+
+    #[test]
     fn matching_cancellation_clears_spinner_without_error_or_snapshot_loss() {
         use crate::application::{
             FirewallError, RefreshCancellationReason, RefreshId, RefreshScheduleObservation,
@@ -1889,6 +2378,13 @@ mod tests {
             UiAction::RefreshStarted {
                 id: RefreshId::new(9),
                 trigger: RefreshTrigger::Manual,
+            },
+        );
+        update(
+            &mut s,
+            UiAction::RefreshOverviewReady {
+                id: RefreshId::new(9),
+                overview: std::sync::Arc::new(refresh_overview()),
             },
         );
         assert_eq!(s.active_refresh, Some(RefreshId::new(9)));
@@ -1990,6 +2486,13 @@ mod tests {
                 trigger: RefreshTrigger::Manual,
             },
         );
+        update(
+            &mut s,
+            UiAction::RefreshOverviewReady {
+                id: RefreshId::new(9),
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
 
         update(
             &mut s,
@@ -2006,6 +2509,10 @@ mod tests {
         );
 
         assert_eq!(s.active_refresh, Some(RefreshId::new(9)));
+        assert_eq!(
+            s.refresh_overview.as_ref().map(|preview| preview.id),
+            Some(RefreshId::new(9))
+        );
     }
 
     #[test]
