@@ -85,6 +85,7 @@ struct StagedFixtureControl {
     background_detail_started: AtomicBool,
     background_detail_waiting: Notify,
     release_background_detail: Semaphore,
+    seen: Mutex<Vec<Vec<String>>>,
 }
 
 impl StagedFixtureControl {
@@ -105,6 +106,20 @@ impl StagedFixtureControl {
     fn release_background_detail(&self) {
         self.release_background_detail.add_permits(1);
     }
+
+    fn detail_commands(&self) -> Vec<Vec<String>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|args| {
+                args.iter().any(|arg| {
+                    arg.starts_with("--info-service=") || arg.starts_with("--info-policy=")
+                })
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 fn staged_backend_fixture() -> (CliBackend<StagedFixtureRunner>, Arc<StagedFixtureControl>) {
@@ -112,6 +127,7 @@ fn staged_backend_fixture() -> (CliBackend<StagedFixtureRunner>, Arc<StagedFixtu
         background_detail_started: AtomicBool::new(false),
         background_detail_waiting: Notify::new(),
         release_background_detail: Semaphore::new(0),
+        seen: Mutex::new(Vec::new()),
     });
     (
         CliBackend::new(StagedFixtureRunner {
@@ -132,6 +148,7 @@ impl CommandRunner for StagedFixtureRunner {
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, ProcessError> {
         assert_eq!(request.program, "firewall-cmd");
         assert_eq!(request.timeout, DEFAULT_TIMEOUT);
+        self.control.seen.lock().unwrap().push(request.args.clone());
         let stdout = match request.args.as_slice() {
             [state] if state == "--state" => "running\n".to_owned(),
             [version] if version == "--version" => "2.3.2\n".to_owned(),
@@ -205,6 +222,10 @@ async fn staged_cli_read_returns_zone_overview_before_background_details() {
             .contains_key(&ZoneName::parse("public").unwrap())
     );
     assert!(!control.background_detail_started());
+    assert!(
+        control.detail_commands().is_empty(),
+        "overview must not request policy or service details"
+    );
 
     let hydration = backend.snapshot_hydrated(Some(overview), &priority);
     tokio::pin!(hydration);
