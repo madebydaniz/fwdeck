@@ -356,6 +356,7 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use crate::domain::ZoneName;
 

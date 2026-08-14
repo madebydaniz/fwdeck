@@ -229,7 +229,17 @@ pub fn render_breadcrumb(f: &mut Frame, area: Rect, state: &UiState, theme: &The
     if state.active_refresh.is_some() {
         spans.push(Span::styled("  ⟳ refreshing", theme.info()));
     }
+    if let Some(label) = refresh_activity_label(state) {
+        spans.push(Span::styled(format!(" · {label}"), theme.info()));
+    }
     f.render_widget(Paragraph::new(Line::from(spans)).style(theme.panel()), area);
+}
+
+fn refresh_activity_label(state: &UiState) -> Option<&'static str> {
+    state
+        .matching_refresh_overview()
+        .is_some()
+        .then_some("loading details")
 }
 
 /// Sidebar listing every view with its hotkey and row count.
@@ -313,7 +323,7 @@ pub fn render_table(f: &mut Frame, area: Rect, state: &mut UiState, theme: &Them
         block = block.title_bottom(Span::styled(format!(" {hint} "), theme.muted()));
     }
 
-    if state.snapshot.is_none() && view != ViewId::Logs {
+    if state.snapshot.is_none() && view != ViewId::Logs && !state.matching_overview_supports(view) {
         let (message, style) = state.backend_error.as_ref().map_or_else(
             || {
                 (
@@ -575,5 +585,113 @@ pub fn render_toasts(f: &mut Frame, screen: Rect, state: &UiState, theme: &Theme
             Paragraph::new(Line::from(Span::styled(text, style))).style(theme.panel()),
             area,
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    use crate::application::{RefreshId, RefreshOverview};
+    use crate::config::Config;
+    use crate::domain::{Scoped, mock};
+    use crate::ui::state::{RefreshOverviewState, UiState};
+    use crate::ui::theme::{Theme, Variant};
+    use crate::ui::views::ViewId;
+
+    use super::{refresh_activity_label, render_table};
+
+    fn overview() -> Arc<RefreshOverview> {
+        let snapshot = mock::sample().unwrap();
+        Arc::new(RefreshOverview {
+            status: snapshot.status,
+            default_zone: snapshot.default_zone,
+            active: snapshot.active,
+            runtime: snapshot.runtime,
+            permanent: snapshot.permanent,
+            available_services: snapshot.available_services,
+            policy_names: Scoped {
+                runtime: snapshot.policies.runtime.into_keys().collect(),
+                permanent: snapshot.policies.permanent.into_keys().collect(),
+            },
+            degraded: snapshot.degraded,
+        })
+    }
+
+    fn render_table_text(state: &mut UiState) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let theme = Theme::new(Variant::Dracula, true, true);
+        terminal
+            .draw(|frame| render_table(frame, Rect::new(0, 0, 120, 30), state, &theme))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn matching_preview_reports_that_details_are_loading() {
+        let mut state = UiState::new(&Config::default(), "test".to_owned(), false, None);
+        let id = RefreshId::new(7);
+        state.active_refresh = Some(id);
+        state.refresh_overview = Some(RefreshOverviewState {
+            id,
+            overview: overview(),
+        });
+
+        assert_eq!(refresh_activity_label(&state), Some("loading details"));
+    }
+
+    #[test]
+    fn stale_preview_does_not_report_that_details_are_loading() {
+        let mut state = UiState::new(&Config::default(), "test".to_owned(), false, None);
+        state.active_refresh = Some(RefreshId::new(8));
+        state.refresh_overview = Some(RefreshOverviewState {
+            id: RefreshId::new(7),
+            overview: overview(),
+        });
+
+        assert_eq!(refresh_activity_label(&state), None);
+    }
+
+    #[test]
+    fn startup_zone_preview_renders_before_full_hydration() {
+        let mut state = UiState::new(&Config::default(), "test".to_owned(), false, None);
+        let id = RefreshId::new(7);
+        state.active_refresh = Some(id);
+        state.refresh_overview = Some(RefreshOverviewState {
+            id,
+            overview: overview(),
+        });
+
+        let content = render_table_text(&mut state);
+
+        assert!(content.contains("public"));
+        assert!(!content.contains("loading firewall state"));
+    }
+
+    #[test]
+    fn startup_service_view_waits_for_hydrated_definitions() {
+        let mut state = UiState::new(&Config::default(), "test".to_owned(), false, None);
+        let id = RefreshId::new(7);
+        state.active_refresh = Some(id);
+        state.refresh_overview = Some(RefreshOverviewState {
+            id,
+            overview: overview(),
+        });
+        state.view = ViewId::Services;
+
+        let content = render_table_text(&mut state);
+
+        assert!(content.contains("loading firewall state"));
     }
 }

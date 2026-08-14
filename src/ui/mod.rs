@@ -28,7 +28,7 @@ use futures_util::{Stream, StreamExt};
 
 use tokio::sync::mpsc;
 
-use crate::application::api::{EngineEvent, EngineHandle, RollbackRequest};
+use crate::application::api::{EngineEvent, EngineHandle, RefreshPriority, RollbackRequest};
 use crate::application::ports::FirewallError;
 use crate::config::Config;
 use crate::error::AppError;
@@ -91,6 +91,8 @@ async fn event_loop(
     let mut logs_alive = true;
     let mut log_batch: Vec<LogEntry> = Vec::new();
     let mut outbox = EngineOutbox::new();
+    let mut published_priority = RefreshPriority::default();
+    publish_refresh_priority(&engine, &state, &mut published_priority);
 
     loop {
         terminal.draw(|f| render::render(f, &mut state, &theme))?;
@@ -111,15 +113,15 @@ async fn event_loop(
         .await?;
 
         let Some(action) = action else { continue };
-        if process_action_worklist(
+        let control = process_action_worklist(
             &mut state,
             &mut outbox,
             std::collections::VecDeque::from([action]),
             config.retention,
         )
-        .await
-        .is_break()
-        {
+        .await;
+        publish_refresh_priority(&engine, &state, &mut published_priority);
+        if control.is_break() {
             // A clean quit must not abandon armed rollbacks: fire the inverses
             // and wait (bounded) for the engine to run them. Crash/SIGKILL/
             // connection-loss is covered by the out-of-process watchdog.
@@ -168,7 +170,7 @@ where
         },
         event = engine.events.recv(), if *engine_alive => if let Some(event) = event {
             observe_engine_event(outbox, &event);
-            engine_event_action(event)
+            Some(engine_event_action(event))
         } else {
             *engine_alive = false;
             Some(UiAction::EngineStopped(
@@ -207,37 +209,48 @@ fn observe_engine_event(outbox: &mut EngineOutbox, event: &EngineEvent) {
 }
 
 /// Maps an engine event to the UI action that handles it.
-fn engine_event_action(event: EngineEvent) -> Option<UiAction> {
+fn engine_event_action(event: EngineEvent) -> UiAction {
     match event {
-        EngineEvent::RefreshStarted { id, trigger } => {
-            Some(UiAction::RefreshStarted { id, trigger })
+        EngineEvent::RefreshStarted { id, trigger } => UiAction::RefreshStarted { id, trigger },
+        EngineEvent::RefreshOverviewReady { id, overview } => {
+            UiAction::RefreshOverviewReady { id, overview }
         }
-        EngineEvent::RefreshOverviewReady { .. } => None,
         EngineEvent::RefreshFinished {
             schedule,
             result,
             observation,
-        } => Some(UiAction::RefreshCompleted {
+        } => UiAction::RefreshCompleted {
             schedule,
             result,
             observation,
-        }),
+        },
         EngineEvent::RefreshCancelled {
             schedule,
             reason,
             elapsed,
-        } => Some(UiAction::RefreshCancelled {
+        } => UiAction::RefreshCancelled {
             schedule,
             reason,
             elapsed,
-        }),
-        EngineEvent::ManualDemandRejected { count } => {
-            Some(UiAction::ManualDemandRejected { count })
-        }
-        EngineEvent::OperationFinished(result) => Some(UiAction::OperationFinished(result)),
+        },
+        EngineEvent::ManualDemandRejected { count } => UiAction::ManualDemandRejected { count },
+        EngineEvent::OperationFinished(result) => UiAction::OperationFinished(result),
         EngineEvent::PlanFinished { applied, remaining } => {
-            Some(UiAction::PlanFinished { applied, remaining })
+            UiAction::PlanFinished { applied, remaining }
         }
+    }
+}
+
+/// Publishes only a changed latest-value hint; this never touches the engine outbox.
+fn publish_refresh_priority(
+    engine: &EngineHandle,
+    state: &UiState,
+    published: &mut RefreshPriority,
+) {
+    let next = state.refresh_priority();
+    if next != *published {
+        engine.refresh_priority.publish(next.clone());
+        *published = next;
     }
 }
 
@@ -597,10 +610,7 @@ fn absorb_shutdown_engine_event(
     event: EngineEvent,
     deferred: &mut std::collections::VecDeque<RollbackRequest>,
 ) {
-    let Some(action) = engine_event_action(event) else {
-        return;
-    };
-    for effect in update::update(state, action) {
+    for effect in update::update(state, engine_event_action(event)) {
         match outbox::enqueue_engine_effect(outbox, effect) {
             Ok(EngineEffectDisposition::Queued | EngineEffectDisposition::NotEngineBound(_)) => {}
             Err(OutboxEnqueueError::Rollback(outbox::RollbackEnqueueError::Full(request))) => {
@@ -714,7 +724,7 @@ mod tests {
 
     use super::{
         TICK_INTERVAL, base64_encode, drain_rollbacks_on_exit, engine_event_action,
-        next_event_loop_action, process_action_worklist,
+        next_event_loop_action, process_action_worklist, publish_refresh_priority,
     };
 
     struct TestRollbackGuard;
@@ -936,12 +946,12 @@ mod tests {
         let count = NonZeroU64::new(7).unwrap();
         assert_eq!(
             engine_event_action(EngineEvent::ManualDemandRejected { count }),
-            Some(UiAction::ManualDemandRejected { count })
+            UiAction::ManualDemandRejected { count }
         );
     }
 
     #[test]
-    fn overview_event_is_ignored_without_blocking_the_following_engine_event() {
+    fn overview_event_maps_without_blocking_the_following_engine_event() {
         let snapshot = mock::sample().unwrap();
         let overview = crate::application::RefreshOverview {
             status: snapshot.status,
@@ -958,16 +968,88 @@ mod tests {
         };
         let count = NonZeroU64::new(7).unwrap();
 
+        let overview = Arc::new(overview);
         assert_eq!(
             engine_event_action(EngineEvent::RefreshOverviewReady {
                 id: RefreshId::new(1),
-                overview: Arc::new(overview),
+                overview: Arc::clone(&overview),
             }),
-            None
+            UiAction::RefreshOverviewReady {
+                id: RefreshId::new(1),
+                overview,
+            }
         );
         assert_eq!(
             engine_event_action(EngineEvent::ManualDemandRejected { count }),
-            Some(UiAction::ManualDemandRejected { count })
+            UiAction::ManualDemandRejected { count }
+        );
+    }
+
+    #[test]
+    fn selection_updates_replace_the_engine_priority_without_queueing() {
+        let config = Config::default();
+        let mut state = UiState::new(&config, "test".to_owned(), false, None);
+        state.snapshot = Some(Arc::new(mock::sample().unwrap()));
+        state.view = crate::ui::views::ViewId::Services;
+        state.selected_zone = Some(ZoneName::parse("public").unwrap());
+        state.view_state_mut().selected = state
+            .visible_rows()
+            .iter()
+            .position(|row| matches!(&row.id, crate::ui::views::RowId::Service { service, .. } if service.as_str() == "http"))
+            .unwrap();
+        let (refresh_priority, source) = crate::application::refresh_priority_channel();
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (manual_tx, _manual_rx) = mpsc::channel(1);
+        let (rollback_tx, _rollback_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let engine = EngineHandle {
+            requests: request_tx,
+            manual_refreshes: manual_tx,
+            rollbacks: rollback_tx,
+            events: event_rx,
+            refresh_priority,
+        };
+        let mut published = crate::application::RefreshPriority::default();
+        let lane_capacities = (
+            engine.requests.capacity(),
+            engine.manual_refreshes.capacity(),
+            engine.rollbacks.capacity(),
+        );
+
+        publish_refresh_priority(&engine, &state, &mut published);
+        assert_eq!(
+            source
+                .latest()
+                .service
+                .as_ref()
+                .map(crate::domain::ServiceName::as_str),
+            Some("http")
+        );
+        assert_eq!(
+            source.latest().zone,
+            Some(ZoneName::parse("public").unwrap())
+        );
+        state.view = crate::ui::views::ViewId::Policies;
+        state.selected_zone = Some(ZoneName::parse("work").unwrap());
+        publish_refresh_priority(&engine, &state, &mut published);
+
+        assert_eq!(source.latest(), state.refresh_priority());
+        assert_eq!(source.latest().zone, Some(ZoneName::parse("work").unwrap()));
+        assert_eq!(
+            source
+                .latest()
+                .policy
+                .as_ref()
+                .map(crate::domain::PolicyName::as_str),
+            Some("mypolicy")
+        );
+        assert_eq!(
+            (
+                engine.requests.capacity(),
+                engine.manual_refreshes.capacity(),
+                engine.rollbacks.capacity(),
+            ),
+            lane_capacities
         );
     }
 

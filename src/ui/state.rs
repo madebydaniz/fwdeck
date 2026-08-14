@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ratatui::widgets::TableState;
 
 use crate::application::ports::FirewallError;
+use crate::application::{RefreshId, RefreshOverview, RefreshPriority};
 use crate::config::Config;
 use crate::domain::LogEntry;
 use crate::domain::{
@@ -118,6 +119,15 @@ pub struct Toast {
     pub expires_at_tick: u64,
 }
 
+/// Preview owned by one exact in-flight refresh lifecycle.
+#[derive(Debug, Clone)]
+pub struct RefreshOverviewState {
+    /// Identity used to reject stale overview and completion events.
+    pub id: RefreshId,
+    /// Preview-only overview; never used as a mutation precondition.
+    pub overview: Arc<RefreshOverview>,
+}
+
 /// The whole UI state tree: current view, data snapshot, overlays, and
 /// operator-facing toggles.
 // Independent operator-facing toggles mirrored from config; a state machine
@@ -144,7 +154,9 @@ pub struct UiState {
     /// "session diff" compares the current state against.
     pub session_baseline: Option<Arc<FirewallSnapshot>>,
     /// Exact refresh lifecycle currently in flight, if any.
-    pub active_refresh: Option<crate::application::RefreshId>,
+    pub active_refresh: Option<RefreshId>,
+    /// Matching low-latency overview shown while full hydration continues.
+    pub refresh_overview: Option<RefreshOverviewState>,
     /// Last backend failure; cleared by the next successful refresh.
     pub backend_error: Option<FirewallError>,
     /// Denied packets seen this session (from the log tailer).
@@ -243,6 +255,7 @@ impl UiState {
             snapshot: None,
             session_baseline: None,
             active_refresh: None,
+            refresh_overview: None,
             backend_error: None,
             denied_session: 0,
             log_buffer: std::collections::VecDeque::new(),
@@ -297,6 +310,66 @@ impl UiState {
             .or_else(|| self.snapshot.as_ref().map(|s| s.default_zone.clone()))
     }
 
+    /// Matching preview for the active lifecycle, if one has arrived.
+    #[must_use]
+    pub fn matching_refresh_overview(&self) -> Option<&RefreshOverview> {
+        self.refresh_overview
+            .as_ref()
+            .filter(|preview| Some(preview.id) == self.active_refresh)
+            .map(|preview| preview.overview.as_ref())
+    }
+
+    /// Whether the active preview can render this view without inventing details.
+    #[must_use]
+    pub fn matching_overview_supports(&self, view: ViewId) -> bool {
+        self.matching_refresh_overview().is_some() && views::overview_supports(view)
+    }
+
+    fn display_zone(&self) -> Option<ZoneName> {
+        self.selected_zone
+            .clone()
+            .or_else(|| {
+                self.matching_refresh_overview()
+                    .map(|overview| overview.default_zone.clone())
+            })
+            .or_else(|| {
+                self.snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.default_zone.clone())
+            })
+    }
+
+    /// Latest UI selection that staged hydration should fetch first.
+    #[must_use]
+    pub fn refresh_priority(&self) -> RefreshPriority {
+        let mut priority = RefreshPriority {
+            zone: self.display_zone(),
+            service: None,
+            policy: None,
+        };
+        let rows = self.visible_rows();
+        let Some(row) = rows.get(self.view_state().selected) else {
+            return priority;
+        };
+        match &row.id {
+            RowId::Zone(zone) => priority.zone = Some(zone.clone()),
+            RowId::Service { zone, service } => {
+                priority.zone = Some(zone.clone());
+                priority.service = Some(service.clone());
+            }
+            RowId::Policy { name } => priority.policy = Some(name.clone()),
+            RowId::Port { .. }
+            | RowId::Forwarding { .. }
+            | RowId::RichRule { .. }
+            | RowId::Interface { .. }
+            | RowId::Source { .. }
+            | RowId::IpSet { .. }
+            | RowId::Direct { .. }
+            | RowId::Log { .. } => {}
+        }
+        priority
+    }
+
     /// Unfiltered rows for a view.
     // rows are recomputed per keystroke/frame; snapshot scale (dozens of
     // zones) makes this free — add caching only if profiling ever disagrees.
@@ -327,6 +400,15 @@ impl UiState {
                     )
                 })
                 .collect();
+        }
+        if let Some(overview) = self.matching_refresh_overview() {
+            let zone = self
+                .selected_zone
+                .clone()
+                .unwrap_or_else(|| overview.default_zone.clone());
+            if let Some(rows) = views::overview_rows(view, overview, &zone, self.config_view) {
+                return rows;
+            }
         }
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();

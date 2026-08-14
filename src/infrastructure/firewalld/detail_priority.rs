@@ -97,6 +97,7 @@ const fn target_order(target: ConfigurationTarget) -> u8 {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::collections::BTreeMap;
 
