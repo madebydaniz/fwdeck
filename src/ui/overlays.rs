@@ -237,7 +237,6 @@ fn modal(f: &mut Frame, theme: &Theme, area: Rect, title: &str) -> Block<'static
 
 const TEXT_MODAL_PERCENT: u16 = 70;
 const TEXT_MODAL_MIN_WIDTH: u16 = 60;
-const TEXT_MODAL_MAX_WIDTH: u16 = 120;
 const MODAL_MARGIN: u16 = 2;
 const HELP_KEY_WIDTH: usize = 22;
 
@@ -246,7 +245,6 @@ fn text_modal_width(screen: Rect) -> u16 {
     let proportional = screen.width.saturating_mul(TEXT_MODAL_PERCENT) / 100;
     proportional
         .max(TEXT_MODAL_MIN_WIDTH.min(available))
-        .min(TEXT_MODAL_MAX_WIDTH)
         .min(available)
 }
 
@@ -819,7 +817,7 @@ mod tests {
     #[test]
     fn text_modal_width_is_seventy_percent_with_safe_bounds() {
         assert_eq!(text_modal_width(Rect::new(0, 0, 100, 30)), 70);
-        assert_eq!(text_modal_width(Rect::new(0, 0, 200, 50)), 120);
+        assert_eq!(text_modal_width(Rect::new(0, 0, 200, 50)), 140);
         assert_eq!(text_modal_width(Rect::new(0, 0, 40, 20)), 38);
     }
 
