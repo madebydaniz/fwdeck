@@ -16,12 +16,12 @@ use crate::domain::FirewallSnapshot;
 
 use super::api::{
     EngineEvent, EngineRequest, ManualRefreshRequest, MutationPlan, MutationRequest,
-    OperationResult, REQUEST_CAPACITY, RefreshCancellationReason, RefreshScheduleObservation,
-    RefreshTrigger, RollbackRegistration, RollbackRequest,
+    OperationResult, REQUEST_CAPACITY, RefreshCancellationReason, RefreshId, RefreshPrioritySource,
+    RefreshScheduleObservation, RefreshTrigger, RollbackRegistration, RollbackRequest,
 };
 use super::ports::{
-    FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId, SnapshotRead,
-    StepReport,
+    FirewallBackend, FirewallError, OperationOutcome, OverviewRead, RollbackGuard, RollbackGuardId,
+    SnapshotRead, StepReport,
 };
 use super::refresh_scheduler::{
     ManualDemandOverflow, RefreshCancellation, RefreshCompletion, RefreshDemand, RefreshScheduler,
@@ -206,12 +206,13 @@ impl<'a> PeriodicDeadline<'a> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
     backend: B,
     rollback_guard: G,
     mut inputs: EngineReceivers,
     events: mpsc::Sender<EngineEvent>,
+    refresh_priority: RefreshPrioritySource,
     refresh_interval: Duration,
     read_only: bool,
     rollback_timeout: Duration,
@@ -248,6 +249,7 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
                 &backend,
                 &rollback_guard,
                 &events,
+                &refresh_priority,
                 &mut inputs,
                 &mut pending_requests,
                 &mut scheduler,
@@ -321,6 +323,7 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
             &backend,
             &mut inputs,
             &events,
+            &refresh_priority,
             &mut scheduler,
             &mut periodic_deadline,
             start,
@@ -393,6 +396,7 @@ async fn drive_ordinary_lifecycle<B: FirewallBackend>(
     backend: &B,
     inputs: &mut EngineReceivers,
     events: &mpsc::Sender<EngineEvent>,
+    refresh_priority: &RefreshPrioritySource,
     scheduler: &mut RefreshScheduler,
     periodic_deadline: &mut PeriodicDeadline<'_>,
     start: RefreshStart,
@@ -400,7 +404,17 @@ async fn drive_ordinary_lifecycle<B: FirewallBackend>(
     if send_refresh_started(events, start).await.is_err() {
         return OrdinaryLifecycleOutcome::Shutdown;
     }
-    match drive_ordinary_refresh(backend, inputs, events, scheduler, periodic_deadline).await {
+    match drive_ordinary_refresh(
+        backend,
+        inputs,
+        events,
+        refresh_priority,
+        scheduler,
+        periodic_deadline,
+        start.id,
+    )
+    .await
+    {
         OrdinaryRefreshOutcome::Completed(read) => {
             match finish_ordinary_refresh(events, scheduler, start, read).await {
                 Ok(trailing_manual) => OrdinaryLifecycleOutcome::Completed { trailing_manual },
@@ -430,11 +444,13 @@ async fn drive_ordinary_refresh<B: FirewallBackend>(
     backend: &B,
     inputs: &mut EngineReceivers,
     events: &mpsc::Sender<EngineEvent>,
+    refresh_priority: &RefreshPrioritySource,
     scheduler: &mut RefreshScheduler,
     periodic_deadline: &mut PeriodicDeadline<'_>,
+    id: RefreshId,
 ) -> OrdinaryRefreshOutcome {
     let started = Instant::now();
-    let snapshot = backend.snapshot_observed();
+    let snapshot = read_staged_snapshot(backend, refresh_priority, events, id);
     tokio::pin!(snapshot);
 
     loop {
@@ -492,23 +508,67 @@ async fn drive_ordinary_refresh<B: FirewallBackend>(
                 if periodic_deadline.observe_due(scheduler, "ordinary").is_err() {
                     return OrdinaryRefreshOutcome::Shutdown;
                 }
-                return OrdinaryRefreshOutcome::Completed(read);
+                return match read {
+                    Some(read) => OrdinaryRefreshOutcome::Completed(read),
+                    None => OrdinaryRefreshOutcome::Shutdown,
+                };
             }
         }
     }
 }
 
+async fn read_staged_snapshot<B: FirewallBackend>(
+    backend: &B,
+    refresh_priority: &RefreshPrioritySource,
+    events: &mpsc::Sender<EngineEvent>,
+    id: RefreshId,
+) -> Option<SnapshotRead> {
+    let OverviewRead {
+        result,
+        observation: overview_observation,
+    } = backend.snapshot_overview(refresh_priority).await;
+    let overview = match result {
+        Ok(overview) => overview,
+        Err(error) => {
+            return Some(SnapshotRead {
+                result: Err(error),
+                observation: overview_observation,
+            });
+        }
+    };
+
+    if let Some(value) = overview.as_ref()
+        && events
+            .send(EngineEvent::RefreshOverviewReady {
+                id,
+                overview: Arc::clone(value),
+            })
+            .await
+            .is_err()
+    {
+        return None;
+    }
+
+    let hydration = backend.snapshot_hydrated(overview, refresh_priority).await;
+    Some(SnapshotRead {
+        result: hydration.result,
+        observation: overview_observation.merge_sequential(hydration.observation),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn drive_mandatory_refresh<B: FirewallBackend>(
     backend: &B,
     inputs: &mut EngineReceivers,
     events: &mpsc::Sender<EngineEvent>,
+    refresh_priority: &RefreshPrioritySource,
     pending_requests: &mut VecDeque<EngineRequest>,
     scheduler: &mut RefreshScheduler,
     start: RefreshStart,
     periodic_deadline: &mut PeriodicDeadline<'_>,
 ) -> MandatoryRefreshOutcome {
     let started = Instant::now();
-    let snapshot = backend.snapshot_observed();
+    let snapshot = read_staged_snapshot(backend, refresh_priority, events, start.id);
     tokio::pin!(snapshot);
 
     loop {
@@ -523,6 +583,9 @@ async fn drive_mandatory_refresh<B: FirewallBackend>(
                 if periodic_deadline.observe_due(scheduler, "mandatory").is_err() {
                     return MandatoryRefreshOutcome::Shutdown;
                 }
+                let Some(read) = read else {
+                    return MandatoryRefreshOutcome::Shutdown;
+                };
                 if inputs.all_closed_and_empty() || events.is_closed() {
                     return MandatoryRefreshOutcome::Shutdown;
                 }
@@ -657,6 +720,7 @@ async fn reconcile_after_request<B: FirewallBackend, G: RollbackGuard>(
     backend: &B,
     rollback_guard: &G,
     events: &mpsc::Sender<EngineEvent>,
+    refresh_priority: &RefreshPrioritySource,
     inputs: &mut EngineReceivers,
     pending_requests: &mut VecDeque<EngineRequest>,
     scheduler: &mut RefreshScheduler,
@@ -673,6 +737,7 @@ async fn reconcile_after_request<B: FirewallBackend, G: RollbackGuard>(
             backend,
             inputs,
             events,
+            refresh_priority,
             pending_requests,
             scheduler,
             start,
@@ -1259,13 +1324,41 @@ async fn send_refresh_finished(
 mod tests {
     use super::*;
     use crate::application::ports::{
-        FirewallBackend, FirewallError, RollbackGuardError, RollbackGuardId, SnapshotRead,
+        FirewallBackend, FirewallError, OverviewRead, RollbackGuardError, RollbackGuardId,
+        SnapshotRead,
     };
-    use crate::application::{RefreshCancellationReason, RefreshTrigger};
-    use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus, mock};
+    use crate::application::{
+        RefreshCancellationReason, RefreshOverview, RefreshPrioritySource, RefreshTrigger,
+    };
+    use crate::domain::{
+        FirewallOperation, FirewallSnapshot, FirewallStatus, RefreshObservation, Scoped, mock,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::Semaphore;
+
+    async fn run<B: FirewallBackend, G: RollbackGuard>(
+        backend: B,
+        rollback_guard: G,
+        inputs: EngineReceivers,
+        events: mpsc::Sender<EngineEvent>,
+        refresh_interval: Duration,
+        read_only: bool,
+        rollback_timeout: Duration,
+    ) {
+        let (_publisher, refresh_priority) = crate::application::refresh_priority_channel();
+        super::run(
+            backend,
+            rollback_guard,
+            inputs,
+            events,
+            refresh_priority,
+            refresh_interval,
+            read_only,
+            rollback_timeout,
+        )
+        .await;
+    }
 
     #[derive(Default)]
     struct TestRollbackGuard;
@@ -1390,11 +1483,20 @@ mod tests {
 
     #[derive(Clone)]
     struct ControlledSnapshotBackend {
+        active_overviews: Arc<AtomicUsize>,
         active_snapshots: Arc<AtomicUsize>,
         max_active_snapshots: Arc<AtomicUsize>,
         snapshot_calls: Arc<AtomicUsize>,
         snapshot_started: Arc<Semaphore>,
         snapshot_release: Arc<Semaphore>,
+        overview_enabled: Arc<AtomicBool>,
+        overview_blocked: Arc<AtomicBool>,
+        overview_started: Arc<Semaphore>,
+        overview_release: Arc<Semaphore>,
+        overview_calls: Arc<AtomicUsize>,
+        overview_completions: Arc<AtomicUsize>,
+        hydration_starts: Arc<AtomicUsize>,
+        hydration_completions: Arc<AtomicUsize>,
         apply_observed_zero_active: Arc<AtomicBool>,
         active_snapshots_at_apply: Arc<Mutex<Vec<usize>>>,
         applied_operations: Arc<Mutex<Vec<FirewallOperation>>>,
@@ -1403,15 +1505,37 @@ mod tests {
     impl ControlledSnapshotBackend {
         fn new() -> Self {
             Self {
+                active_overviews: Arc::new(AtomicUsize::new(0)),
                 active_snapshots: Arc::new(AtomicUsize::new(0)),
                 max_active_snapshots: Arc::new(AtomicUsize::new(0)),
                 snapshot_calls: Arc::new(AtomicUsize::new(0)),
                 snapshot_started: Arc::new(Semaphore::new(0)),
                 snapshot_release: Arc::new(Semaphore::new(0)),
+                overview_enabled: Arc::new(AtomicBool::new(false)),
+                overview_blocked: Arc::new(AtomicBool::new(false)),
+                overview_started: Arc::new(Semaphore::new(0)),
+                overview_release: Arc::new(Semaphore::new(0)),
+                overview_calls: Arc::new(AtomicUsize::new(0)),
+                overview_completions: Arc::new(AtomicUsize::new(0)),
+                hydration_starts: Arc::new(AtomicUsize::new(0)),
+                hydration_completions: Arc::new(AtomicUsize::new(0)),
                 apply_observed_zero_active: Arc::new(AtomicBool::new(false)),
                 active_snapshots_at_apply: Arc::new(Mutex::new(Vec::new())),
                 applied_operations: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn enable_blocked_overview(&self) {
+            self.overview_enabled.store(true, Ordering::SeqCst);
+            self.overview_blocked.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_for_overview_start(&self) {
+            self.overview_started.acquire().await.unwrap().forget();
+        }
+
+        fn release_overview(&self) {
+            self.overview_release.add_permits(1);
         }
 
         async fn wait_for_snapshot_start(&self) {
@@ -1420,6 +1544,18 @@ mod tests {
 
         fn release_snapshot(&self) {
             self.snapshot_release.add_permits(1);
+        }
+
+        fn hydration_completions(&self) -> usize {
+            self.hydration_completions.load(Ordering::SeqCst)
+        }
+
+        fn hydration_starts(&self) -> usize {
+            self.hydration_starts.load(Ordering::SeqCst)
+        }
+
+        fn overview_completions(&self) -> usize {
+            self.overview_completions.load(Ordering::SeqCst)
         }
     }
 
@@ -1452,8 +1588,77 @@ mod tests {
             }
         }
 
+        fn snapshot_overview(
+            &self,
+            _priority: &RefreshPrioritySource,
+        ) -> impl std::future::Future<Output = OverviewRead> + Send {
+            let enabled = Arc::clone(&self.overview_enabled);
+            let blocked = Arc::clone(&self.overview_blocked);
+            let active = Arc::clone(&self.active_overviews);
+            let started = Arc::clone(&self.overview_started);
+            let release = Arc::clone(&self.overview_release);
+            let calls = Arc::clone(&self.overview_calls);
+            let completions = Arc::clone(&self.overview_completions);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if !enabled.load(Ordering::SeqCst) {
+                    return OverviewRead {
+                        result: Ok(None),
+                        observation: RefreshObservation::total_only(Duration::ZERO),
+                    };
+                }
+
+                active.fetch_add(1, Ordering::SeqCst);
+                let _guard = ActiveSnapshotGuard { active };
+                started.add_permits(1);
+                if blocked.load(Ordering::SeqCst) {
+                    release.acquire().await.unwrap().forget();
+                }
+                let result = mock::sample()
+                    .map_err(|error| FirewallError::Parse(error.to_string()))
+                    .map(|snapshot| {
+                        Arc::new(RefreshOverview {
+                            status: snapshot.status,
+                            default_zone: snapshot.default_zone,
+                            active: snapshot.active,
+                            runtime: snapshot.runtime,
+                            permanent: snapshot.permanent,
+                            available_services: snapshot.available_services,
+                            policy_names: Scoped {
+                                runtime: snapshot.policies.runtime.into_keys().collect(),
+                                permanent: snapshot.policies.permanent.into_keys().collect(),
+                            },
+                            degraded: snapshot.degraded,
+                        })
+                    })
+                    .map(Some);
+                completions.fetch_add(1, Ordering::SeqCst);
+                OverviewRead {
+                    result,
+                    observation: RefreshObservation::total_only(Duration::ZERO),
+                }
+            }
+        }
+
+        fn snapshot_hydrated(
+            &self,
+            _overview: Option<Arc<RefreshOverview>>,
+            _priority: &RefreshPrioritySource,
+        ) -> impl std::future::Future<Output = SnapshotRead> + Send {
+            let hydration = self.snapshot_observed();
+            let starts = Arc::clone(&self.hydration_starts);
+            let completions = Arc::clone(&self.hydration_completions);
+            async move {
+                starts.fetch_add(1, Ordering::SeqCst);
+                let read = hydration.await;
+                completions.fetch_add(1, Ordering::SeqCst);
+                read
+            }
+        }
+
         async fn apply(&self, operation: &FirewallOperation) -> OperationOutcome {
-            let active_snapshots = self.active_snapshots.load(Ordering::SeqCst);
+            let active_snapshots = self.active_snapshots.load(Ordering::SeqCst)
+                + self.active_overviews.load(Ordering::SeqCst);
             self.apply_observed_zero_active
                 .store(active_snapshots == 0, Ordering::SeqCst);
             self.active_snapshots_at_apply
@@ -2304,6 +2509,227 @@ mod tests {
     async fn drain_initial_refresh(rx: &mut mpsc::Receiver<EngineEvent>) {
         rx.recv().await.unwrap(); // RefreshStarted
         rx.recv().await.unwrap(); // RefreshFinished
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overview_event_arrives_before_hydration_finishes() {
+        let (_request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        backend.enable_blocked_overview();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            test_receivers(request_rx),
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        let refresh_id = match event_rx.recv().await.unwrap() {
+            EngineEvent::RefreshStarted {
+                id,
+                trigger: RefreshTrigger::Initial,
+            } => id,
+            other => panic!("expected initial refresh start, got {other:?}"),
+        };
+        backend.wait_for_overview_start().await;
+        assert_eq!(backend.overview_completions(), 0);
+
+        backend.release_overview();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshOverviewReady { id, .. } if id == refresh_id && id.get() == 1
+        ));
+        assert_eq!(backend.hydration_completions(), 0);
+        assert_eq!(backend.hydration_starts(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mutation_cancels_overview_before_apply() {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        backend.enable_blocked_overview();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            test_receivers(request_rx),
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_overview_start().await;
+        request_tx
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled {
+                reason: RefreshCancellationReason::MutationPreempted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(_)
+        ));
+        assert_eq!(backend.overview_completions(), 0);
+        assert_eq!(backend.active_snapshots_at_apply.lock().unwrap()[0], 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mutation_cancels_hydration_before_apply() {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let backend = ControlledSnapshotBackend::new();
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            test_receivers(request_rx),
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        assert_eq!(backend.hydration_starts(), 1);
+        request_tx
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled {
+                reason: RefreshCancellationReason::MutationPreempted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(_)
+        ));
+        assert_eq!(backend.hydration_completions(), 0);
+        assert_eq!(backend.active_snapshots_at_apply.lock().unwrap()[0], 0);
+        assert_eq!(backend.applied_operations.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rollback_preempts_mandatory_hydration_and_restarts_it() {
+        let (request_tx, request_rx) = mpsc::channel(REQUEST_CAPACITY);
+        let (inputs, _manual_tx, rollback_tx) = test_receiver_lanes(request_rx);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let backend = ControlledSnapshotBackend::new();
+        let rollback = FirewallOperation::SetPanicMode { enabled: true };
+        let rollback_id = RollbackGuardId::new(915);
+        tokio::spawn(run(
+            backend.clone(),
+            TestRollbackGuard,
+            inputs,
+            event_tx,
+            Duration::from_secs(3600),
+            false,
+            Duration::from_secs(30),
+        ));
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::Initial,
+                ..
+            }
+        ));
+        backend.wait_for_snapshot_start().await;
+        request_tx
+            .send(EngineRequest::Apply(reviewed(FirewallOperation::Reload)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled { .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(_)
+        ));
+
+        let mut post_mutation_starts = 0;
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        post_mutation_starts += 1;
+        backend.wait_for_snapshot_start().await;
+        rollback_tx
+            .send(RollbackRequest {
+                id: rollback_id,
+                operation: rollback.clone(),
+                watchdog_unit: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshCancelled {
+                reason: RefreshCancellationReason::RollbackPreempted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::OperationFinished(result)
+                if result.completed_rollback == Some(rollback_id)
+                    && result.outcome.operation() == &rollback
+        ));
+        assert_eq!(backend.hydration_completions(), 0);
+        assert_eq!(backend.active_snapshots_at_apply.lock().unwrap()[1], 0);
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshStarted {
+                trigger: RefreshTrigger::PostMutation,
+                ..
+            }
+        ));
+        post_mutation_starts += 1;
+        backend.wait_for_snapshot_start().await;
+
+        assert_eq!(post_mutation_starts, 2);
+        assert_eq!(backend.hydration_starts(), 3);
+        assert_eq!(
+            backend
+                .applied_operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|operation| *operation == &rollback)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -259,6 +259,13 @@ pub enum EngineEvent {
         /// Demand that started this refresh.
         trigger: RefreshTrigger,
     },
+    /// A low-latency staged overview is ready while full hydration continues.
+    RefreshOverviewReady {
+        /// Identity of the lifecycle that owns this overview and its hydration.
+        id: RefreshId,
+        /// Authoritative overview captured for this lifecycle.
+        overview: Arc<RefreshOverview>,
+    },
     /// The snapshot pass ended. `Arc` because the UI keeps the previous
     /// snapshot alive while diffing against the new one.
     RefreshFinished {
@@ -310,6 +317,8 @@ pub struct EngineHandle {
     pub rollbacks: mpsc::Sender<RollbackRequest>,
     /// Bounded event channel out of the engine (capacity 64).
     pub events: mpsc::Receiver<EngineEvent>,
+    /// Latest-value staged refresh priority publisher owned by this engine.
+    pub refresh_priority: RefreshPriorityPublisher,
 }
 
 /// Spawns the engine task owning `backend`. Bounded channels: a slow UI applies
@@ -326,11 +335,13 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
     let (manual_refresh_tx, manual_refresh_rx) = mpsc::channel(MANUAL_REFRESH_CAPACITY);
     let (rollback_tx, rollback_rx) = mpsc::channel(ROLLBACK_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
+    let (refresh_priority, refresh_priority_source) = refresh_priority_channel();
     tokio::spawn(engine::run(
         backend,
         rollback_guard,
         engine::EngineReceivers::new(request_rx, manual_refresh_rx, rollback_rx),
         event_tx,
+        refresh_priority_source,
         refresh_interval,
         read_only,
         rollback_timeout,
@@ -340,6 +351,7 @@ pub fn spawn<B: FirewallBackend, G: RollbackGuard>(
         manual_refreshes: manual_refresh_tx,
         rollbacks: rollback_tx,
         events: event_rx,
+        refresh_priority,
     }
 }
 

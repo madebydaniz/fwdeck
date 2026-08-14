@@ -168,7 +168,7 @@ where
         },
         event = engine.events.recv(), if *engine_alive => if let Some(event) = event {
             observe_engine_event(outbox, &event);
-            Some(engine_event_action(event))
+            engine_event_action(event)
         } else {
             *engine_alive = false;
             Some(UiAction::EngineStopped(
@@ -207,31 +207,36 @@ fn observe_engine_event(outbox: &mut EngineOutbox, event: &EngineEvent) {
 }
 
 /// Maps an engine event to the UI action that handles it.
-fn engine_event_action(event: EngineEvent) -> UiAction {
+fn engine_event_action(event: EngineEvent) -> Option<UiAction> {
     match event {
-        EngineEvent::RefreshStarted { id, trigger } => UiAction::RefreshStarted { id, trigger },
+        EngineEvent::RefreshStarted { id, trigger } => {
+            Some(UiAction::RefreshStarted { id, trigger })
+        }
+        EngineEvent::RefreshOverviewReady { .. } => None,
         EngineEvent::RefreshFinished {
             schedule,
             result,
             observation,
-        } => UiAction::RefreshCompleted {
+        } => Some(UiAction::RefreshCompleted {
             schedule,
             result,
             observation,
-        },
+        }),
         EngineEvent::RefreshCancelled {
             schedule,
             reason,
             elapsed,
-        } => UiAction::RefreshCancelled {
+        } => Some(UiAction::RefreshCancelled {
             schedule,
             reason,
             elapsed,
-        },
-        EngineEvent::ManualDemandRejected { count } => UiAction::ManualDemandRejected { count },
-        EngineEvent::OperationFinished(result) => UiAction::OperationFinished(result),
+        }),
+        EngineEvent::ManualDemandRejected { count } => {
+            Some(UiAction::ManualDemandRejected { count })
+        }
+        EngineEvent::OperationFinished(result) => Some(UiAction::OperationFinished(result)),
         EngineEvent::PlanFinished { applied, remaining } => {
-            UiAction::PlanFinished { applied, remaining }
+            Some(UiAction::PlanFinished { applied, remaining })
         }
     }
 }
@@ -592,7 +597,10 @@ fn absorb_shutdown_engine_event(
     event: EngineEvent,
     deferred: &mut std::collections::VecDeque<RollbackRequest>,
 ) {
-    for effect in update::update(state, engine_event_action(event)) {
+    let Some(action) = engine_event_action(event) else {
+        return;
+    };
+    for effect in update::update(state, action) {
         match outbox::enqueue_engine_effect(outbox, effect) {
             Ok(EngineEffectDisposition::Queued | EngineEffectDisposition::NotEngineBound(_)) => {}
             Err(OutboxEnqueueError::Rollback(outbox::RollbackEnqueueError::Full(request))) => {
@@ -928,7 +936,38 @@ mod tests {
         let count = NonZeroU64::new(7).unwrap();
         assert_eq!(
             engine_event_action(EngineEvent::ManualDemandRejected { count }),
-            UiAction::ManualDemandRejected { count }
+            Some(UiAction::ManualDemandRejected { count })
+        );
+    }
+
+    #[test]
+    fn overview_event_is_ignored_without_blocking_the_following_engine_event() {
+        let snapshot = mock::sample().unwrap();
+        let overview = crate::application::RefreshOverview {
+            status: snapshot.status,
+            default_zone: snapshot.default_zone,
+            active: snapshot.active,
+            runtime: snapshot.runtime,
+            permanent: snapshot.permanent,
+            available_services: snapshot.available_services,
+            policy_names: crate::domain::Scoped {
+                runtime: snapshot.policies.runtime.into_keys().collect(),
+                permanent: snapshot.policies.permanent.into_keys().collect(),
+            },
+            degraded: snapshot.degraded,
+        };
+        let count = NonZeroU64::new(7).unwrap();
+
+        assert_eq!(
+            engine_event_action(EngineEvent::RefreshOverviewReady {
+                id: RefreshId::new(1),
+                overview: Arc::new(overview),
+            }),
+            None
+        );
+        assert_eq!(
+            engine_event_action(EngineEvent::ManualDemandRejected { count }),
+            Some(UiAction::ManualDemandRejected { count })
         );
     }
 
@@ -983,11 +1022,14 @@ mod tests {
         let (manual_tx, _manual_rx) = mpsc::channel(1);
         let (rollback_tx, _rollback_rx) = mpsc::channel(1);
         let (event_tx, event_rx) = mpsc::channel(2);
+        let (refresh_priority, _refresh_priority_source) =
+            crate::application::refresh_priority_channel();
         let mut engine = EngineHandle {
             requests: request_tx,
             manual_refreshes: manual_tx,
             rollbacks: rollback_tx,
             events: event_rx,
+            refresh_priority,
         };
 
         let waiting = numbered_port_operation(200);
@@ -1536,11 +1578,14 @@ mod tests {
         let (manual_tx, _manual_rx) = tokio::sync::mpsc::channel(1);
         let (rollback_tx, mut rollback_rx) = tokio::sync::mpsc::channel(1);
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
+        let (refresh_priority, _refresh_priority_source) =
+            crate::application::refresh_priority_channel();
         let mut engine = EngineHandle {
             requests: request_tx,
             manual_refreshes: manual_tx,
             rollbacks: rollback_tx,
             events: event_rx,
+            refresh_priority,
         };
         let mut outbox = EngineOutbox::new();
         let responder = tokio::spawn(async move {
