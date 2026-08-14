@@ -5,10 +5,12 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fwdeck::application::ports::{FirewallBackend, FirewallError, OperationOutcome};
+use fwdeck::application::refresh_priority_channel;
 use fwdeck::domain::{
     ConfigurationTarget, FirewallOperation, RefreshSection, ServiceName, SnapshotSection, ZoneName,
 };
@@ -16,6 +18,7 @@ use fwdeck::infrastructure::firewalld::CliBackend;
 use fwdeck::infrastructure::process::{
     CommandOutput, CommandRequest, CommandRunner, DEFAULT_TIMEOUT, ProcessError,
 };
+use tokio::sync::{Notify, Semaphore};
 
 const LIST_ALL_RUNTIME: &str = include_str!("fixtures/firewall_cmd/list_all_zones_runtime.txt");
 const LIST_ALL_PERMANENT: &str = include_str!("fixtures/firewall_cmd/list_all_zones_permanent.txt");
@@ -71,6 +74,167 @@ impl CommandRunner for FakeRunner {
             .pop_front()
             .expect("backend issued an unexpected extra command")
     }
+}
+
+#[derive(Clone)]
+struct StagedFixtureRunner {
+    control: Arc<StagedFixtureControl>,
+}
+
+struct StagedFixtureControl {
+    background_detail_started: AtomicBool,
+    background_detail_waiting: Notify,
+    release_background_detail: Semaphore,
+}
+
+impl StagedFixtureControl {
+    async fn wait_for_background_detail(&self) {
+        loop {
+            let notified = self.background_detail_waiting.notified();
+            if self.background_detail_started.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn background_detail_started(&self) -> bool {
+        self.background_detail_started.load(Ordering::SeqCst)
+    }
+
+    fn release_background_detail(&self) {
+        self.release_background_detail.add_permits(1);
+    }
+}
+
+fn staged_backend_fixture() -> (CliBackend<StagedFixtureRunner>, Arc<StagedFixtureControl>) {
+    let control = Arc::new(StagedFixtureControl {
+        background_detail_started: AtomicBool::new(false),
+        background_detail_waiting: Notify::new(),
+        release_background_detail: Semaphore::new(0),
+    });
+    (
+        CliBackend::new(StagedFixtureRunner {
+            control: Arc::clone(&control),
+        }),
+        control,
+    )
+}
+
+fn staged_fixture_zones(zones: &str) -> String {
+    zones.replace(
+        "services: cockpit dhcpv6-client ssh",
+        "services: background cockpit dhcpv6-client ssh",
+    )
+}
+
+impl CommandRunner for StagedFixtureRunner {
+    async fn run(&self, request: CommandRequest) -> Result<CommandOutput, ProcessError> {
+        assert_eq!(request.program, "firewall-cmd");
+        assert_eq!(request.timeout, DEFAULT_TIMEOUT);
+        let stdout = match request.args.as_slice() {
+            [state] if state == "--state" => "running\n".to_owned(),
+            [version] if version == "--version" => "2.3.2\n".to_owned(),
+            [log_denied] if log_denied == "--get-log-denied" => "off\n".to_owned(),
+            [panic] if panic == "--query-panic" => {
+                return Ok(output(Some(1), "no\n", ""));
+            }
+            [default_zone] if default_zone == "--get-default-zone" => "public\n".to_owned(),
+            [active] if active == "--get-active-zones" => ACTIVE_ZONES.to_owned(),
+            [zones] if zones == "--list-all-zones" => staged_fixture_zones(LIST_ALL_RUNTIME),
+            [permanent, zones] if permanent == "--permanent" && zones == "--list-all-zones" => {
+                staged_fixture_zones(LIST_ALL_PERMANENT)
+            }
+            [ipsets] if ipsets == "--get-ipsets" => "blocklist\n".to_owned(),
+            [ipset] if ipset == "--info-ipset=blocklist" => INFO_IPSET.to_owned(),
+            [permanent, ipsets] if permanent == "--permanent" && ipsets == "--get-ipsets" => {
+                "blocklist\n".to_owned()
+            }
+            [permanent, ipset]
+                if permanent == "--permanent" && ipset == "--info-ipset=blocklist" =>
+            {
+                INFO_IPSET.to_owned()
+            }
+            [direct, rules] if direct == "--direct" && rules == "--get-all-rules" => {
+                DIRECT_RULES.to_owned()
+            }
+            [services] if services == "--get-services" => "ssh http https\n".to_owned(),
+            [policies] if policies == "--get-policies" => "fwdeck-fixture\n".to_owned(),
+            [policy] if policy == "--info-policy=fwdeck-fixture" => INFO_POLICY.to_owned(),
+            [permanent, policies] if permanent == "--permanent" && policies == "--get-policies" => {
+                "fwdeck-fixture\n".to_owned()
+            }
+            [permanent, policy]
+                if permanent == "--permanent" && policy == "--info-policy=fwdeck-fixture" =>
+            {
+                INFO_POLICY.to_owned()
+            }
+            [service] if service == "--info-service=background" => {
+                self.control
+                    .background_detail_started
+                    .store(true, Ordering::SeqCst);
+                self.control.background_detail_waiting.notify_waiters();
+                match self.control.release_background_detail.acquire().await {
+                    Ok(permit) => {
+                        permit.forget();
+                        INFO_SERVICE.to_owned()
+                    }
+                    Err(_) => {
+                        return Err(ProcessError::Io("background detail gate closed".to_owned()));
+                    }
+                }
+            }
+            [service] if service.starts_with("--info-service=") => INFO_SERVICE.to_owned(),
+            unexpected => panic!("unexpected fixture command: {unexpected:?}"),
+        };
+        Ok(output(Some(0), &stdout, ""))
+    }
+}
+
+#[tokio::test]
+async fn staged_cli_read_returns_zone_overview_before_background_details() {
+    let (backend, control) = staged_backend_fixture();
+    let (_publisher, priority) = refresh_priority_channel();
+
+    let overview = backend.snapshot_overview(&priority).await;
+    let overview = overview.result.unwrap().unwrap();
+    assert_eq!(overview.default_zone.as_str(), "public");
+    assert!(
+        overview
+            .runtime
+            .contains_key(&ZoneName::parse("public").unwrap())
+    );
+    assert!(!control.background_detail_started());
+
+    let hydration = backend.snapshot_hydrated(Some(overview), &priority);
+    tokio::pin!(hydration);
+    control.wait_for_background_detail().await;
+    assert!(futures_util::poll!(&mut hydration).is_pending());
+    control.release_background_detail();
+    assert!(hydration.await.result.is_ok());
+}
+
+#[tokio::test]
+async fn staged_cli_final_snapshot_matches_complete_snapshot() {
+    let (staged_backend, staged_control) = staged_backend_fixture();
+    let (_publisher, priority) = refresh_priority_channel();
+    let overview = staged_backend
+        .snapshot_overview(&priority)
+        .await
+        .result
+        .unwrap()
+        .unwrap();
+    let hydration = staged_backend.snapshot_hydrated(Some(overview), &priority);
+    tokio::pin!(hydration);
+    staged_control.wait_for_background_detail().await;
+    staged_control.release_background_detail();
+    let staged = hydration.await.result.unwrap();
+
+    let (complete_backend, complete_control) = staged_backend_fixture();
+    complete_control.release_background_detail();
+    let complete = complete_backend.snapshot().await.unwrap();
+
+    assert_eq!(staged, complete);
 }
 
 #[tokio::test]

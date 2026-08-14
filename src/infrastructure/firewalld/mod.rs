@@ -13,8 +13,9 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use crate::application::ports::{
-    FirewallBackend, FirewallError, OperationOutcome, SnapshotRead, StepReport,
+    FirewallBackend, FirewallError, OperationOutcome, OverviewRead, SnapshotRead, StepReport,
 };
+use crate::application::{RefreshOverview, RefreshPrioritySource};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -310,6 +311,136 @@ impl<R: CommandRunner> CliBackend<R> {
         )
     }
 
+    /// Fetches heavy snapshot sections using the exact policy names captured
+    /// by an earlier overview read, repopulating the existing tier cache.
+    #[allow(clippy::type_complexity)]
+    async fn fetch_hydrated_sections(
+        &self,
+        overview: &RefreshOverview,
+        _priority: &RefreshPrioritySource,
+    ) -> (
+        Scoped<BTreeMap<IpSetName, IpSetInfo>>,
+        Scoped<BTreeMap<PolicyName, PolicyDetails>>,
+        Vec<String>,
+        Vec<DegradedSection>,
+    ) {
+        let cached = {
+            let mut heavy = self
+                .heavy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(age) = heavy.age.as_mut()
+                && *age < HEAVY_SECTION_EVERY
+            {
+                *age += 1;
+                Some((
+                    heavy.ipsets.clone(),
+                    heavy.policies.clone(),
+                    heavy.direct_rules.clone(),
+                    heavy.degraded.clone(),
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some(cached) = cached {
+            return cached;
+        }
+
+        let (ipsets, mut degraded) = observe_section(RefreshSection::IpSets, self.ipsets()).await;
+        let (direct_rules, direct_err) =
+            observe_section(RefreshSection::DirectRules, self.direct_rules()).await;
+        let (policies, policy_degraded) = observe_section(
+            RefreshSection::Policies,
+            self.policies_for_names(&overview.policy_names),
+        )
+        .await;
+        degraded.extend(direct_err);
+        degraded.extend(policy_degraded);
+        let mut heavy = self
+            .heavy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        heavy.age = Some(1);
+        heavy.ipsets = ipsets.clone();
+        heavy.policies = policies.clone();
+        heavy.direct_rules.clone_from(&direct_rules);
+        heavy.degraded.clone_from(&degraded);
+        (ipsets, policies, direct_rules, degraded)
+    }
+
+    async fn service_definitions_prioritized(
+        &self,
+        names: Vec<ServiceName>,
+        _overview: &RefreshOverview,
+        _priority: &RefreshPrioritySource,
+    ) -> (
+        BTreeMap<ServiceName, ServiceDefinition>,
+        Vec<DegradedSection>,
+    ) {
+        self.service_definitions(names).await
+    }
+
+    async fn refresh_overview(&self) -> Result<RefreshOverview, FirewallError> {
+        let status = observe_section(RefreshSection::Status, self.probe()).await?;
+        if !status.daemon_running && !self.is_offline() {
+            return Err(FirewallError::DaemonNotRunning);
+        }
+        let (default_zone, active, runtime, permanent, mut degraded) =
+            self.fetch_zone_overview().await?;
+        let (available_services, service_error) =
+            observe_section(RefreshSection::Services, self.available_services()).await;
+        if let Some(service_error) = service_error {
+            degraded.push(service_error);
+        }
+        let (policy_names, policy_errors) =
+            observe_section(RefreshSection::Policies, self.policy_names()).await;
+        degraded.extend(policy_errors);
+        Ok(RefreshOverview {
+            status,
+            default_zone,
+            active,
+            runtime,
+            permanent,
+            available_services,
+            policy_names,
+            degraded,
+        })
+    }
+
+    async fn hydrate_overview(
+        &self,
+        overview: Arc<RefreshOverview>,
+        priority: &RefreshPrioritySource,
+    ) -> Result<FirewallSnapshot, FirewallError> {
+        let (ipsets, policies, direct_rules, mut degraded) =
+            self.fetch_hydrated_sections(&overview, priority).await;
+        let (service_definitions, service_degraded) = observe_section(
+            RefreshSection::Services,
+            self.service_definitions_prioritized(
+                overview.referenced_services(),
+                &overview,
+                priority,
+            ),
+        )
+        .await;
+        degraded.extend(service_degraded);
+        degraded.extend(overview.degraded.clone());
+        Ok(FirewallSnapshot {
+            status: overview.status.clone(),
+            default_zone: overview.default_zone.clone(),
+            active: overview.active.clone(),
+            runtime: overview.runtime.clone(),
+            permanent: overview.permanent.clone(),
+            ipsets,
+            service_definitions,
+            available_services: overview.available_services.clone(),
+            policies,
+            direct_rules,
+            degraded,
+        })
+    }
+
     /// `firewall-cmd --check-config`: firewalld's own permanent-config lint.
     pub async fn check_config(&self) -> Result<(), FirewallError> {
         self.run_ok(self.request(&["--check-config"]))
@@ -451,43 +582,76 @@ impl<R: CommandRunner> CliBackend<R> {
         }
     }
 
-    /// Fetches one scope of policies, recording list, info, and parse failures.
-    async fn policies_for(
+    /// Fetches policy names for one configuration scope.
+    async fn policy_names_for(
         &self,
         target: ConfigurationTarget,
-    ) -> (BTreeMap<PolicyName, PolicyDetails>, Vec<DegradedSection>) {
+    ) -> (Vec<PolicyName>, Vec<DegradedSection>) {
         let request = if target == ConfigurationTarget::Permanent && !self.is_offline() {
             self.request(&["--permanent", "--get-policies"])
         } else {
             self.request(&["--get-policies"])
         };
-        let names = match self.run_ok(request).await {
+        match self.run_ok(request).await {
             Ok(raw) => match parse::parse_policy_names(&raw) {
-                Ok(names) => names,
+                Ok(names) => (names, Vec::new()),
                 Err(err) => {
                     tracing::warn!(error = %err, "policy listing unparseable");
-                    return (
-                        BTreeMap::new(),
+                    (
+                        Vec::new(),
                         vec![DegradedSection::new(
                             SnapshotSection::Policies,
                             Some(target),
                             format!("unparseable listing: {err}"),
                         )],
-                    );
+                    )
                 }
             },
             Err(err) => {
                 tracing::warn!(error = %err, "policy listing failed");
-                return (
-                    BTreeMap::new(),
+                (
+                    Vec::new(),
                     vec![DegradedSection::new(
                         SnapshotSection::Policies,
                         Some(target),
                         err.to_string(),
                     )],
-                );
+                )
             }
-        };
+        }
+    }
+
+    /// Fetches policy names for each available configuration scope.
+    async fn policy_names(&self) -> (Scoped<Vec<PolicyName>>, Vec<DegradedSection>) {
+        if self.is_offline() {
+            let (permanent, mut degraded) =
+                self.policy_names_for(ConfigurationTarget::Permanent).await;
+            degraded.push(DegradedSection::new(
+                SnapshotSection::Policies,
+                Some(ConfigurationTarget::Runtime),
+                "runtime configuration is unavailable in offline mode",
+            ));
+            return (
+                Scoped {
+                    runtime: Vec::new(),
+                    permanent,
+                },
+                degraded,
+            );
+        }
+        let (runtime, mut degraded) = self.policy_names_for(ConfigurationTarget::Runtime).await;
+        let (permanent, permanent_degraded) =
+            self.policy_names_for(ConfigurationTarget::Permanent).await;
+        degraded.extend(permanent_degraded);
+        (Scoped { runtime, permanent }, degraded)
+    }
+
+    /// Fetches policy details for the exact names captured by policy listing.
+    async fn policies_for(
+        &self,
+        target: ConfigurationTarget,
+        names: Vec<PolicyName>,
+    ) -> (BTreeMap<PolicyName, PolicyDetails>, Vec<DegradedSection>) {
         let infos = bounded_fan_out(names.into_iter().map(|name| async move {
             let arg = format!("--info-policy={name}");
             let request = if target == ConfigurationTarget::Permanent && !self.is_offline() {
@@ -537,24 +701,31 @@ impl<R: CommandRunner> CliBackend<R> {
         Scoped<BTreeMap<PolicyName, PolicyDetails>>,
         Vec<DegradedSection>,
     ) {
-        if self.is_offline() {
-            let (permanent, mut degraded) = self.policies_for(ConfigurationTarget::Permanent).await;
-            degraded.push(DegradedSection::new(
-                SnapshotSection::Policies,
-                Some(ConfigurationTarget::Runtime),
-                "runtime configuration is unavailable in offline mode",
-            ));
-            return (
-                Scoped {
-                    runtime: BTreeMap::new(),
-                    permanent,
-                },
-                degraded,
-            );
-        }
-        let (runtime, mut degraded) = self.policies_for(ConfigurationTarget::Runtime).await;
-        let (permanent, permanent_degraded) =
-            self.policies_for(ConfigurationTarget::Permanent).await;
+        let (names, mut degraded) = self.policy_names().await;
+        let (runtime, runtime_degraded) = self
+            .policies_for(ConfigurationTarget::Runtime, names.runtime)
+            .await;
+        let (permanent, permanent_degraded) = self
+            .policies_for(ConfigurationTarget::Permanent, names.permanent)
+            .await;
+        degraded.extend(runtime_degraded);
+        degraded.extend(permanent_degraded);
+        (Scoped { runtime, permanent }, degraded)
+    }
+
+    async fn policies_for_names(
+        &self,
+        names: &Scoped<Vec<PolicyName>>,
+    ) -> (
+        Scoped<BTreeMap<PolicyName, PolicyDetails>>,
+        Vec<DegradedSection>,
+    ) {
+        let (runtime, mut degraded) = self
+            .policies_for(ConfigurationTarget::Runtime, names.runtime.clone())
+            .await;
+        let (permanent, permanent_degraded) = self
+            .policies_for(ConfigurationTarget::Permanent, names.permanent.clone())
+            .await;
         degraded.extend(permanent_degraded);
         (Scoped { runtime, permanent }, degraded)
     }
@@ -577,6 +748,27 @@ impl<R: CommandRunner> CliBackend<R> {
                 )
             }
         }
+    }
+
+    async fn fetch_zone_overview(
+        &self,
+    ) -> Result<
+        (
+            ZoneName,
+            BTreeMap<ZoneName, ActiveZone>,
+            BTreeMap<ZoneName, ZoneDetails>,
+            BTreeMap<ZoneName, ZoneDetails>,
+            Vec<DegradedSection>,
+        ),
+        FirewallError,
+    > {
+        observe_section(RefreshSection::Zones, async {
+            let default_zone = self.run_ok(self.request(&["--get-default-zone"])).await?;
+            let default_zone = parse::parse_default_zone(&default_zone)?;
+            let (active, runtime, permanent, degraded) = self.zone_sections().await?;
+            Ok((default_zone, active, runtime, permanent, degraded))
+        })
+        .await
     }
 
     /// Fetches runtime/permanent zones and records malformed individual zone
@@ -710,13 +902,7 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
         }
 
         let (default_zone, active, runtime, permanent, zone_degraded) =
-            observe_section(RefreshSection::Zones, async {
-                let default_zone = self.run_ok(self.request(&["--get-default-zone"])).await?;
-                let default_zone = parse::parse_default_zone(&default_zone)?;
-                let (active, runtime, permanent, zone_degraded) = self.zone_sections().await?;
-                Ok::<_, FirewallError>((default_zone, active, runtime, permanent, zone_degraded))
-            })
-            .await?;
+            self.fetch_zone_overview().await?;
         // Tiered refresh: the per-object sections (one subprocess each) are
         // reused for a few refreshes; mutations invalidate the cache.
         let cached = {
@@ -784,6 +970,41 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
         let started = Instant::now();
         let result = REFRESH_RECORDER
             .scope(Arc::clone(&recorder), self.snapshot())
+            .await;
+        SnapshotRead {
+            result,
+            observation: recorder.finish(started.elapsed()),
+        }
+    }
+
+    async fn snapshot_overview(&self, _priority: &RefreshPrioritySource) -> OverviewRead {
+        let recorder = Arc::new(RefreshRecorder::default());
+        let started = Instant::now();
+        let result = REFRESH_RECORDER
+            .scope(Arc::clone(&recorder), self.refresh_overview())
+            .await
+            .map(|overview| Some(Arc::new(overview)));
+        OverviewRead {
+            result,
+            observation: recorder.finish(started.elapsed()),
+        }
+    }
+
+    async fn snapshot_hydrated(
+        &self,
+        overview: Option<Arc<RefreshOverview>>,
+        priority: &RefreshPrioritySource,
+    ) -> SnapshotRead {
+        let Some(overview) = overview else {
+            return self.snapshot_observed().await;
+        };
+        let recorder = Arc::new(RefreshRecorder::default());
+        let started = Instant::now();
+        let result = REFRESH_RECORDER
+            .scope(
+                Arc::clone(&recorder),
+                self.hydrate_overview(overview, priority),
+            )
             .await;
         SnapshotRead {
             result,
