@@ -297,6 +297,24 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+fn prefixed_rows(prefix: &str, text: &str, inner_width: usize) -> Vec<(String, String)> {
+    let prefix_width = display_width(prefix);
+    let continuation = " ".repeat(prefix_width);
+    let text_width = inner_width.saturating_sub(prefix_width).max(1);
+    wrap_text(text, text_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let prefix = if index == 0 {
+                prefix.to_owned()
+            } else {
+                continuation.clone()
+            };
+            (prefix, row)
+        })
+        .collect()
+}
+
 fn help_entry_rows(keys: &str, description: &str, inner_width: usize) -> Vec<(String, String)> {
     let key_width = HELP_KEY_WIDTH.min(inner_width.saturating_sub(8).max(1));
     let prefix = format!("   {keys:<key_width$}");
@@ -350,35 +368,66 @@ fn render_help(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
 }
 
 fn render_about(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
-    let field = |label: &str, value: &'static str| {
-        Line::from(vec![
-            Span::styled(format!("   {label:<10}"), theme.accent()),
-            Span::styled(value, theme.text()),
-        ])
-    };
-    let body = |text: &'static str| Line::from(Span::styled(format!(" {text}"), theme.text()));
-    let lines = vec![
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
+    let mut lines = vec![
         Line::from(Span::styled(
             format!(" FWDeck v{}", env!("CARGO_PKG_VERSION")),
             theme.brand(),
         )),
         Line::default(),
-        body("A safety-first terminal UI for firewalld — manage zones,"),
-        body("services, ports, and rich rules from the keyboard, with"),
-        body("runtime-vs-permanent scope on every row and a dead-man's"),
-        body("switch that auto-reverts a change that would cut your session."),
-        Line::default(),
-        field("Developer", "Daniel Niazmand"),
-        field("Website", "https://madebydaniz.com"),
-        field("Docs", "https://madebydaniz.github.io/fwdeck/"),
-        field("Source", "https://github.com/madebydaniz/fwdeck"),
-        field("Updates", "https://github.com/madebydaniz/fwdeck/releases"),
-        field("License", "MIT"),
-        Line::default(),
-        body("Run `fwdeck doctor` for your exact upgrade command."),
     ];
+    lines.extend(
+        prefixed_rows(
+            " ",
+            "A safety-first terminal UI for firewalld — manage zones, services, ports, and rich rules from the keyboard, with runtime-vs-permanent scope on every row and a dead-man's switch that auto-reverts a change that would cut your session.",
+            inner_width,
+        )
+        .into_iter()
+        .map(|(prefix, row)| {
+            Line::from(vec![
+                Span::styled(prefix, theme.text()),
+                Span::styled(row, theme.text()),
+            ])
+        }),
+    );
+    lines.push(Line::default());
+    for (label, value) in [
+        ("Developer", "Daniel Niazmand"),
+        ("Website", "https://madebydaniz.com"),
+        ("Docs", "https://madebydaniz.github.io/fwdeck/"),
+        ("Source", "https://github.com/madebydaniz/fwdeck"),
+        ("Updates", "https://github.com/madebydaniz/fwdeck/releases"),
+        ("License", "MIT"),
+    ] {
+        lines.extend(
+            prefixed_rows(&format!("   {label:<10}"), value, inner_width)
+                .into_iter()
+                .map(|(prefix, row)| {
+                    Line::from(vec![
+                        Span::styled(prefix, theme.accent()),
+                        Span::styled(row, theme.text()),
+                    ])
+                }),
+        );
+    }
+    lines.push(Line::default());
+    lines.extend(
+        prefixed_rows(
+            " ",
+            "Run `fwdeck doctor` for your exact upgrade command.",
+            inner_width,
+        )
+        .into_iter()
+        .map(|(prefix, row)| {
+            Line::from(vec![
+                Span::styled(prefix, theme.text()),
+                Span::styled(row, theme.text()),
+            ])
+        }),
+    );
     let desired = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let area = centered(screen, text_modal_width(screen), desired);
+    let area = centered(screen, width, desired);
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title("About", scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
@@ -428,9 +477,12 @@ fn render_global_search(
 ) {
     let hits = super::search::hits(state, &search_state.query);
     let visible_rows = 12usize;
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
+    let label_width = inner_width.saturating_sub(13).max(1);
     let area = centered(
         screen,
-        72,
+        width,
         u16::try_from(visible_rows + 6).unwrap_or(u16::MAX),
     );
     let block = modal(f, theme, area, "Global search");
@@ -451,7 +503,7 @@ fn render_global_search(
     for (index, hit) in hits.iter().enumerate().skip(offset).take(visible_rows) {
         let is_selected = index == selected;
         let marker = if is_selected { "▸ " } else { "  " };
-        let label: String = hit.label.chars().take(54).collect();
+        let label: String = hit.label.chars().take(label_width).collect();
         let spans = vec![
             Span::styled(marker.to_owned(), theme.accent()),
             Span::styled(format!("{:<11}", hit.view.title()), theme.muted()),
@@ -561,40 +613,48 @@ fn render_details(
     screen: Rect,
     scroll: u16,
 ) -> u16 {
-    let mut lines: Vec<Line> = content
-        .lines
-        .iter()
-        .map(|(key, value)| {
-            if key.is_empty() {
-                Line::from(Span::styled(format!("   {value}"), theme.text()))
-            } else {
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
+    let mut lines = Vec::new();
+    for (key, value) in &content.lines {
+        let prefix = if key.is_empty() {
+            "   ".to_owned()
+        } else {
+            format!(" {key:<12}")
+        };
+        lines.extend(prefixed_rows(&prefix, value, inner_width).into_iter().map(
+            |(prefix, row)| {
                 Line::from(vec![
-                    Span::styled(format!(" {key:<12}"), theme.muted()),
-                    Span::styled(value.clone(), theme.text()),
+                    Span::styled(prefix, theme.muted()),
+                    Span::styled(row, theme.text()),
                 ])
-            }
-        })
-        .collect();
+            },
+        ));
+    }
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        " esc close  ·  : for actions on this object",
-        theme.muted(),
-    )));
+    lines.extend(
+        prefixed_rows(
+            " ",
+            "esc close  ·  : for actions on this object",
+            inner_width,
+        )
+        .into_iter()
+        .map(|(prefix, row)| {
+            Line::from(vec![
+                Span::styled(prefix, theme.muted()),
+                Span::styled(row, theme.muted()),
+            ])
+        }),
+    );
 
     let height = u16::try_from(lines.len() + 2)
         .unwrap_or(u16::MAX)
         .min(screen.height.saturating_sub(2));
-    let area = centered(screen, text_modal_width(screen), height);
+    let area = centered(screen, width, height);
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title(&content.title, scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(block)
-            .scroll((scroll, 0)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
     scroll
 }
 
@@ -839,5 +899,78 @@ mod tests {
             content.contains("removed automatically after N seconds"),
             "{content}"
         );
+    }
+
+    #[test]
+    fn narrow_about_can_scroll_to_the_full_final_sentence() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+
+        terminal
+            .draw(|frame| {
+                render_about(frame, &theme, frame.area(), u16::MAX);
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(content.contains("for your exact"), "{content}");
+        assert!(content.contains("upgrade command."), "{content}");
+    }
+
+    #[test]
+    fn narrow_details_can_scroll_to_the_wrapped_value_suffix_and_actions() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let details = DetailsContent {
+            title: "Policy details".to_owned(),
+            lines: vec![(
+                "Description".to_owned(),
+                "a deliberately long policy description whose final suffix stays readable"
+                    .to_owned(),
+            )],
+        };
+
+        terminal
+            .draw(|frame| {
+                render_details(frame, &details, &theme, frame.area(), u16::MAX);
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(content.contains("stays readable"), "{content}");
+        assert!(content.contains("actions on this"), "{content}");
+        assert!(content.contains("object"), "{content}");
+    }
+
+    #[test]
+    fn wide_global_search_uses_the_responsive_modal_width() {
+        let screen_width = 160usize;
+        let screen_height = 40usize;
+        let mut terminal = Terminal::new(TestBackend::new(
+            u16::try_from(screen_width).unwrap(),
+            u16::try_from(screen_height).unwrap(),
+        ))
+        .unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let state = UiState::new(&Config::default(), "testhost".to_owned(), false, None);
+        let search = super::super::search::GlobalSearchState::default();
+
+        terminal
+            .draw(|frame| {
+                render_global_search(frame, &state, &search, &theme, frame.area());
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        let title_offset = content.find("╭ Global search").unwrap();
+        let expected_width = usize::from(text_modal_width(Rect::new(
+            0,
+            0,
+            u16::try_from(screen_width).unwrap(),
+            u16::try_from(screen_height).unwrap(),
+        )));
+        let expected_x = (screen_width - expected_width) / 2;
+        let expected_y = (screen_height - 18) / 2;
+        assert_eq!(title_offset, expected_y * screen_width + expected_x);
     }
 }
