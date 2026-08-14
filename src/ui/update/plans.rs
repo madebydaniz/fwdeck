@@ -58,16 +58,21 @@ pub(super) fn apply_staged_plan(state: &mut UiState) -> Vec<Effect> {
     // Route the whole batch through the same confirmation + dead-man's switch as
     // a single op. Staged plans, restores and bulk deletes are the flows most
     // likely to cut a remote admin off, so they must NOT skip the safety net.
+    let Some(id) = state.allocate_plan_id() else {
+        state.toast(ToastKind::Error, "plan identity exhausted — restart FWDeck");
+        return Vec::new();
+    };
+    let plan = MutationPlan::new(id, ops, snapshot);
     if state.confirm_destructive {
-        let body = plan_confirm_body(state, &ops, satisfied);
+        let body = plan_confirm_body(state, &plan.operations, satisfied);
         state.overlays.push(Overlay::Confirm(Confirmation {
             title: "Apply staged plan".to_owned(),
             body,
-            on_confirm: UiAction::ApplyPlanConfirmed(MutationPlan::new(ops, snapshot)),
+            on_confirm: UiAction::ApplyPlanConfirmed(plan),
         }));
         return Vec::new();
     }
-    apply_plan_now(state, MutationPlan::new(ops, snapshot))
+    apply_plan_now(state, plan)
 }
 
 /// Applies a validated, confirmed plan: clears the staging area and dispatches

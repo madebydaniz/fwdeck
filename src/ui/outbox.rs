@@ -346,7 +346,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::application::{
-        EngineRequest, ManualRefreshRequest, MutationRequest, RollbackGuardId, RollbackRequest,
+        EngineRequest, ManualRefreshRequest, MutationPlan, MutationRequest, PlanId,
+        RollbackGuardId, RollbackRequest,
     };
     use crate::domain::{ConfigurationTarget, FirewallOperation, ServiceName, ZoneName, mock};
 
@@ -387,6 +388,24 @@ mod tests {
         );
         assert_eq!(outbox.take_normal(), Some(first));
         assert_eq!(outbox.take_normal(), None);
+    }
+
+    #[test]
+    fn plan_request_retains_identity() {
+        let mut outbox = EngineOutbox::new();
+        let id = PlanId::new(71);
+        let request = EngineRequest::ApplyPlan(MutationPlan::new(
+            id,
+            vec![FirewallOperation::Reload],
+            Arc::new(mock::sample().unwrap()),
+        ));
+
+        outbox.enqueue_normal(request).unwrap();
+
+        assert!(matches!(
+            outbox.take_normal(),
+            Some(EngineRequest::ApplyPlan(plan)) if plan.id == id
+        ));
     }
 
     #[test]

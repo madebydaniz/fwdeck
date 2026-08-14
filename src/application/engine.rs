@@ -16,8 +16,9 @@ use crate::domain::FirewallSnapshot;
 
 use super::api::{
     EngineEvent, EngineRequest, ManualRefreshRequest, MutationPlan, MutationRequest,
-    OperationResult, REQUEST_CAPACITY, RefreshCancellationReason, RefreshId, RefreshPrioritySource,
-    RefreshScheduleObservation, RefreshTrigger, RollbackRegistration, RollbackRequest,
+    OperationResult, PlanId, REQUEST_CAPACITY, RefreshCancellationReason, RefreshId,
+    RefreshPrioritySource, RefreshScheduleObservation, RefreshTrigger, RollbackRegistration,
+    RollbackRequest,
 };
 use super::ports::{
     FirewallBackend, FirewallError, OperationOutcome, OverviewRead, RollbackGuard, RollbackGuardId,
@@ -983,6 +984,7 @@ async fn apply_plan<B: FirewallBackend, G: RollbackGuard>(
     rollback_timeout: Duration,
 ) -> Result<(), ()> {
     let MutationPlan {
+        id,
         operations,
         expected,
     } = plan;
@@ -990,7 +992,7 @@ async fn apply_plan<B: FirewallBackend, G: RollbackGuard>(
     if !read_only {
         let observed = match mutation_precondition(backend, &expected).await {
             Ok(observed) => observed,
-            Err(error) => return reject_plan_preflight(events, operations, error).await,
+            Err(error) => return reject_plan_preflight(events, id, operations, error).await,
         };
         if let Some(error) = operations
             .iter()
@@ -998,6 +1000,7 @@ async fn apply_plan<B: FirewallBackend, G: RollbackGuard>(
         {
             return reject_plan_preflight(
                 events,
+                id,
                 operations,
                 FirewallError::Validation(error.to_string()),
             )
@@ -1039,9 +1042,13 @@ async fn apply_plan<B: FirewallBackend, G: RollbackGuard>(
         }
     }
     let remaining: Vec<_> = iter.collect();
-    tracing::info!(applied, total, halted, "plan finished");
+    tracing::info!(plan_id = id.get(), applied, total, halted, "plan finished");
     events
-        .send(EngineEvent::PlanFinished { applied, remaining })
+        .send(EngineEvent::PlanFinished {
+            id,
+            applied,
+            remaining,
+        })
         .await
         .map_err(|_| ())
 }
@@ -1153,12 +1160,14 @@ fn rejected_operation(
 
 async fn reject_plan_preflight(
     events: &mpsc::Sender<EngineEvent>,
+    id: PlanId,
     operations: Vec<crate::domain::FirewallOperation>,
     error: FirewallError,
 ) -> Result<(), ()> {
     let Some(first) = operations.first().cloned() else {
         return events
             .send(EngineEvent::PlanFinished {
+                id,
                 applied: 0,
                 remaining: Vec::new(),
             })
@@ -1178,6 +1187,7 @@ async fn reject_plan_preflight(
         .map_err(|_| ())?;
     events
         .send(EngineEvent::PlanFinished {
+            id,
             applied: 0,
             remaining: operations,
         })
@@ -1993,7 +2003,11 @@ mod tests {
     }
 
     fn reviewed_plan(operations: Vec<FirewallOperation>) -> MutationPlan {
-        MutationPlan::new(operations, Arc::new(mock::sample().unwrap()))
+        MutationPlan::new(
+            PlanId::new(1),
+            operations,
+            Arc::new(mock::sample().unwrap()),
+        )
     }
 
     fn manual_request() -> ManualRefreshRequest {
@@ -2036,6 +2050,7 @@ mod tests {
                 EngineEvent::PlanFinished {
                     applied: 1,
                     ref remaining,
+                    ..
                 } if remaining.is_empty()
             ));
         }
@@ -2479,8 +2494,10 @@ mod tests {
             other => panic!("expected initial snapshot, got {other:?}"),
         };
         let operations = vec![FirewallOperation::Reload, FirewallOperation::Reload];
+        let plan_id = crate::application::api::PlanId::new(41);
         request_tx
             .send(EngineRequest::ApplyPlan(MutationPlan::new(
+                plan_id,
                 operations.clone(),
                 expected,
             )))
@@ -2495,9 +2512,10 @@ mod tests {
         assert!(matches!(
             event_rx.recv().await.unwrap(),
             EngineEvent::PlanFinished {
+                id,
                 applied: 0,
                 remaining,
-            } if remaining == operations
+            } if id == plan_id && remaining == operations
         ));
         assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
     }
@@ -2646,6 +2664,7 @@ mod tests {
             EngineEvent::PlanFinished {
                 applied: 0,
                 ref remaining,
+                ..
             } if remaining.len() == 2
         ));
         assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
@@ -2664,7 +2683,11 @@ mod tests {
             &backend,
             &TestRollbackGuard,
             &event_tx,
-            MutationPlan::new(Vec::new(), Arc::new(mock::sample().unwrap())),
+            MutationPlan::new(
+                PlanId::new(1),
+                Vec::new(),
+                Arc::new(mock::sample().unwrap()),
+            ),
             false,
             Duration::from_secs(30),
         )
@@ -2676,6 +2699,7 @@ mod tests {
             EngineEvent::PlanFinished {
                 applied: 0,
                 ref remaining,
+                ..
             } if remaining.is_empty()
         ));
         assert!(event_rx.try_recv().is_err());
@@ -2712,6 +2736,7 @@ mod tests {
             EngineEvent::PlanFinished {
                 applied: 0,
                 ref remaining,
+                ..
             } if remaining == &[FirewallOperation::Reload]
         ));
         assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
@@ -3484,6 +3509,7 @@ mod tests {
             EngineEvent::PlanFinished {
                 applied: 1,
                 ref remaining,
+                ..
             } if remaining.is_empty()
         ));
         assert!(matches!(
@@ -4139,6 +4165,7 @@ mod tests {
             EngineEvent::PlanFinished {
                 applied: 1,
                 ref remaining,
+                ..
             } if remaining.is_empty()
         ));
         assert!(matches!(
@@ -4956,7 +4983,9 @@ mod tests {
                 if matches!(result.outcome, OperationOutcome::Failed { .. })
         ));
         match event_rx.recv().await.unwrap() {
-            EngineEvent::PlanFinished { applied, remaining } => {
+            EngineEvent::PlanFinished {
+                applied, remaining, ..
+            } => {
                 assert_eq!(applied, 1, "only the first op fully applied");
                 assert_eq!(
                     remaining.len(),
@@ -5022,6 +5051,7 @@ mod tests {
             EngineEvent::PlanFinished {
                 applied: 1,
                 ref remaining,
+                ..
             } if remaining.len() == 1
         ));
 
@@ -5222,7 +5252,12 @@ mod tests {
             ));
         }
         match event_rx.recv().await.unwrap() {
-            EngineEvent::PlanFinished { applied, remaining } => {
+            EngineEvent::PlanFinished {
+                id,
+                applied,
+                remaining,
+            } => {
+                assert_eq!(id, PlanId::new(1));
                 assert_eq!(applied, 2);
                 assert!(remaining.is_empty(), "nothing left when the plan succeeds");
             }

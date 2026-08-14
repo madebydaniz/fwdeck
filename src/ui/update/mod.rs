@@ -387,15 +387,15 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             let staged_before = state.staged.clone();
             let toasts_before = state.toasts.clone();
             let effects = apply_staged_plan(state);
-            let required = effects.iter().find_map(|effect| match effect {
-                Effect::ApplyPlan(plan) => Some(risky_operation_count(
-                    &plan.operations,
-                    state.rollback_ticks,
+            let reservation = effects.iter().find_map(|effect| match effect {
+                Effect::ApplyPlan(plan) => Some((
+                    plan.id,
+                    risky_operation_count(&plan.operations, state.rollback_ticks),
                 )),
                 _ => None,
             });
-            if let Some(required) = required
-                && !reserve_plan_rollback_capacity(state, required)
+            if let Some((id, required)) = reservation
+                && !reserve_plan_rollback_capacity(state, id, required)
             {
                 let rejection = state.toasts.back().cloned();
                 state.staged = staged_before;
@@ -411,7 +411,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         // on_confirm): arms the dead-man's switch, then dispatches the batch.
         UiAction::ApplyPlanConfirmed(plan) => {
             let required = risky_operation_count(&plan.operations, state.rollback_ticks);
-            if !reserve_plan_rollback_capacity(state, required) {
+            if !reserve_plan_rollback_capacity(state, plan.id, required) {
                 return Vec::new();
             }
             return apply_plan_now(state, plan);
@@ -603,32 +603,42 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 result.completed_rollback.is_none(),
             );
         }
-        UiAction::PlanFinished { applied, remaining } => {
-            let release = if let Some(plan) = state.in_flight_plan_rollback.take() {
-                plan.total.checked_sub(plan.consumed).unwrap_or_else(|| {
-                    state.toast(
-                        ToastKind::Error,
-                        "internal error: plan consumed more rollback reservations than it owned",
-                    );
-                    0
-                })
-            } else {
+        UiAction::PlanFinished {
+            id,
+            applied,
+            remaining,
+        } => {
+            let Some(active) = state.in_flight_plan_rollback else {
                 state.toast(
                     ToastKind::Error,
-                    "internal error: plan finished without an active plan",
+                    format!(
+                        "internal error: stale plan completion {} without an active plan",
+                        id.get()
+                    ),
                 );
-                let unclassified = state
-                    .rollback_reservations
-                    .checked_sub(state.single_rollback_reservations)
-                    .unwrap_or_else(|| {
-                        state.toast(
-                            ToastKind::Error,
-                            "internal error: single rollback reservations exceed the total",
-                        );
-                        0
-                    });
-                risky_operation_count(&remaining, state.rollback_ticks).min(unclassified)
+                return Vec::new();
             };
+            if active.id != id {
+                state.toast(
+                    ToastKind::Error,
+                    format!(
+                        "internal error: stale plan completion {} while plan {} is active",
+                        id.get(),
+                        active.id.get()
+                    ),
+                );
+                return Vec::new();
+            }
+            let Some(plan) = state.in_flight_plan_rollback.take() else {
+                return Vec::new();
+            };
+            let release = plan.total.checked_sub(plan.consumed).unwrap_or_else(|| {
+                state.toast(
+                    ToastKind::Error,
+                    "internal error: plan consumed more rollback reservations than it owned",
+                );
+                0
+            });
             release_rollback_reservations(state, release, "halted plan");
             if remaining.is_empty() {
                 state.toast(
@@ -860,7 +870,11 @@ fn reserve_single_rollback_capacity(state: &mut UiState, required: usize) -> boo
     true
 }
 
-fn reserve_plan_rollback_capacity(state: &mut UiState, required: usize) -> bool {
+fn reserve_plan_rollback_capacity(
+    state: &mut UiState,
+    id: crate::application::PlanId,
+    required: usize,
+) -> bool {
     if !engine_dispatch_allowed(state, required) {
         return false;
     }
@@ -873,6 +887,7 @@ fn reserve_plan_rollback_capacity(state: &mut UiState, required: usize) -> bool 
     };
     state.rollback_reservations = total;
     state.in_flight_plan_rollback = Some(PlanRollbackReservations {
+        id,
         total: required,
         consumed: 0,
     });
@@ -1406,6 +1421,10 @@ mod tests {
         let mut state = UiState::new(&Config::default(), "test".into(), false, None);
         state.snapshot = Some(std::sync::Arc::new(mock::sample().unwrap()));
         state
+    }
+
+    fn active_plan_id(state: &UiState) -> crate::application::PlanId {
+        state.in_flight_plan_rollback.unwrap().id
     }
 
     fn refresh_overview() -> crate::application::RefreshOverview {
@@ -3941,10 +3960,17 @@ mod tests {
     #[test]
     fn halted_plan_releases_reservations_for_unexecuted_risky_operations() {
         let mut state = state();
-        state.rollback_reservations = 2;
+        state.confirm_destructive = false;
+        state.staged = two_risky_operations();
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyStagedPlan).as_slice(),
+            [Effect::ApplyPlan(_)]
+        ));
+        let id = active_plan_id(&state);
         update(
             &mut state,
             UiAction::PlanFinished {
+                id,
                 applied: 0,
                 remaining: two_risky_operations(),
             },
@@ -3983,9 +4009,11 @@ mod tests {
         );
         assert_eq!(state.rollback_reservations, 1);
 
+        let id = active_plan_id(&state);
         update(
             &mut state,
             UiAction::PlanFinished {
+                id,
                 applied: 0,
                 remaining: operations,
             },
@@ -4324,9 +4352,11 @@ mod tests {
             toast.kind == ToastKind::Warning && toast.text.contains("plan is still running")
         }));
 
+        let id = active_plan_id(&state);
         update(
             &mut state,
             UiAction::PlanFinished {
+                id,
                 applied: 1,
                 remaining: Vec::new(),
             },
@@ -4352,9 +4382,11 @@ mod tests {
             update(&mut state, UiAction::ApplyStagedPlan).as_slice(),
             [Effect::ApplyPlan(_)]
         ));
+        let id = active_plan_id(&state);
         update(
             &mut state,
             UiAction::PlanFinished {
+                id,
                 applied: 1,
                 remaining: Vec::new(),
             },
@@ -4364,6 +4396,7 @@ mod tests {
         update(
             &mut state,
             UiAction::PlanFinished {
+                id,
                 applied: 1,
                 remaining: Vec::new(),
             },
@@ -4374,6 +4407,84 @@ mod tests {
         assert!(state.toasts.iter().any(|toast| {
             toast.kind == ToastKind::Error && toast.text.contains("without an active plan")
         }));
+    }
+
+    #[test]
+    fn stale_plan_completion_cannot_clear_the_active_plan() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        state.staged = vec![FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("mdns").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        }];
+        let effects = update(&mut state, UiAction::ApplyStagedPlan);
+        let active_id = match effects.as_slice() {
+            [Effect::ApplyPlan(plan)] => plan.id,
+            other => panic!("expected one plan effect, got {other:?}"),
+        };
+        let active_before = state.in_flight_plan_rollback;
+
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id: crate::application::PlanId::new(active_id.get() + 1),
+                applied: 0,
+                remaining: two_risky_operations(),
+            },
+        );
+
+        assert_eq!(state.in_flight_plan_rollback, active_before);
+        assert!(state.staged.is_empty());
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Error && toast.text.contains("stale plan completion")
+        }));
+    }
+
+    #[test]
+    fn duplicate_old_completion_cannot_finish_a_newer_plan() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        let operation = || FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("mdns").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+
+        state.staged = vec![operation()];
+        let first = update(&mut state, UiAction::ApplyStagedPlan);
+        let first_id = match first.as_slice() {
+            [Effect::ApplyPlan(plan)] => plan.id,
+            other => panic!("expected first plan effect, got {other:?}"),
+        };
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id: first_id,
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+
+        state.staged = vec![operation()];
+        let second = update(&mut state, UiAction::ApplyStagedPlan);
+        let second_id = match second.as_slice() {
+            [Effect::ApplyPlan(plan)] => plan.id,
+            other => panic!("expected second plan effect, got {other:?}"),
+        };
+        assert_ne!(first_id, second_id);
+
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id: first_id,
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+
+        assert_eq!(active_plan_id(&state), second_id);
+        assert!(state.staged.is_empty());
     }
 
     #[test]
@@ -4397,6 +4508,7 @@ mod tests {
         update(
             &mut state,
             UiAction::PlanFinished {
+                id: crate::application::PlanId::new(999),
                 applied: 0,
                 remaining: vec![operation],
             },
