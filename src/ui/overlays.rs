@@ -235,7 +235,90 @@ fn modal(f: &mut Frame, theme: &Theme, area: Rect, title: &str) -> Block<'static
         .style(theme.panel())
 }
 
+const TEXT_MODAL_PERCENT: u16 = 70;
+const TEXT_MODAL_MIN_WIDTH: u16 = 60;
+const TEXT_MODAL_MAX_WIDTH: u16 = 120;
+const MODAL_MARGIN: u16 = 2;
+const HELP_KEY_WIDTH: usize = 22;
+
+fn text_modal_width(screen: Rect) -> u16 {
+    let available = screen.width.saturating_sub(MODAL_MARGIN).max(1);
+    let proportional = screen.width.saturating_mul(TEXT_MODAL_PERCENT) / 100;
+    proportional
+        .max(TEXT_MODAL_MIN_WIDTH.min(available))
+        .min(TEXT_MODAL_MAX_WIDTH)
+        .min(available)
+}
+
+fn display_width(text: &str) -> usize {
+    Line::from(text).width()
+}
+
+fn split_word(word: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for character in word.chars() {
+        let mut candidate = current.clone();
+        candidate.push(character);
+        if !current.is_empty() && display_width(&candidate) > width {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        for chunk in split_word(word, width) {
+            if current.is_empty() {
+                current = chunk;
+                continue;
+            }
+            let candidate = format!("{current} {chunk}");
+            if display_width(&candidate) <= width {
+                current = candidate;
+            } else {
+                rows.push(std::mem::take(&mut current));
+                current = chunk;
+            }
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+fn help_entry_rows(keys: &str, description: &str, inner_width: usize) -> Vec<(String, String)> {
+    let key_width = HELP_KEY_WIDTH.min(inner_width.saturating_sub(8).max(1));
+    let prefix = format!("   {keys:<key_width$}");
+    let continuation = " ".repeat(display_width(&prefix));
+    let description_width = inner_width.saturating_sub(display_width(&prefix)).max(1);
+    wrap_text(description, description_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let keys = if index == 0 {
+                prefix.clone()
+            } else {
+                continuation.clone()
+            };
+            (keys, row)
+        })
+        .collect()
+}
+
 fn render_help(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
     let mut lines = Vec::new();
     for (category, entries) in keymap::HELP {
         lines.push(Line::from(Span::styled(
@@ -243,16 +326,22 @@ fn render_help(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
             theme.accent(),
         )));
         for entry in *entries {
-            lines.push(Line::from(vec![
-                Span::styled(format!("   {:<22}", entry.keys), theme.hotkey()),
-                Span::styled(entry.desc, theme.text()),
-            ]));
+            lines.extend(
+                help_entry_rows(entry.keys, entry.desc, inner_width)
+                    .into_iter()
+                    .map(|(keys, description)| {
+                        Line::from(vec![
+                            Span::styled(keys, theme.hotkey()),
+                            Span::styled(description, theme.text()),
+                        ])
+                    }),
+            );
         }
         lines.push(Line::default());
     }
 
     let desired = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let area = centered(screen, 58, desired);
+    let area = centered(screen, width, desired);
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title("Help", scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
@@ -289,7 +378,7 @@ fn render_about(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 
         body("Run `fwdeck doctor` for your exact upgrade command."),
     ];
     let desired = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let area = centered(screen, 62, desired);
+    let area = centered(screen, text_modal_width(screen), desired);
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title("About", scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
@@ -395,14 +484,9 @@ fn render_palette(
 ) {
     let commands = palette::filtered(state);
     let visible_rows = 12usize;
-    let area = centered(
-        screen,
-        64,
-        u16::try_from(visible_rows + 6).unwrap_or(u16::MAX),
-    );
-    let block = modal(f, theme, area, "Commands");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
+    let title_width = inner_width.saturating_sub(18).max(8);
 
     let mut lines = vec![
         Line::from(vec![
@@ -420,14 +504,15 @@ fn render_palette(
         let is_selected = index == selected;
         let marker = if is_selected { "▸ " } else { "  " };
         let mut spans = vec![Span::styled(marker.to_owned(), theme.accent())];
+        let title: String = command.title.chars().take(title_width).collect();
         match command.availability {
             Availability::Enabled => {
-                spans.push(Span::styled(format!("{:<40}", command.title), theme.text()));
+                spans.push(Span::styled(format!("{title:<title_width$}"), theme.text()));
                 spans.push(Span::styled(command.category.label(), theme.muted()));
             }
             Availability::Disabled(reason) => {
                 spans.push(Span::styled(
-                    format!("{:<40}", command.title),
+                    format!("{title:<title_width$}"),
                     theme.muted(),
                 ));
                 spans.push(Span::styled(reason, theme.warn()));
@@ -449,16 +534,24 @@ fn render_palette(
 
     lines.push(Line::default());
     if let Some(command) = commands.get(selected) {
-        lines.push(Line::from(Span::styled(
-            format!(" {}", command.description),
-            theme.info(),
-        )));
+        lines.extend(
+            wrap_text(command.description, inner_width.saturating_sub(1))
+                .into_iter()
+                .map(|row| Line::from(Span::styled(format!(" {row}"), theme.info()))),
+        );
     }
     lines.push(Line::from(Span::styled(
         " enter run · esc close",
         theme.muted(),
     )));
-    f.render_widget(Paragraph::new(lines), inner);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(screen.height);
+    let area = centered(screen, width, height);
+    let block = modal(f, theme, area, "Commands");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn render_details(
@@ -491,7 +584,7 @@ fn render_details(
     let height = u16::try_from(lines.len() + 2)
         .unwrap_or(u16::MAX)
         .min(screen.height.saturating_sub(2));
-    let area = centered(screen, 68, height);
+    let area = centered(screen, text_modal_width(screen), height);
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title(&content.title, scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
@@ -555,16 +648,26 @@ fn render_rich_builder(
     theme: &Theme,
     screen: Rect,
 ) {
-    let area = centered(screen, 66, 10);
-    let block = modal(f, theme, area, "Rich rule builder");
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
     let (label, example) = builder.prompt();
-    let lines = vec![
-        Line::from(Span::styled(
-            format!(" preview: {}", builder.assemble()),
-            theme.info(),
-        )),
-        Line::default(),
-        Line::from(Span::styled(format!(" {label} — {example}"), theme.muted())),
+    let mut lines: Vec<Line> = wrap_text(
+        &format!("preview: {}", builder.assemble()),
+        inner_width.saturating_sub(1),
+    )
+    .into_iter()
+    .map(|row| Line::from(Span::styled(format!(" {row}"), theme.info())))
+    .collect();
+    lines.push(Line::default());
+    lines.extend(
+        wrap_text(
+            &format!("{label} — {example}"),
+            inner_width.saturating_sub(1),
+        )
+        .into_iter()
+        .map(|row| Line::from(Span::styled(format!(" {row}"), theme.muted()))),
+    );
+    lines.extend([
         Line::from(vec![
             Span::styled(" > ", theme.accent()),
             Span::styled(builder.buffer.clone(), theme.text()),
@@ -575,17 +678,36 @@ fn render_rich_builder(
             " enter next/finish · esc cancel",
             theme.muted(),
         )),
-    ];
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    ]);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(screen.height);
+    let area = centered(screen, width, height);
+    let block = modal(f, theme, area, "Rich rule builder");
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
 }
 
 fn render_confirm(f: &mut Frame, confirmation: &Confirmation, theme: &Theme, screen: Rect) {
-    let height = u16::try_from(confirmation.body.len() + 5).unwrap_or(u16::MAX);
-    let area = centered(screen, 60, height);
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(3));
+    let body: Vec<String> = confirmation
+        .body
+        .iter()
+        .flat_map(|entry| wrap_text(entry, inner_width))
+        .collect();
+    let height = u16::try_from(body.len() + 5)
+        .unwrap_or(u16::MAX)
+        .min(screen.height);
+    let area = centered(screen, width, height);
     let block = modal(f, theme, area, &confirmation.title);
 
     let mut lines: Vec<Line> = vec![Line::default()];
-    for entry in &confirmation.body {
+    for entry in body {
         lines.push(Line::from(Span::styled(format!(" {entry}"), theme.text())));
     }
     lines.push(Line::default());
@@ -612,5 +734,110 @@ fn centered(screen: Rect, width: u16, height: u16) -> Rect {
         y: screen.y + (screen.height.saturating_sub(height)) / 2,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::domain::mock;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn text_modal_width_is_seventy_percent_with_safe_bounds() {
+        assert_eq!(text_modal_width(Rect::new(0, 0, 100, 30)), 70);
+        assert_eq!(text_modal_width(Rect::new(0, 0, 200, 50)), 120);
+        assert_eq!(text_modal_width(Rect::new(0, 0, 40, 20)), 38);
+    }
+
+    #[test]
+    fn help_entry_wraps_under_the_description_column() {
+        let rows = help_entry_rows("u", "roll back last change now (during countdown)", 36);
+
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|(keys, description)| {
+            Line::from(format!("{keys}{description}")).width() <= 36
+        }));
+        assert!(rows[1].0.chars().all(|character| character == ' '));
+        assert_eq!(rows[0].0.len(), rows[1].0.len());
+    }
+
+    #[test]
+    fn wide_help_keeps_the_full_long_description_visible() {
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+
+        terminal
+            .draw(|frame| {
+                render_help(frame, &theme, frame.area(), 0);
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(content.contains("roll back last change now"));
+        assert!(content.contains("during a countdown"));
+    }
+
+    #[test]
+    fn narrow_confirmation_wraps_body_without_hiding_its_suffix_or_actions() {
+        let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let confirmation = Confirmation {
+            title: "Apply staged plan".to_owned(),
+            body: vec![
+                "this deliberately long confirmation description must remain visible".to_owned(),
+            ],
+            on_confirm: UiAction::Quit,
+        };
+
+        terminal
+            .draw(|frame| {
+                render_confirm(frame, &confirmation, &theme, frame.area());
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(content.contains("description must"));
+        assert!(content.contains("remain visible"));
+        assert!(content.contains("confirm"));
+        assert!(content.contains("cancel"));
+    }
+
+    #[test]
+    fn wide_palette_keeps_the_full_selected_description_visible() {
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let mut state = UiState::new(&Config::default(), "testhost".to_owned(), false, None);
+        state.snapshot = Some(std::sync::Arc::new(mock::sample().unwrap()));
+        let palette_state = PaletteState {
+            query: "temporary service".to_owned(),
+            selected: 0,
+        };
+        state.overlays.push(Overlay::Palette(palette_state.clone()));
+
+        terminal
+            .draw(|frame| {
+                render_palette(frame, &state, &palette_state, &theme, frame.area());
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(
+            content.contains("removed automatically after N seconds"),
+            "{content}"
+        );
     }
 }
