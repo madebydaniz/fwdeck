@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::application::ports::{
     FirewallBackend, FirewallError, OperationOutcome, OverviewRead, SnapshotRead, StepReport,
 };
-use crate::application::{RefreshOverview, RefreshPrioritySource};
+use crate::application::{RefreshOverview, RefreshPriority, RefreshPrioritySource};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,7 +27,7 @@ use crate::domain::{
     RefreshObservation, RefreshSection, RefreshSectionObservation, Scoped, ServiceDefinition,
     ServiceName, SnapshotSection, ZoneDetails, ZoneName,
 };
-use detail_priority::{DetailQueue, DetailWork};
+use detail_priority::{DetailBatch, DetailBatchObservation, DetailQueue, DetailWork};
 
 /// Fallback so the browse overlay is never empty if `--get-services` fails.
 use super::process::{CommandOutput, CommandRequest, CommandRunner, DEFAULT_TIMEOUT};
@@ -159,6 +159,18 @@ fn trace_detail_hydration(preferred_details: usize, background_details: usize) {
         preferred_details,
         background_details,
         "refresh detail hydration finished"
+    );
+}
+
+fn trace_detail_batch(priority: &RefreshPriority, batch: &DetailBatch) {
+    let observation = DetailBatchObservation::new(priority, batch);
+    tracing::debug!(
+        zone = ?observation.zone,
+        service = ?observation.service,
+        policy = ?observation.policy,
+        preferred_details = observation.preferred_details,
+        background_details = observation.background_details,
+        "refresh detail batch dispatched"
     );
 }
 
@@ -475,6 +487,7 @@ impl<R: CommandRunner> CliBackend<R> {
         while !queue.is_empty() {
             let latest = priority.latest();
             let batch = queue.take_batch(8, overview, &latest);
+            trace_detail_batch(&latest, &batch);
             preferred_details = preferred_details.saturating_add(batch.preferred_details);
             background_details = background_details.saturating_add(batch.background_details);
             let completed = bounded_fan_out(

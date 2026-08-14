@@ -1,5 +1,5 @@
 use crate::application::{RefreshOverview, RefreshPriority};
-use crate::domain::{ConfigurationTarget, PolicyName, ServiceName};
+use crate::domain::{ConfigurationTarget, PolicyName, ServiceName, ZoneName};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DetailWork {
@@ -41,6 +41,27 @@ pub(super) struct DetailBatch {
     pub(super) work: Vec<DetailWork>,
     pub(super) preferred_details: usize,
     pub(super) background_details: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct DetailBatchObservation<'a> {
+    pub(super) zone: Option<&'a str>,
+    pub(super) service: Option<&'a str>,
+    pub(super) policy: Option<&'a str>,
+    pub(super) preferred_details: usize,
+    pub(super) background_details: usize,
+}
+
+impl<'a> DetailBatchObservation<'a> {
+    pub(super) fn new(priority: &'a RefreshPriority, batch: &DetailBatch) -> Self {
+        Self {
+            zone: priority.zone.as_ref().map(ZoneName::as_str),
+            service: priority.service.as_ref().map(ServiceName::as_str),
+            policy: priority.policy.as_ref().map(PolicyName::as_str),
+            preferred_details: batch.preferred_details,
+            background_details: batch.background_details,
+        }
+    }
 }
 
 impl DetailQueue {
@@ -122,7 +143,7 @@ mod tests {
         ServiceName, ZoneDetails, ZoneName,
     };
 
-    use super::{DetailQueue, DetailWork, order_pending};
+    use super::{DetailBatchObservation, DetailQueue, DetailWork, order_pending};
 
     fn service(name: &str) -> ServiceName {
         ServiceName::parse(name).unwrap()
@@ -272,5 +293,47 @@ mod tests {
         assert_eq!(batch.preferred_details, 2);
         assert_eq!(batch.background_details, 6);
         assert_eq!(batch.work.len(), 8);
+    }
+
+    #[test]
+    fn each_batch_observation_uses_its_latest_hint_and_dispatch_counts() {
+        let overview = fixture_overview();
+        let mut queue = DetailQueue::new(fixture_work());
+        let initial = RefreshPriority {
+            zone: Some(ZoneName::parse("work").unwrap()),
+            service: None,
+            policy: Some(policy("allow-work")),
+        };
+
+        let first = queue.take_batch(8, &overview, &initial);
+        let first_observation = DetailBatchObservation::new(&initial, &first);
+        assert_eq!(
+            first_observation,
+            DetailBatchObservation {
+                zone: Some("work"),
+                service: None,
+                policy: Some("allow-work"),
+                preferred_details: 2,
+                background_details: 6,
+            }
+        );
+
+        let latest = RefreshPriority {
+            zone: Some(ZoneName::parse("dmz").unwrap()),
+            service: Some(service("https")),
+            policy: Some(policy("zulu-policy")),
+        };
+        let second = queue.take_batch(8, &overview, &latest);
+        let second_observation = DetailBatchObservation::new(&latest, &second);
+        assert_eq!(
+            second_observation,
+            DetailBatchObservation {
+                zone: Some("dmz"),
+                service: Some("https"),
+                policy: Some("zulu-policy"),
+                preferred_details: 2,
+                background_details: 3,
+            }
+        );
     }
 }
