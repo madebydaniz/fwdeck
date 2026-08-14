@@ -226,6 +226,9 @@ LogDenied, and live counters (zones, active, denied this session).</li>
 the <code>≠</code> marker means that row differs between runtime and permanent.</li>
 <li><strong>Status bar</strong> — mutation target and the three always-on
 entries: <kbd>:</kbd> palette · <kbd>/</kbd> filter · <kbd>?</kbd> help.</li>
+<li><strong>Dialogs</strong> — text-heavy overlays use the available terminal
+width and wrap long descriptions instead of clipping them. In Help, About, and
+Details, use <kbd>↑</kbd>/<kbd>↓</kbd> when the title shows a scroll indicator.</li>
 </ul>
 </section>
 
@@ -757,7 +760,10 @@ FWDeck then completes a fresh reconciliation before accepting the next change.</
 <p>FWDeck shows status and zone data as soon as the overview stage completes.
 Service and policy details continue loading in the same cancellable refresh;
 only the final complete or explicitly degraded snapshot becomes authoritative
-for validation, snapshots, and exports.</p>
+for validation, snapshots, and exports. The latest selected zone, service, or
+policy reprioritizes detail batches that have not started yet. An active
+subprocess is allowed to finish, so changing selection does not create a
+cancellation storm or a second backend owner.</p>
 <p>Retention runs at startup and after new state is written. It only removes
 regular files with FWDeck-generated names; symlinks, imported snapshots, and
 unknown files are ignored. Preview the exact plan before applying it:</p>
