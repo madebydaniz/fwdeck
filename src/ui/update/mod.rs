@@ -716,12 +716,12 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                         state.session_baseline = Some(std::sync::Arc::clone(&snapshot));
                     }
                     state.snapshot = Some(snapshot);
-                    reconcile_selection(state, selected);
                 }
                 // Keep the stale snapshot: outdated data plus a visible error
                 // beats an empty screen.
                 Err(error) => state.backend_error = Some(error),
             }
+            reconcile_selection(state, selected);
         }
         UiAction::RefreshCancelled { schedule, .. } => {
             if state.active_refresh == Some(schedule.id) {
@@ -2082,6 +2082,53 @@ mod tests {
     }
 
     #[test]
+    fn preview_only_cross_zone_row_activation_reports_loading_details() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(3);
+        let work = ZoneName::parse("work").unwrap();
+        let port = "42424/tcp".parse().unwrap();
+        let mut overview = refresh_overview();
+        overview.default_zone = work.clone();
+        overview.runtime.get_mut(&work).unwrap().ports.push(port);
+        state.view = ViewId::Ports;
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+        state.view_state_mut().selected = state
+            .visible_rows()
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.id,
+                    RowId::Port { zone, port: row_port }
+                        if zone == &work && row_port == &port
+                )
+            })
+            .unwrap();
+
+        update(&mut state, UiAction::ActivateRow);
+
+        assert!(!matches!(state.overlays.last(), Some(Overlay::Details(_))));
+        assert!(
+            state
+                .toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("loading details"))
+        );
+    }
+
+    #[test]
     fn preview_port_rows_replace_the_stale_authoritative_rows() {
         let mut state = state();
         let id = crate::application::RefreshId::new(3);
@@ -2241,6 +2288,74 @@ mod tests {
         assert_eq!(s.active_refresh, None);
         assert!(s.snapshot.is_some(), "stale data must survive an error");
         assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
+    }
+
+    #[test]
+    fn refresh_error_reconciles_reordered_preview_selection_marks_and_priority() {
+        use crate::application::ports::FirewallError;
+
+        let mut state = state();
+        state.view = ViewId::Zones;
+        let id = crate::application::RefreshId::new(3);
+        let public = ZoneName::parse("public").unwrap();
+        let preview_only = ZoneName::parse("aaa-preview").unwrap();
+        let public_row = RowId::Zone(public.clone());
+        let preview_only_row = RowId::Zone(preview_only.clone());
+        let mut overview = refresh_overview();
+        overview.runtime.insert(
+            preview_only.clone(),
+            crate::domain::ZoneDetails::empty(preview_only.clone()),
+        );
+        overview.permanent.insert(
+            preview_only.clone(),
+            crate::domain::ZoneDetails::empty(preview_only),
+        );
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+        state.view_state_mut().selected = state
+            .visible_rows()
+            .iter()
+            .position(|row| row.id == public_row)
+            .unwrap();
+        state
+            .view_state_mut()
+            .marked
+            .extend([public_row.clone(), preview_only_row.clone()]);
+
+        update(
+            &mut state,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(id, crate::application::RefreshTrigger::Periodic),
+                result: Err(FirewallError::DaemonNotRunning),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::ZERO,
+                ),
+            },
+        );
+
+        assert_eq!(selected_row_id(&state), Some(public_row.clone()));
+        assert_eq!(
+            state
+                .view_state()
+                .marked
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![public_row]
+        );
+        assert_eq!(state.refresh_priority().zone, Some(public));
     }
 
     #[test]

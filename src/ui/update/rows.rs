@@ -8,7 +8,7 @@ use crate::ui::action::{Effect, UiAction};
 use crate::ui::details;
 use crate::ui::overlays::{FormKind, Overlay};
 use crate::ui::state::{ToastKind, UiState};
-use crate::ui::views::{RowId, ViewId, ViewRow};
+use crate::ui::views::{self, RowId, ViewId, ViewRow};
 
 use super::{blocked_read_only, request_operation, selected_row, target_for_scope, update};
 
@@ -70,28 +70,60 @@ fn zone_for_iface(snapshot: &FirewallSnapshot, iface: Option<&str>) -> Option<Zo
 pub(super) fn activate_row(state: &mut UiState) {
     if state.view == ViewId::Zones {
         let rows = state.visible_rows();
-        let Some(RowId::Zone(zone)) = rows.get(state.view_state().selected).map(|row| &row.id)
+        let Some(RowId::Zone(zone)) = rows
+            .get(state.view_state().selected)
+            .map(|row| row.id.clone())
         else {
             return;
         };
         state.selected_zone = Some(zone.clone());
         // Enter selects the zone AND opens its overview.
         if let Some(snapshot) = state.snapshot.clone()
-            && let Some(content) = details::for_zone(&snapshot, zone)
+            && let Some(content) = details::for_zone(&snapshot, &zone)
         {
             state.overlays.push(Overlay::Details(content));
+        } else if state.matching_refresh_overview().is_some() {
+            state.toast(ToastKind::Info, "loading details");
         }
         return;
     }
 
+    let rows = state.visible_rows();
+    let Some(selected) = rows.get(state.view_state().selected).cloned() else {
+        return;
+    };
     let content = state.snapshot.clone().and_then(|snapshot| {
-        let zone = state.effective_zone()?;
-        let rows = state.visible_rows();
-        let row = rows.get(state.view_state().selected)?;
-        details::for_row(state.view, &snapshot, &zone, row)
+        let zone = row_zone(&selected.id)
+            .cloned()
+            .or_else(|| state.effective_zone())?;
+        let row = if state.view == ViewId::Logs {
+            selected
+        } else {
+            views::rows(state.view, &snapshot, &zone, state.config_view)
+                .into_iter()
+                .find(|row| row.id == selected.id)?
+        };
+        details::for_row(state.view, &snapshot, &zone, &row)
     });
     if let Some(content) = content {
         state.overlays.push(Overlay::Details(content));
+    } else if state.matching_refresh_overview().is_some() {
+        state.toast(ToastKind::Info, "loading details");
+    }
+}
+
+fn row_zone(id: &RowId) -> Option<&ZoneName> {
+    match id {
+        RowId::Zone(zone)
+        | RowId::Service { zone, .. }
+        | RowId::Port { zone, .. }
+        | RowId::Forwarding { zone, .. }
+        | RowId::RichRule { zone, .. }
+        | RowId::Interface { zone, .. }
+        | RowId::Source { zone, .. } => Some(zone),
+        RowId::IpSet { .. } | RowId::Policy { .. } | RowId::Direct { .. } | RowId::Log { .. } => {
+            None
+        }
     }
 }
 
