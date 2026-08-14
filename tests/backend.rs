@@ -10,9 +10,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fwdeck::application::ports::{FirewallBackend, FirewallError, OperationOutcome};
-use fwdeck::application::refresh_priority_channel;
+use fwdeck::application::{RefreshPriority, refresh_priority_channel};
 use fwdeck::domain::{
-    ConfigurationTarget, FirewallOperation, RefreshSection, ServiceName, SnapshotSection, ZoneName,
+    ConfigurationTarget, FirewallOperation, PolicyName, RefreshSection, ServiceName,
+    SnapshotSection, ZoneName,
 };
 use fwdeck::infrastructure::firewalld::CliBackend;
 use fwdeck::infrastructure::process::{
@@ -176,13 +177,15 @@ impl CommandRunner for StagedFixtureRunner {
                 DIRECT_RULES.to_owned()
             }
             [services] if services == "--get-services" => "ssh http https\n".to_owned(),
-            [policies] if policies == "--get-policies" => "fwdeck-fixture\n".to_owned(),
-            [policy] if policy == "--info-policy=fwdeck-fixture" => INFO_POLICY.to_owned(),
+            [policies] if policies == "--get-policies" => {
+                "alpha-policy fwdeck-fixture\n".to_owned()
+            }
+            [policy] if policy.starts_with("--info-policy=") => INFO_POLICY.to_owned(),
             [permanent, policies] if permanent == "--permanent" && policies == "--get-policies" => {
-                "fwdeck-fixture\n".to_owned()
+                "alpha-policy fwdeck-fixture\n".to_owned()
             }
             [permanent, policy]
-                if permanent == "--permanent" && policy == "--info-policy=fwdeck-fixture" =>
+                if permanent == "--permanent" && policy.starts_with("--info-policy=") =>
             {
                 INFO_POLICY.to_owned()
             }
@@ -229,8 +232,8 @@ async fn staged_cli_read_returns_zone_overview_before_background_details() {
 
     let hydration = backend.snapshot_hydrated(Some(overview), &priority);
     tokio::pin!(hydration);
-    control.wait_for_background_detail().await;
     assert!(futures_util::poll!(&mut hydration).is_pending());
+    control.wait_for_background_detail().await;
     control.release_background_detail();
     assert!(hydration.await.result.is_ok());
 }
@@ -247,6 +250,7 @@ async fn staged_cli_final_snapshot_matches_complete_snapshot() {
         .unwrap();
     let hydration = staged_backend.snapshot_hydrated(Some(overview), &priority);
     tokio::pin!(hydration);
+    assert!(futures_util::poll!(&mut hydration).is_pending());
     staged_control.wait_for_background_detail().await;
     staged_control.release_background_detail();
     let staged = hydration.await.result.unwrap();
@@ -256,6 +260,41 @@ async fn staged_cli_final_snapshot_matches_complete_snapshot() {
     let complete = complete_backend.snapshot().await.unwrap();
 
     assert_eq!(staged, complete);
+}
+
+#[tokio::test]
+async fn staged_priority_changes_only_reorder_unstarted_details() {
+    let (backend, control) = staged_backend_fixture();
+    let (publisher, priority) = refresh_priority_channel();
+    let overview = backend
+        .snapshot_overview(&priority)
+        .await
+        .result
+        .unwrap()
+        .unwrap();
+    let hydration = backend.snapshot_hydrated(Some(overview), &priority);
+    tokio::pin!(hydration);
+
+    assert!(futures_util::poll!(&mut hydration).is_pending());
+    control.wait_for_background_detail().await;
+    assert_eq!(
+        control.detail_commands().len(),
+        8,
+        "only the active bounded batch may start before its gate opens"
+    );
+    let first_batch = control.detail_commands();
+    publisher.publish(RefreshPriority {
+        zone: None,
+        service: None,
+        policy: Some(PolicyName::parse("fwdeck-fixture").unwrap()),
+    });
+    control.release_background_detail();
+
+    assert!(hydration.await.result.is_ok());
+    let details = control.detail_commands();
+    assert_eq!(details.len(), 12);
+    assert_eq!(&details[..8], first_batch.as_slice());
+    assert_eq!(details[8], vec!["--info-policy=fwdeck-fixture"]);
 }
 
 #[tokio::test]
@@ -276,8 +315,8 @@ async fn snapshot_issues_exact_commands_in_order() {
     runner.push_ok(DIRECT_RULES);
     runner.push_ok("ssh http https\n"); // --get-services
     runner.push_ok("fwdeck-fixture\n");
-    runner.push_ok(INFO_POLICY);
     runner.push_ok("fwdeck-fixture\n");
+    runner.push_ok(INFO_POLICY);
     runner.push_ok(INFO_POLICY);
     // One --info-service per referenced service (sorted union across configs).
     for _ in 0..7 {
@@ -309,8 +348,8 @@ async fn snapshot_issues_exact_commands_in_order() {
             vec!["--direct".to_owned(), "--get-all-rules".to_owned()],
             vec!["--get-services".to_owned()],
             vec!["--get-policies".to_owned()],
-            vec!["--info-policy=fwdeck-fixture".to_owned()],
             vec!["--permanent".to_owned(), "--get-policies".to_owned()],
+            vec!["--info-policy=fwdeck-fixture".to_owned()],
             vec![
                 "--permanent".to_owned(),
                 "--info-policy=fwdeck-fixture".to_owned(),
