@@ -3,6 +3,15 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.5.1](https://github.com/madebydaniz/fwdeck/compare/v0.5.0...v0.5.1) (2026-08-15)
+
+
+### Documentation
+
+* **main:** publish repository cleanup ([#55](https://github.com/madebydaniz/fwdeck/issues/55)) ([3aa8d46](https://github.com/madebydaniz/fwdeck/commit/3aa8d46f8de314aca71fdfa83330d9ca375ff93d))
+* **repo:** consolidate public project documentation ([a09dcc4](https://github.com/madebydaniz/fwdeck/commit/a09dcc41cab017a53edb7c1ff6063776e43df70f))
+* **repo:** consolidate public project documentation ([#54](https://github.com/madebydaniz/fwdeck/issues/54)) ([70c1824](https://github.com/madebydaniz/fwdeck/commit/70c18243c6d4b21c61d677df41b5e4ca7b96b775))
+
 ## [0.5.0](https://github.com/madebydaniz/fwdeck/compare/v0.4.0...v0.5.0) (2026-08-15)
 
 
