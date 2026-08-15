@@ -220,9 +220,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "clap"
-version = "4.6.4"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d91e0c145792ef73a6ad36d27c75ac09f1832222a3c209689d90f534685ee5b7"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -230,9 +230,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.2"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -242,9 +242,9 @@ dependencies = [
 
 [[package]]
 name = "clap_complete"
-version = "4.6.7"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db8b397918185f0161ff3d6fcaa9e4bfc09b8367caf6e1d4a2848e5477ed027b"
+checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
 dependencies = [
  "clap",
 ]
@@ -269,9 +269,9 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clap_mangen"
-version = "0.3.0"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d82842b45bf9f6a3be090dd860095ac30728042c08e0d6261ca7259b5d850f07"
+checksum = "c630ddc90572b3d9abd3f887f0007b4e048faf5c5a59ae607f8ac1c5e3790873"
 dependencies = [
  "clap",
  "roff",
@@ -709,7 +709,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "toml",
  "tracing",
@@ -873,7 +873,7 @@ checksum = "bde5057d6143cc94e861d90f591b9303d6716c6b9602309150bd068853c10899"
 dependencies = [
  "hashbrown 0.16.1",
  "portable-atomic",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1367,7 +1367,7 @@ dependencies = [
  "palette",
  "serde",
  "strum",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width",
@@ -1453,7 +1453,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1845,11 +1845,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl 2.0.19",
+ "thiserror-impl 2.0.20",
 ]
 
 [[package]]
@@ -1865,9 +1865,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1934,9 +1934,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.3+spec-1.1.0"
+version = "1.1.4+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53c96ecdfa941c8fc4fcaed14f99ada8ebed502eef533015095a07e3301d4c3c"
+checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -1970,9 +1970,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.2+spec-1.1.0"
+version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
+checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
  "winnow",
 ]
