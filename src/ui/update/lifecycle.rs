@@ -1,8 +1,8 @@
 //! Operation outcomes: audit recording, result toasts, and the rollback
 //! dead-man's switch (arm, fire).
 
+use crate::application::api::RollbackRegistration;
 use crate::application::ports::OperationOutcome;
-use crate::domain::FirewallOperation;
 use crate::ui::action::Effect;
 use crate::ui::details;
 use crate::ui::overlays::Overlay;
@@ -12,6 +12,38 @@ pub(super) fn operation_finished(
     state: &mut UiState,
     op_id: u64,
     outcome: OperationOutcome,
+    mut rollback: Option<RollbackRegistration>,
+    guard_warning: Option<String>,
+    is_forward_operation: bool,
+) -> Vec<Effect> {
+    let risky = is_forward_operation
+        && state.rollback_ticks != 0
+        && outcome.operation().connectivity_warning().is_some();
+    let missing_reservation = risky && !super::consume_rollback_reservation(state);
+    if missing_reservation {
+        state.toast(
+            ToastKind::Error,
+            "internal error: risky operation finished without a rollback reservation",
+        );
+    }
+    let emergency_rollback = missing_reservation.then(|| rollback.take()).flatten();
+    let mut effects = record_operation_finished(state, op_id, outcome, rollback, guard_warning);
+    if let Some(rollback) = emergency_rollback {
+        effects.push(Effect::ApplyRollback {
+            id: rollback.id,
+            operation: rollback.inverse,
+            watchdog_unit: rollback.watchdog_unit,
+        });
+    }
+    effects
+}
+
+fn record_operation_finished(
+    state: &mut UiState,
+    op_id: u64,
+    outcome: OperationOutcome,
+    rollback: Option<RollbackRegistration>,
+    guard_warning: Option<String>,
 ) -> Vec<Effect> {
     state.push_audit(crate::ui::state::AuditEntry {
         tick: state.tick,
@@ -25,16 +57,16 @@ pub(super) fn operation_finished(
         },
         error: outcome.first_error().map(ToString::to_string),
     });
-    // The rollback is pre-armed before the apply (see `pre_arm_rollback`), so
-    // this only reacts to the outcome — it never arms.
     let mut effects = Vec::new();
+    if let Some(warning) = guard_warning {
+        state.toast(ToastKind::Warning, warning);
+    }
     match &outcome {
         OperationOutcome::Applied { operation, .. } => {
             state.toast(ToastKind::Success, operation.success_message());
             // Queue for postcondition verification — every applied op in a
             // plan is checked, not just the last.
             state.verify_next_refresh.push(operation.clone());
-            // The change landed: the pre-armed countdown and watchdog stand.
         }
         OperationOutcome::PartiallyApplied { .. } => {
             state.toast(
@@ -44,11 +76,11 @@ pub(super) fn operation_finished(
             state
                 .overlays
                 .push(Overlay::Details(details::for_outcome(&outcome)));
-            // Runtime changed → keep the rollback armed so the operator can revert.
         }
         OperationOutcome::Indeterminate { .. } => {
             // A timeout is not a failure: the change may have landed after
-            // the response was lost. Never auto-retry, never auto-invert.
+            // the response was lost. Never auto-retry the forward mutation;
+            // retain its pre-armed, idempotent connectivity rollback.
             state.toast(
                 ToastKind::Warning,
                 "OUTCOME UNKNOWN (timeout) — refreshing; verify before retrying",
@@ -56,9 +88,8 @@ pub(super) fn operation_finished(
             state
                 .overlays
                 .push(Overlay::Details(details::for_outcome(&outcome)));
-            // The change MAY have landed → keep the rollback armed, don't retract.
         }
-        OperationOutcome::Failed { operation, .. } => {
+        OperationOutcome::Failed { .. } => {
             let message = outcome
                 .first_error()
                 .map_or_else(|| "operation failed".to_owned(), ToString::to_string);
@@ -66,134 +97,24 @@ pub(super) fn operation_finished(
             state
                 .overlays
                 .push(Overlay::Details(details::for_outcome(&outcome)));
-            // A clean failure applied nothing, so a pre-armed watchdog would
-            // fire an inverse against an unchanged firewall — retract it.
-            effects.extend(retract_pending_rollback(state, operation));
         }
     }
-    // Start the countdown now that the apply has landed (applied, partial, or
-    // indeterminate — all mean the change may be live). A clean failure applied
-    // nothing and was retracted above, so it is skipped.
-    if !matches!(outcome, OperationOutcome::Failed { .. }) {
-        start_countdown(state, outcome.operation());
+    if !matches!(outcome, OperationOutcome::Failed { .. })
+        && let Some(rollback) = rollback
+    {
+        state
+            .pending_rollback
+            .push(crate::ui::state::PendingRollback {
+                id: rollback.id,
+                forward: outcome.operation().clone(),
+                inverse: rollback.inverse,
+                deadline_tick: state.tick.saturating_add(state.rollback_ticks),
+                description: outcome.operation().describe(),
+                watchdog_unit: rollback.watchdog_unit,
+            });
     }
     // The durable JSONL write happens in the shell, not the reducer.
     effects.push(Effect::RecordAudit { op_id, outcome });
-    effects
-}
-
-/// Starts the countdown for an armed rollback whose apply has just landed: sets
-/// its deadline relative to *now*, so the window is the operator's confirmation
-/// time and excludes apply round-trip latency. No-op if nothing matches.
-fn start_countdown(state: &mut UiState, operation: &FirewallOperation) {
-    let deadline = state.tick + state.rollback_ticks;
-    for pending in &mut state.pending_rollback {
-        if &pending.forward == operation && pending.deadline_tick == u64::MAX {
-            pending.deadline_tick = deadline;
-        }
-    }
-}
-
-/// Pre-arms the dead-man's switch for a risky, reversible operation **before**
-/// it is applied. Arming first is the whole point: if the process is killed
-/// mid-apply, the out-of-process watchdog still fires the inverse — and the
-/// inverse restores the pre-apply state, which is exactly where we still are if
-/// the apply never landed. The caller dispatches the returned effect (an
-/// `ArmWatchdog`, if systemd is usable) ahead of `Effect::Apply`.
-pub(super) fn pre_arm_rollback(state: &mut UiState, operation: &FirewallOperation) -> Vec<Effect> {
-    pre_arm_rollback_at(state, operation, 0)
-}
-
-/// Pre-arms the dead-man's switch for every connectivity-affecting operation in
-/// a staged plan / restore / bulk delete — each with its own watchdog unit — so
-/// the multi-change flows most likely to cut a remote admin off get the same
-/// safety net as a single operation.
-pub(super) fn pre_arm_plan_rollbacks(
-    state: &mut UiState,
-    operations: &[FirewallOperation],
-) -> Vec<Effect> {
-    let mut effects = Vec::new();
-    for (index, operation) in operations.iter().enumerate() {
-        effects.extend(pre_arm_rollback_at(state, operation, index));
-    }
-    effects
-}
-
-fn pre_arm_rollback_at(
-    state: &mut UiState,
-    operation: &FirewallOperation,
-    index: usize,
-) -> Vec<Effect> {
-    if state.rollback_ticks == 0 {
-        return Vec::new();
-    }
-    if operation.connectivity_warning().is_none() {
-        return Vec::new();
-    }
-    let Some(inverse) = operation.inverse() else {
-        return Vec::new();
-    };
-    // The out-of-process net fires with a grace margin after the in-process
-    // deadline (which disarms it on the happy path first).
-    let delay_secs = state.rollback_ticks / 4 + 15;
-    // The index keeps units unique when a whole plan arms at the same tick.
-    let unit = format!(
-        "fwdeck-rollback-{}-{}-{}",
-        std::process::id(),
-        state.tick,
-        index
-    );
-    // The watchdog restores RUNTIME connectivity: a single command, and exactly
-    // the scope that can lock you out. (The in-process `inverse` above also
-    // reverts the permanent config; the watchdog deliberately does not.)
-    //
-    // The in-process and out-of-process reverts can both fire in a narrow
-    // window (the design fails toward connectivity). The runtime inverse MUST
-    // therefore stay idempotent — re-applying it after it already ran is a
-    // harmless no-op, never an error — so a double-fire cannot do damage.
-    let args = operation.inverse_runtime().and_then(|runtime_inverse| {
-        crate::infrastructure::firewalld::command::plan(
-            &runtime_inverse,
-            crate::infrastructure::process::DEFAULT_TIMEOUT,
-        )
-        .into_iter()
-        .next()
-        .map(|planned| planned.request.args)
-    });
-    let effect = args.map(|args| Effect::ArmWatchdog {
-        unit: unit.clone(),
-        delay_secs,
-        args,
-    });
-    state
-        .pending_rollback
-        .push(crate::ui::state::PendingRollback {
-            forward: operation.clone(),
-            inverse,
-            // Countdown not started yet: `operation_finished` sets the real
-            // deadline once the apply lands, so the window is the operator's
-            // confirmation time and does not include apply round-trip latency.
-            deadline_tick: u64::MAX,
-            description: operation.describe(),
-            watchdog_unit: effect.is_some().then_some(unit),
-        });
-    effect.into_iter().collect()
-}
-
-/// Retracts a pre-armed rollback whose operation did not apply: drops the
-/// pending entry and disarms its watchdog so no stale inverse can fire.
-fn retract_pending_rollback(state: &mut UiState, operation: &FirewallOperation) -> Vec<Effect> {
-    let mut effects = Vec::new();
-    state.pending_rollback.retain(|pending| {
-        if &pending.forward == operation {
-            if let Some(unit) = &pending.watchdog_unit {
-                effects.push(Effect::DisarmWatchdog { unit: unit.clone() });
-            }
-            false
-        } else {
-            true
-        }
-    });
     effects
 }
 
@@ -238,11 +159,11 @@ fn fire_pending(
             ToastKind::Warning,
             format!("rolling back: {}", pending.description),
         );
-        // We are handling it in-process — the watchdog must not double-fire.
-        if let Some(unit) = pending.watchdog_unit {
-            effects.push(Effect::DisarmWatchdog { unit });
-        }
-        effects.push(Effect::Apply(pending.inverse));
+        effects.push(Effect::ApplyRollback {
+            id: pending.id,
+            operation: pending.inverse,
+            watchdog_unit: pending.watchdog_unit,
+        });
     }
     effects
 }

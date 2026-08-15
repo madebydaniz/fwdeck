@@ -7,7 +7,7 @@
 # (EL9, firewalld 1.x), or debian:13 (trixie, firewalld 2.3.x). Package names
 # differ between families, so the RUN below branches on the package manager.
 ARG BASE_IMAGE=fedora:44
-FROM ${BASE_IMAGE}
+FROM ${BASE_IMAGE} AS base
 
 RUN if command -v dnf >/dev/null; then \
         dnf install -y \
@@ -47,3 +47,11 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["bash"]
+
+FROM base AS coverage
+
+ARG CARGO_LLVM_COV_VERSION=0.8.7
+RUN rustup component add llvm-tools-preview \
+    && cargo install cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}" --locked
+
+FROM base AS dev

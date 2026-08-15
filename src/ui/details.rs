@@ -3,9 +3,13 @@
 //! error diagnostics with recovery hints.
 
 use crate::application::ports::{FirewallError, OperationOutcome};
-use crate::domain::{FirewallOperation, FirewallSnapshot, ZoneName};
+use crate::domain::{
+    ConfigurationTarget, FeatureSupport, FirewallOperation, FirewallSnapshot, FirewalldFeature,
+    PolicyDependencyGraph, PolicyDependencyResource, PolicySetDetails, SnapshotSection, ZoneName,
+    translate_direct_rule,
+};
 
-use super::views::ViewId;
+use super::views::{RowId, ViewId, ViewRow};
 
 /// Read-only rendering of live nftables rule-hit counters, busiest chain first.
 /// An empty list is normal — firewalld only counters some rules.
@@ -225,20 +229,21 @@ fn drift_services(
     drift_line(lines, "services", runtime, permanent, render);
 }
 
-/// Details for the selected row of the current view. The row's cells are the
-/// lookup keys — the same identity the table itself displays.
+/// Details for the selected typed row of the current view.
 #[must_use]
 pub fn for_row(
     view: ViewId,
     snapshot: &FirewallSnapshot,
     zone: &ZoneName,
-    row: &[String],
+    row: &ViewRow,
 ) -> Option<DetailsContent> {
     let cell = |index: usize| row.get(index).cloned().unwrap_or_default();
     match view {
         ViewId::Zones => {
-            let name = ZoneName::parse(row.first()?).ok()?;
-            for_zone(snapshot, &name)
+            let RowId::Zone(name) = &row.id else {
+                return None;
+            };
+            for_zone(snapshot, name)
         }
         ViewId::Services => Some(DetailsContent {
             title: format!("Service `{}`", cell(0)),
@@ -263,13 +268,9 @@ pub fn for_row(
             ],
         }),
         ViewId::RichRules => {
-            // Column 3 carries the verbatim rule — the row's identity.
-            let raw = row.get(3)?;
-            let details = snapshot
-                .runtime
-                .get(zone)
-                .or_else(|| snapshot.permanent.get(zone))?;
-            let rule = details.rich_rules.iter().find(|r| r.as_str() == raw)?;
+            let RowId::RichRule { rule, .. } = &row.id else {
+                return None;
+            };
             Some(DetailsContent {
                 title: "Rich rule".to_owned(),
                 lines: vec![
@@ -290,34 +291,18 @@ pub fn for_row(
             lines: vec![line("family", cell(1)), line("zone", cell(2))],
         }),
         ViewId::IpSets => {
-            let name = crate::domain::IpSetName::parse(row.first()?).ok()?;
-            let info = snapshot.ipsets.get(&name)?;
-            let mut lines = vec![line("type", info.kind.clone())];
-            if info.entries.is_empty() {
-                lines.push(line("entries", "none"));
-            }
-            for entry in &info.entries {
-                lines.push(line("entry", entry.clone()));
-            }
-            Some(DetailsContent {
-                title: format!("IPSet `{name}`"),
-                lines,
-            })
+            let RowId::IpSet { name } = &row.id else {
+                return None;
+            };
+            ipset_details(snapshot, name, row.scope()?)
         }
-        ViewId::Direct => Some(DetailsContent {
-            title: "Direct rule (deprecated)".to_owned(),
-            lines: vec![
-                line("family", cell(0)),
-                line("table", cell(1)),
-                line("chain", cell(2)),
-                line("priority", cell(3)),
-                line("args", cell(4)),
-                line(
-                    "note",
-                    "direct rules are deprecated in firewalld — prefer rich rules or policies",
-                ),
-            ],
-        }),
+        ViewId::Policies => {
+            let RowId::Policy { name } = &row.id else {
+                return None;
+            };
+            policy_details(snapshot, name)
+        }
+        ViewId::Direct => direct_rule_details(row),
         ViewId::Logs => Some(DetailsContent {
             title: "Log entry".to_owned(),
             lines: vec![
@@ -331,6 +316,191 @@ pub fn for_row(
             ],
         }),
     }
+}
+
+fn direct_rule_details(row: &ViewRow) -> Option<DetailsContent> {
+    let cell = |index: usize| row.cells().get(index).map_or("", String::as_str);
+    let mut lines = vec![
+        line("family", cell(0)),
+        line("table", cell(1)),
+        line("chain", cell(2)),
+        line("priority", cell(3)),
+        line("args", cell(4)),
+        line(
+            "note",
+            "direct rules are deprecated in firewalld — prefer rich rules or policies",
+        ),
+    ];
+    let RowId::Direct { rule, .. } = &row.id else {
+        return None;
+    };
+    match translate_direct_rule(rule) {
+        Ok(translation) => {
+            lines.push(line("migration", "conservative policy candidate available"));
+            lines.push(line(
+                "direction",
+                format!(
+                    "{}: {} → {}",
+                    translation.chain.as_str(),
+                    translation.chain.ingress_zone(),
+                    translation.chain.egress_zone()
+                ),
+            ));
+            lines.push(line("rich rule", translation.rich_rule.as_str()));
+            lines.push(line(
+                "next",
+                "press `a` or use the palette; the direct rule remains until manual retirement",
+            ));
+        }
+        Err(err) => {
+            lines.push(line("migration", "manual review required"));
+            lines.push(line("reason", err.to_string()));
+        }
+    }
+    Some(DetailsContent {
+        title: "Direct rule (deprecated)".to_owned(),
+        lines,
+    })
+}
+
+fn policy_details(
+    snapshot: &FirewallSnapshot,
+    name: &crate::domain::PolicyName,
+) -> Option<DetailsContent> {
+    let runtime = snapshot.policies.runtime.get(name);
+    let permanent = snapshot.policies.permanent.get(name);
+    if runtime.is_none() && permanent.is_none() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    match (runtime, permanent) {
+        (Some(runtime), Some(permanent)) if runtime.configuration_eq(permanent) => {
+            append_policy_configuration(&mut lines, "both", runtime);
+        }
+        (Some(runtime), Some(permanent)) => {
+            append_policy_configuration(&mut lines, "runtime (drift)", runtime);
+            append_policy_configuration(&mut lines, "permanent (drift)", permanent);
+        }
+        (Some(runtime), None) => append_policy_configuration(&mut lines, "runtime", runtime),
+        (None, Some(permanent)) => {
+            append_policy_configuration(&mut lines, "permanent", permanent);
+        }
+        (None, None) => {}
+    }
+
+    let missing = match (runtime, permanent) {
+        (Some(runtime), Some(permanent)) if runtime.configuration_eq(permanent) => {
+            super::views::policy_dependency_issues(snapshot, runtime)
+        }
+        (Some(runtime), Some(permanent)) => {
+            super::views::policy_dependency_issues(snapshot, runtime)
+                .into_iter()
+                .map(|issue| format!("runtime {issue}"))
+                .chain(
+                    super::views::policy_dependency_issues(snapshot, permanent)
+                        .into_iter()
+                        .map(|issue| format!("permanent {issue}")),
+                )
+                .collect()
+        }
+        (Some(runtime), None) => super::views::policy_dependency_issues(snapshot, runtime),
+        (None, Some(permanent)) => super::views::policy_dependency_issues(snapshot, permanent),
+        (None, None) => Vec::new(),
+    };
+    lines.push(line(
+        "dependencies",
+        if missing.is_empty() {
+            "all referenced zones/services are known".to_owned()
+        } else {
+            format!("missing: {}", missing.join(", "))
+        },
+    ));
+
+    Some(DetailsContent {
+        title: format!("Policy `{name}`"),
+        lines,
+    })
+}
+
+fn append_policy_configuration(
+    lines: &mut Vec<(String, String)>,
+    scope: &str,
+    policy: &crate::domain::PolicyDetails,
+) {
+    lines.push(line("configuration", scope));
+    lines.push(line(
+        "state",
+        if policy.disabled {
+            "disabled"
+        } else if policy.active {
+            "active"
+        } else {
+            "inactive"
+        },
+    ));
+    lines.push(line("priority", policy.priority.to_string()));
+    lines.push(line("target", policy.target.as_str()));
+    lines.push(line(
+        "flow",
+        format!(
+            "{} → {}",
+            join(&policy.ingress_zones),
+            join(&policy.egress_zones)
+        ),
+    ));
+    lines.push(line("services", join(&policy.services)));
+    lines.push(line("ports", join(&policy.ports)));
+    lines.push(line("protocols", join(&policy.protocols)));
+    lines.push(line("source ports", join(&policy.source_ports)));
+    let forward_ports: Vec<_> = policy
+        .forward_ports
+        .iter()
+        .map(crate::domain::ForwardPort::spec_string)
+        .collect();
+    lines.push(line("forward ports", join(&forward_ports)));
+    lines.push(line("icmp blocks", join(&policy.icmp_blocks)));
+    lines.push(line(
+        "masquerade",
+        if policy.masquerade { "yes" } else { "no" },
+    ));
+    for rule in &policy.rich_rules {
+        lines.push(line("rich rule", rule.as_str()));
+    }
+}
+
+fn ipset_details(
+    snapshot: &FirewallSnapshot,
+    name: &crate::domain::IpSetName,
+    scope: crate::ui::views::Scope,
+) -> Option<DetailsContent> {
+    let runtime = snapshot.ipsets.runtime.get(name);
+    let permanent = snapshot.ipsets.permanent.get(name);
+    let info = runtime.or(permanent)?;
+    let mut lines = vec![
+        line("type", info.kind.clone()),
+        line("scope", scope.as_str()),
+    ];
+    if runtime.is_none_or(|value| value.entries.is_empty()) {
+        lines.push(line("runtime entries", "none"));
+    }
+    if let Some(runtime) = runtime {
+        for entry in &runtime.entries {
+            lines.push(line("runtime entry", entry.clone()));
+        }
+    }
+    if permanent.is_none_or(|value| value.entries.is_empty()) {
+        lines.push(line("permanent entries", "none"));
+    }
+    if let Some(permanent) = permanent {
+        for entry in &permanent.entries {
+            lines.push(line("permanent entry", entry.clone()));
+        }
+    }
+    Some(DetailsContent {
+        title: format!("IPSet `{name}`"),
+        lines,
+    })
 }
 
 /// Post-execution operation report: one line per step with the exact
@@ -379,40 +549,252 @@ pub fn for_outcome(outcome: &OperationOutcome) -> DetailsContent {
 #[must_use]
 pub fn policy_browse(snapshot: &FirewallSnapshot) -> DetailsContent {
     let mut lines: Vec<(String, String)> = Vec::new();
-    if snapshot.policies.is_empty() {
+    let mut names: Vec<_> = snapshot
+        .policies
+        .runtime
+        .keys()
+        .chain(snapshot.policies.permanent.keys())
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
         lines.push(("policies".to_owned(), "none defined".to_owned()));
     }
-    for (name, policy) in &snapshot.policies {
-        lines.push((name.to_string(), String::new()));
-        lines.push((String::new(), format!("target: {}", policy.target.as_str())));
-        lines.push((
-            String::new(),
-            format!(
-                "ingress: {} → egress: {}",
-                join(&policy.ingress_zones),
-                join(&policy.egress_zones)
-            ),
-        ));
-        if !policy.services.is_empty() {
+    let mut add_policy =
+        |name: &crate::domain::PolicyName, scope: &str, policy: &crate::domain::PolicyDetails| {
+            lines.push((format!("{name} [{scope}]"), String::new()));
+            lines.push((String::new(), format!("target: {}", policy.target.as_str())));
             lines.push((
                 String::new(),
-                format!("services: {}", join(&policy.services)),
+                format!(
+                    "ingress: {} → egress: {}",
+                    join(&policy.ingress_zones),
+                    join(&policy.egress_zones)
+                ),
             ));
-        }
-        if !policy.ports.is_empty() {
-            lines.push((String::new(), format!("ports: {}", join(&policy.ports))));
+            if !policy.services.is_empty() {
+                lines.push((
+                    String::new(),
+                    format!("services: {}", join(&policy.services)),
+                ));
+            }
+            if !policy.ports.is_empty() {
+                lines.push((String::new(), format!("ports: {}", join(&policy.ports))));
+            }
+        };
+    for name in &names {
+        let runtime = snapshot.policies.runtime.get(*name);
+        let permanent = snapshot.policies.permanent.get(*name);
+        match (runtime, permanent) {
+            (Some(runtime), Some(permanent)) if runtime.configuration_eq(permanent) => {
+                add_policy(name, "both", runtime);
+            }
+            (Some(runtime), Some(permanent)) => {
+                add_policy(name, "runtime drift", runtime);
+                add_policy(name, "permanent drift", permanent);
+            }
+            (Some(runtime), None) => add_policy(name, "runtime", runtime),
+            (None, Some(permanent)) => add_policy(name, "permanent", permanent),
+            (None, None) => {}
         }
     }
     DetailsContent {
-        title: format!("Policies ({})", snapshot.policies.len()),
+        title: format!("Policies ({})", names.len()),
         lines,
     }
 }
 
-/// Drift workspace: every runtime vs permanent difference across all zones,
-/// grouped per zone, so an operator sees at a glance what won't survive a
-/// reload. Zones present in only one scope are reported as a single
-/// lifecycle line instead of per-attribute drift.
+/// Predefined policy sets derived from the ordinary policy snapshot because
+/// firewalld exposes set mutations but no separate set-list command.
+#[must_use]
+pub fn policy_set_browse(snapshot: &FirewallSnapshot) -> DetailsContent {
+    let support = FirewalldFeature::PolicySets.support_for(snapshot.status.version.as_deref());
+    let mut lines = vec![line(
+        "capability",
+        match support {
+            FeatureSupport::Supported => "supported (firewalld 2.4+)",
+            FeatureSupport::Unsupported => "unavailable — requires firewalld 2.4+",
+            FeatureSupport::Unknown => "unknown — firewalld version was not reported",
+        },
+    )];
+    if support != FeatureSupport::Supported {
+        return DetailsContent {
+            title: "Policy sets".to_owned(),
+            lines,
+        };
+    }
+    if !snapshot.section_is_complete(
+        SnapshotSection::Policies,
+        ConfigurationTarget::RuntimeAndPermanent,
+    ) {
+        lines.push(line(
+            "state",
+            "unknown — the latest policy snapshot is incomplete",
+        ));
+        return DetailsContent {
+            title: "Policy sets".to_owned(),
+            lines,
+        };
+    }
+    for set in PolicySetDetails::known(snapshot) {
+        lines.push(line(&set.name.to_string(), "predefined upstream set"));
+        lines.push(line("  runtime", set.runtime.state.label()));
+        lines.push(line("  permanent", set.permanent.state.label()));
+        lines.push(line("  runtime members", join(&set.runtime.members)));
+        lines.push(line("  permanent members", join(&set.permanent.members)));
+    }
+    lines.push(line("", ""));
+    lines.push(line(
+        "manage",
+        "palette → Set policy-set state → `gateway enable|disable`",
+    ));
+    DetailsContent {
+        title: "Policy sets".to_owned(),
+        lines,
+    }
+}
+
+/// Scoped policy dependency edges with health derived from the same snapshot.
+#[must_use]
+pub fn policy_dependency_graph(snapshot: &FirewallSnapshot) -> DetailsContent {
+    let mut lines = Vec::new();
+    let mut edge_count = 0usize;
+
+    for (target, scope) in [
+        (ConfigurationTarget::Runtime, "runtime"),
+        (ConfigurationTarget::Permanent, "permanent"),
+    ] {
+        let graph = PolicyDependencyGraph::from_snapshot(snapshot, target);
+        let dependencies: Vec<_> = graph.dependencies().collect();
+        lines.push(line(scope, format!("{} edges", dependencies.len())));
+        edge_count += dependencies.len();
+
+        if dependencies.is_empty() {
+            lines.push(line("", "none"));
+            continue;
+        }
+
+        for dependency in dependencies {
+            let (role, edge, health) = match &dependency.resource {
+                PolicyDependencyResource::IngressZone(zone) => (
+                    "ingress",
+                    format!("{zone} → {}", dependency.policy),
+                    zone_dependency_health(snapshot, target, zone),
+                ),
+                PolicyDependencyResource::EgressZone(zone) => (
+                    "egress",
+                    format!("{} → {zone}", dependency.policy),
+                    zone_dependency_health(snapshot, target, zone),
+                ),
+                PolicyDependencyResource::Service(service) => (
+                    "service",
+                    format!("{service} → {}", dependency.policy),
+                    service_dependency_health(snapshot, target, service),
+                ),
+            };
+            lines.push(line(&format!("  {role}"), format!("{edge} [{health}]")));
+        }
+        lines.push(line("", ""));
+    }
+
+    lines.push(line(
+        "safety",
+        "permanent references must be removed before deleting a zone or service",
+    ));
+    DetailsContent {
+        title: format!("Policy dependency graph ({edge_count} scoped edges)"),
+        lines,
+    }
+}
+
+/// Lossless-vs-manual classification of every observed direct rule. This is
+/// read-only; creating a replacement remains an explicit row-scoped action.
+#[must_use]
+pub fn direct_migration(snapshot: &FirewallSnapshot) -> DetailsContent {
+    let complete =
+        snapshot.section_is_complete(SnapshotSection::DirectRules, ConfigurationTarget::Runtime);
+    let mut lines = vec![
+        line(
+            "safety",
+            "replacement policies are additive; FWDeck never removes direct rules",
+        ),
+        line(
+            "workflow",
+            "create permanent policy → reload → validate traffic → retire legacy rule manually",
+        ),
+        line("snapshot", if complete { "complete" } else { "incomplete" }),
+        (String::new(), String::new()),
+    ];
+    let mut eligible = 0usize;
+    for (index, rule) in snapshot.direct_rules.iter().enumerate() {
+        match translate_direct_rule(rule) {
+            Ok(translation) => {
+                eligible += 1;
+                lines.push((
+                    format!("#{index} eligible"),
+                    format!(
+                        "{} {} → {}",
+                        translation.chain.as_str(),
+                        translation.chain.ingress_zone(),
+                        translation.chain.egress_zone()
+                    ),
+                ));
+                lines.push(line("rich rule", translation.rich_rule.as_str()));
+            }
+            Err(err) => lines.push((format!("#{index} manual"), err.to_string())),
+        }
+        lines.push(line("source", rule));
+    }
+    if snapshot.direct_rules.is_empty() {
+        lines.push(line("rules", "none observed"));
+    }
+    DetailsContent {
+        title: format!(
+            "Direct migration assistant ({eligible}/{} eligible)",
+            snapshot.direct_rules.len()
+        ),
+        lines,
+    }
+}
+
+fn zone_dependency_health(
+    snapshot: &FirewallSnapshot,
+    target: ConfigurationTarget,
+    zone: &str,
+) -> &'static str {
+    if matches!(zone, "ANY" | "HOST") {
+        return "pseudo-zone";
+    }
+    if !snapshot.section_is_complete(SnapshotSection::Zones, target) {
+        return "unknown";
+    }
+    let exists = match target {
+        ConfigurationTarget::Runtime => snapshot.runtime.keys().any(|name| name.as_str() == zone),
+        ConfigurationTarget::Permanent => {
+            snapshot.permanent.keys().any(|name| name.as_str() == zone)
+        }
+        ConfigurationTarget::RuntimeAndPermanent => false,
+    };
+    if exists { "ok" } else { "missing" }
+}
+
+fn service_dependency_health(
+    snapshot: &FirewallSnapshot,
+    target: ConfigurationTarget,
+    service: &crate::domain::ServiceName,
+) -> &'static str {
+    if !snapshot.section_is_complete(SnapshotSection::Services, target) {
+        return "unknown";
+    }
+    if snapshot.available_services.contains(service) {
+        "ok"
+    } else {
+        "missing"
+    }
+}
+
+/// Drift workspace: every runtime vs permanent difference across zones,
+/// ipsets, and policies, so an operator sees what won't survive a reload.
 #[must_use]
 pub fn drift_workspace(snapshot: &FirewallSnapshot) -> DetailsContent {
     let mut lines: Vec<(String, String)> = Vec::new();
@@ -445,17 +827,100 @@ pub fn drift_workspace(snapshot: &FirewallSnapshot) -> DetailsContent {
             (None, None) => {}
         }
     }
+    let object_drift = scoped_object_drift_lines(snapshot);
+    differences += object_drift.len();
+    lines.extend(object_drift);
 
     if differences == 0 {
+        let complete = [
+            crate::domain::SnapshotSection::Zones,
+            crate::domain::SnapshotSection::IpSets,
+            crate::domain::SnapshotSection::Policies,
+        ]
+        .into_iter()
+        .all(|section| {
+            snapshot.section_is_complete(
+                section,
+                crate::domain::ConfigurationTarget::RuntimeAndPermanent,
+            )
+        });
         lines.push((
             String::new(),
-            "runtime and permanent are in sync".to_owned(),
+            if complete {
+                "runtime and permanent are in sync".to_owned()
+            } else {
+                "no observed drift, but incomplete sections make sync status unknown".to_owned()
+            },
         ));
     }
     DetailsContent {
         title: format!("Drift ({differences} differences)"),
         lines,
     }
+}
+
+fn scoped_object_drift_lines(snapshot: &FirewallSnapshot) -> Vec<(String, String)> {
+    let mut lines = Vec::new();
+    let mut ipsets: Vec<_> = snapshot
+        .ipsets
+        .runtime
+        .keys()
+        .chain(snapshot.ipsets.permanent.keys())
+        .collect();
+    ipsets.sort();
+    ipsets.dedup();
+    for name in ipsets {
+        match (
+            snapshot.ipsets.runtime.get(name),
+            snapshot.ipsets.permanent.get(name),
+        ) {
+            (Some(runtime), Some(permanent)) if runtime != permanent => lines.push(line(
+                "ipset",
+                format!(
+                    "{name} — runtime {} ({} entries) / permanent {} ({} entries)",
+                    runtime.kind,
+                    runtime.entries.len(),
+                    permanent.kind,
+                    permanent.entries.len()
+                ),
+            )),
+            (Some(_), None) => lines.push(line("ipset", format!("{name} — runtime only"))),
+            (None, Some(_)) => lines.push(line("ipset", format!("{name} — permanent only"))),
+            _ => {}
+        }
+    }
+
+    let mut policies: Vec<_> = snapshot
+        .policies
+        .runtime
+        .keys()
+        .chain(snapshot.policies.permanent.keys())
+        .collect();
+    policies.sort();
+    policies.dedup();
+    for name in policies {
+        match (
+            snapshot.policies.runtime.get(name),
+            snapshot.policies.permanent.get(name),
+        ) {
+            (Some(runtime), Some(permanent)) if !runtime.configuration_eq(permanent) => {
+                lines.push(line(
+                    "policy",
+                    format!(
+                        "{name} — runtime {} ({} services) / permanent {} ({} services)",
+                        runtime.target.as_str(),
+                        runtime.services.len(),
+                        permanent.target.as_str(),
+                        permanent.services.len()
+                    ),
+                ));
+            }
+            (Some(_), None) => lines.push(line("policy", format!("{name} — runtime only"))),
+            (None, Some(_)) => lines.push(line("policy", format!("{name} — permanent only"))),
+            _ => {}
+        }
+    }
+    lines
 }
 
 /// Per-attribute drift lines for one zone present in both scopes.
@@ -617,6 +1082,12 @@ fn recovery_hint(error: &FirewallError) -> &'static str {
             "inspect ~/.local/state/fwdeck/fwdeck.log for the full command context"
         }
         FirewallError::ReadOnlyMode => "restart fwdeck without --read-only to allow mutations",
+        FirewallError::StaleSnapshot => {
+            "review the refreshed state, then confirm the operation again"
+        }
+        FirewallError::Validation(_) => {
+            "review the operation and refreshed state before trying again"
+        }
     }
 }
 
@@ -642,13 +1113,17 @@ mod tests {
         let snapshot = mock::sample().unwrap();
         let zone = snapshot.default_zone.clone();
         let raw = snapshot.runtime[&zone].rich_rules[0].as_str().to_owned();
-        let row = vec![
-            "ipv4".to_owned(),
-            "reject".to_owned(),
-            "both".to_owned(),
-            raw.clone(),
-        ];
-        let content = for_row(ViewId::RichRules, &snapshot, &zone, &row).unwrap();
+        let rows = crate::ui::views::rows(
+            ViewId::RichRules,
+            &snapshot,
+            &zone,
+            crate::domain::ConfigurationTarget::Runtime,
+        );
+        let row = rows
+            .iter()
+            .find(|row| matches!(&row.id, RowId::RichRule { rule, .. } if rule.as_str() == raw))
+            .unwrap();
+        let content = for_row(ViewId::RichRules, &snapshot, &zone, row).unwrap();
         let rule_line = content.lines.iter().find(|(k, _)| k == "rule").unwrap();
         assert_eq!(rule_line.1, raw);
     }
@@ -657,14 +1132,14 @@ mod tests {
     fn service_row_details_show_ports_and_protocols_not_a_placeholder() {
         let snapshot = mock::sample().unwrap();
         let zone = snapshot.default_zone.clone();
-        // Cells as services_rows builds them: [name, ports, protocols, scope].
-        let row = vec![
-            "https".to_owned(),
-            "443/tcp".to_owned(),
-            "-".to_owned(),
-            "runtime".to_owned(),
-        ];
-        let content = for_row(ViewId::Services, &snapshot, &zone, &row).unwrap();
+        let rows = crate::ui::views::rows(
+            ViewId::Services,
+            &snapshot,
+            &zone,
+            crate::domain::ConfigurationTarget::Runtime,
+        );
+        let row = rows.iter().find(|row| row[0] == "https").unwrap();
+        let content = for_row(ViewId::Services, &snapshot, &zone, row).unwrap();
         let ports = content.lines.iter().find(|(k, _)| k == "ports").unwrap();
         assert_eq!(ports.1, "443/tcp");
         assert!(content.lines.iter().any(|(k, _)| k == "protocols"));
@@ -698,6 +1173,23 @@ mod tests {
     }
 
     #[test]
+    fn drift_workspace_includes_ipset_entry_drift() {
+        let mut snapshot = mock::sample().unwrap();
+        let blocklist = crate::domain::IpSetName::parse("blocklist").unwrap();
+        snapshot
+            .ipsets
+            .permanent
+            .get_mut(&blocklist)
+            .unwrap()
+            .entries
+            .clear();
+        let content = drift_workspace(&snapshot);
+        assert!(content.lines.iter().any(|(key, value)| {
+            key == "ipset" && value.contains("blocklist") && value.contains("runtime")
+        }));
+    }
+
+    #[test]
     fn drift_workspace_reports_sync_when_identical() {
         let mut snapshot = mock::sample().unwrap();
         snapshot.permanent = snapshot.runtime.clone();
@@ -721,5 +1213,87 @@ mod tests {
             .find(|(k, _)| k == "suggested")
             .unwrap();
         assert!(hint.1.contains("systemctl start firewalld"));
+    }
+
+    #[test]
+    fn policy_row_details_show_flow_state_and_dependencies() {
+        let snapshot = mock::sample().unwrap();
+        let zone = snapshot.default_zone.clone();
+        let rows = crate::ui::views::rows(
+            ViewId::Policies,
+            &snapshot,
+            &zone,
+            crate::domain::ConfigurationTarget::Runtime,
+        );
+        let row = rows.first().unwrap();
+        let content = for_row(ViewId::Policies, &snapshot, &zone, row).unwrap();
+
+        assert_eq!(content.title, "Policy `mypolicy`");
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| { key == "flow" && value == "public → ANY" })
+        );
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| { key == "dependencies" && value.contains("all referenced") })
+        );
+    }
+
+    #[test]
+    fn policy_set_workspace_reports_capability_and_scoped_state() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot.status.version = Some("2.4.2".to_owned());
+        for member in crate::domain::policy_set::GATEWAY_POLICY_MEMBERS {
+            let name = crate::domain::PolicyName::parse(member).unwrap();
+            let mut policy = crate::domain::PolicyDetails::empty(name.clone());
+            policy.disabled = true;
+            snapshot
+                .policies
+                .runtime
+                .insert(name.clone(), policy.clone());
+            snapshot.policies.permanent.insert(name, policy);
+        }
+
+        let content = policy_set_browse(&snapshot);
+        assert_eq!(content.title, "Policy sets");
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| key == "capability" && value.contains("supported"))
+        );
+        assert!(content.lines.iter().any(|(key, _)| key == "gateway"));
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| key == "  runtime" && value == "disabled")
+        );
+    }
+
+    #[test]
+    fn direct_migration_workspace_distinguishes_eligible_and_manual_rules() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot
+            .direct_rules
+            .push("ipv4 nat PREROUTING 0 -j DNAT".to_owned());
+        let content = direct_migration(&snapshot);
+        assert!(content.title.contains("1/2 eligible"));
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| key.contains("eligible") && value.contains("ANY → HOST"))
+        );
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| key.contains("manual") && value.contains("table `nat`"))
+        );
     }
 }

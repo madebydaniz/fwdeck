@@ -128,4 +128,10 @@ _site/
 
 # Local AI-assistant tooling config (never commit)
 /.claude/
+/.superpowers/
+/docs/
 ROADMAP.md
+.agents
+.forge
+.idea
+skills-lock.json

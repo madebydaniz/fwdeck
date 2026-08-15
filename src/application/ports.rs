@@ -2,9 +2,65 @@
 //! infrastructure implements this trait, the UI never sees it.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus};
+use crate::domain::{FirewallOperation, FirewallSnapshot, FirewallStatus, RefreshObservation};
+
+use super::api::{RefreshOverview, RefreshPrioritySource};
+
+/// Stable identity for one rollback guard. It is assigned immediately before
+/// the matching operation runs, so duplicate operations never share lifecycle
+/// state or a systemd unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RollbackGuardId(u64);
+
+impl RollbackGuardId {
+    /// Builds an id from the process-local monotonic sequence.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric value used in external guard names.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Failure while arming or disarming the out-of-process rollback guard.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RollbackGuardError {
+    /// The guard command could not be spawned or did not produce a result.
+    #[error("rollback guard process failed: {0}")]
+    Process(String),
+    /// The guard command exited unsuccessfully.
+    #[error("rollback guard command failed (exit {code}): {stderr}")]
+    CommandFailed {
+        /// Exit status, or `-1` when terminated by a signal.
+        code: i32,
+        /// Trimmed diagnostic output.
+        stderr: String,
+    },
+}
+
+/// Out-of-process dead-man's-switch port. The engine invokes `arm` immediately
+/// before each risky operation, including each individual staged-plan item.
+pub trait RollbackGuard: Send + Sync + 'static {
+    /// Arms a runtime inverse after `delay`. `Ok(None)` means this host cannot
+    /// provide an out-of-process guard; the UI still provides its in-process
+    /// countdown.
+    fn arm(
+        &self,
+        id: RollbackGuardId,
+        operation: &FirewallOperation,
+        delay: Duration,
+    ) -> impl Future<Output = Result<Option<String>, RollbackGuardError>> + Send;
+
+    /// Cancels an armed unit. Implementations must enforce a hard timeout.
+    fn disarm(&self, unit: &str) -> impl Future<Output = Result<(), RollbackGuardError>> + Send;
+}
 
 /// Errors crossing the backend boundary, categorized so the UI can react
 /// meaningfully instead of showing "command failed".
@@ -42,6 +98,14 @@ pub enum FirewallError {
     /// Mutation rejected because the engine runs with `read_only` enforced.
     #[error("fwdeck is in read-only mode")]
     ReadOnlyMode,
+    /// The observed state changed after validation/confirmation but before the
+    /// engine reached the mutation boundary.
+    #[error("firewall state changed after confirmation — refreshed; review and retry")]
+    StaleSnapshot,
+    /// The engine's defense-in-depth validation rejected a request before any
+    /// backend command or rollback guard was started.
+    #[error("operation rejected by validation: {0}")]
+    Validation(String),
 }
 
 /// One executed step of an operation, with the exact invocation for
@@ -49,7 +113,8 @@ pub enum FirewallError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepReport {
     /// Which configuration the step touched: `"runtime"`, `"permanent"`,
-    /// `"global"`, `"offline"`, or `"policy"` (read-only rejection).
+    /// `"global"`, `"offline"`, `"policy"` (read-only rejection), or
+    /// `"precondition"` (no mutation was attempted).
     pub target: &'static str,
     /// Exact argv (CLI backend) or D-Bus method + args, for audit/display.
     pub invocation: Vec<String>,
@@ -138,6 +203,25 @@ impl OperationOutcome {
     }
 }
 
+/// One snapshot attempt together with operational telemetry from the same
+/// backend boundary. The observation is available even when the read fails.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotRead {
+    /// Fresh firewall state, or the categorized backend failure.
+    pub result: Result<FirewallSnapshot, FirewallError>,
+    /// Exact latency plus adapter-specific process/section measurements.
+    pub observation: RefreshObservation,
+}
+
+/// Result of the low-latency overview phase of a staged refresh.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverviewRead {
+    /// Overview state, when the backend supports staged refresh reads.
+    pub result: Result<Option<Arc<RefreshOverview>>, FirewallError>,
+    /// Exact latency plus adapter-specific process/section measurements.
+    pub observation: RefreshObservation,
+}
+
 /// The firewalld backend: reads (`probe`, `snapshot`) and mutations (`apply`,
 /// `reload`). Native async-fn-in-trait with explicit `Send` bounds (ADR-1).
 pub trait FirewallBackend: Send + Sync + 'static {
@@ -146,6 +230,52 @@ pub trait FirewallBackend: Send + Sync + 'static {
 
     /// Full state in a handful of process calls, independent of zone count (ADR-2).
     fn snapshot(&self) -> impl Future<Output = Result<FirewallSnapshot, FirewallError>> + Send;
+
+    /// Full state plus refresh telemetry. Adapters can override this to report
+    /// subprocess and per-section metrics; the default remains total-only.
+    /// The returned future must be cancellation-safe: dropping it must not mutate
+    /// firewall state, detach unbounded work, or leave a child process running.
+    /// The engine may drop ordinary refreshes before a confirmed mutation.
+    fn snapshot_observed(&self) -> impl Future<Output = SnapshotRead> + Send {
+        async move {
+            let started = std::time::Instant::now();
+            let result = self.snapshot().await;
+            SnapshotRead {
+                result,
+                observation: RefreshObservation::total_only(started.elapsed()),
+            }
+        }
+    }
+
+    /// Reads the low-latency overview stage, when the backend supports it.
+    fn snapshot_overview(
+        &self,
+        _priority: &RefreshPrioritySource,
+    ) -> impl Future<Output = OverviewRead> + Send {
+        async {
+            OverviewRead {
+                result: Ok(None),
+                observation: RefreshObservation::total_only(Duration::ZERO),
+            }
+        }
+    }
+
+    /// Hydrates a staged overview into the complete firewall snapshot.
+    fn snapshot_hydrated(
+        &self,
+        _overview: Option<Arc<RefreshOverview>>,
+        _priority: &RefreshPrioritySource,
+    ) -> impl Future<Output = SnapshotRead> + Send {
+        self.snapshot_observed()
+    }
+
+    /// Reads state for a mutation precondition, bypassing any refresh cache.
+    /// Backends without a cache can use the default implementation.
+    fn snapshot_fresh(
+        &self,
+    ) -> impl Future<Output = Result<FirewallSnapshot, FirewallError>> + Send {
+        self.snapshot()
+    }
 
     /// Executes one operation (runtime step first, then permanent). Partial
     /// failure is an outcome, never an `Err` — callers must not lose it.

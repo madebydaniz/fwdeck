@@ -72,6 +72,38 @@ pub enum Command {
     },
     /// Print the man page (troff) to stdout
     Manpage,
+    /// Inspect or apply local-state retention (dry-run unless --apply is set)
+    Prune {
+        /// Explicitly request the default read-only preview
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Delete the files selected by the retention policy
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+    },
+    /// List, pin, or unpin saved snapshots
+    Snapshots {
+        /// Snapshot metadata operation
+        #[command(subcommand)]
+        command: SnapshotCommand,
+    },
+}
+
+/// Snapshot metadata subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum SnapshotCommand {
+    /// List saved snapshots and their pin state
+    List,
+    /// Exclude an app-generated snapshot from automatic retention
+    Pin {
+        /// Snapshot filename shown by `fwdeck snapshots list`
+        name: String,
+    },
+    /// Return a pinned snapshot to the normal retention policy
+    Unpin {
+        /// Snapshot filename shown by `fwdeck snapshots list`
+        name: String,
+    },
 }
 
 /// Rendered completions for `shell`.
@@ -189,5 +221,33 @@ mod tests {
         let man = manpage();
         assert!(man.contains(".TH"), "troff output expected");
         assert!(man.contains("fwdeck"));
+    }
+
+    #[test]
+    fn parses_retention_and_snapshot_commands() {
+        let dry_run = Cli::try_parse_from(["fwdeck", "prune", "--dry-run"]).unwrap();
+        assert!(matches!(
+            dry_run.command,
+            Some(Command::Prune {
+                dry_run: true,
+                apply: false
+            })
+        ));
+        let apply = Cli::try_parse_from(["fwdeck", "prune", "--apply"]).unwrap();
+        assert!(matches!(
+            apply.command,
+            Some(Command::Prune {
+                dry_run: false,
+                apply: true
+            })
+        ));
+        let pin = Cli::try_parse_from(["fwdeck", "snapshots", "pin", "snapshot-1.json"]).unwrap();
+        assert!(matches!(
+            pin.command,
+            Some(Command::Snapshots {
+                command: SnapshotCommand::Pin { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["fwdeck", "prune", "--dry-run", "--apply"]).is_err());
     }
 }

@@ -4,14 +4,17 @@
 
 use strum::IntoEnumIterator;
 
-use crate::domain::{FirewallOperation, LogDenied};
+use crate::domain::{
+    ConfigurationTarget, FeatureSupport, FirewallOperation, FirewalldFeature, LogDenied,
+    SnapshotSection, translate_direct_rule,
+};
 use crate::infrastructure::firewalld::command::ExportFormat;
 
 use super::action::UiAction;
 use super::fuzzy;
 use super::overlays::FormKind;
 use super::state::UiState;
-use super::views::ViewId;
+use super::views::{RowId, ViewId};
 
 /// Grouping label shown next to each palette entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,9 +131,53 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
     } else {
         staged
     };
+    let policy_sets_mutable = match mutable {
+        Availability::Enabled => match state.snapshot.as_deref() {
+            Some(snapshot)
+                if !snapshot.section_is_complete(
+                    SnapshotSection::Policies,
+                    ConfigurationTarget::RuntimeAndPermanent,
+                ) =>
+            {
+                Availability::Disabled("policy data incomplete")
+            }
+            Some(snapshot) => match FirewalldFeature::PolicySets
+                .support_for(snapshot.status.version.as_deref())
+            {
+                FeatureSupport::Supported => Availability::Enabled,
+                FeatureSupport::Unsupported => Availability::Disabled("requires firewalld 2.4+"),
+                FeatureSupport::Unknown => Availability::Disabled("firewalld version unknown"),
+            },
+            None => Availability::Disabled("no data yet"),
+        },
+        disabled @ Availability::Disabled(_) => disabled,
+    };
     let row_bound = |required_view: ViewId, reason: &'static str| match mutable {
         Availability::Enabled if state.view == required_view && has_rows => Availability::Enabled,
         Availability::Enabled => Availability::Disabled(reason),
+        disabled @ Availability::Disabled(_) => disabled,
+    };
+    let direct_migration_mutable = match row_bound(
+        ViewId::Direct,
+        "select a supported migration candidate in the Direct view",
+    ) {
+        Availability::Enabled
+            if state.snapshot.as_deref().is_some_and(|snapshot| {
+                !snapshot
+                    .section_is_complete(SnapshotSection::DirectRules, ConfigurationTarget::Runtime)
+            }) =>
+        {
+            Availability::Disabled("direct-rule data incomplete")
+        }
+        Availability::Enabled => {
+            let rows = state.visible_rows();
+            match rows.get(state.view_state().selected).map(|row| &row.id) {
+                Some(RowId::Direct { rule, .. }) if translate_direct_rule(rule).is_ok() => {
+                    Availability::Enabled
+                }
+                _ => Availability::Disabled("selected rule requires manual migration"),
+            }
+        }
         disabled @ Availability::Disabled(_) => disabled,
     };
 
@@ -576,6 +623,46 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
             with_data,
         ),
         cmd(
+            UiAction::BrowsePolicySets,
+            "Browse policy sets",
+            "Show capability, member policies, and scoped administrative state",
+            &["policy", "set", "gateway", "router", "members"],
+            Category::App,
+            with_data,
+        ),
+        cmd(
+            UiAction::OpenForm(FormKind::SetPolicySetState),
+            "Set policy-set state",
+            "Enable or disable a verified predefined set (firewalld 2.4+)",
+            &["policy", "set", "gateway", "enable", "disable", "router"],
+            Category::Firewall,
+            policy_sets_mutable,
+        ),
+        cmd(
+            UiAction::ShowPolicyDependencies,
+            "Policy dependency graph",
+            "Show scoped zone/service edges and dangling references",
+            &["policy", "graph", "dependency", "impact", "reference"],
+            Category::Firewall,
+            with_data,
+        ),
+        cmd(
+            UiAction::ShowDirectMigration,
+            "Direct-rule migration assistant",
+            "Classify direct rules and preview conservative policy candidates",
+            &["direct", "deprecated", "migrate", "policy", "legacy"],
+            Category::App,
+            with_data,
+        ),
+        cmd(
+            UiAction::OpenForm(FormKind::MigrateDirectRule),
+            "Migrate selected direct rule",
+            "Create an additive permanent policy replacement; keep the direct rule",
+            &["direct", "deprecated", "migrate", "replace", "policy"],
+            Category::Firewall,
+            direct_migration_mutable,
+        ),
+        cmd(
             UiAction::ShowDrift,
             "Drift workspace",
             "Every runtime vs permanent difference across all zones",
@@ -765,6 +852,67 @@ mod tests {
             filtered(&state)
                 .iter()
                 .any(|c| c.action == UiAction::ToggleMasqueradeRequested)
+        );
+    }
+
+    #[test]
+    fn dependency_graph_is_discoverable_by_impact_keyword() {
+        let state = state_with_palette("impact");
+        assert!(
+            filtered(&state)
+                .iter()
+                .any(|command| command.action == UiAction::ShowPolicyDependencies)
+        );
+    }
+
+    #[test]
+    fn policy_set_mutation_is_version_gated() {
+        let mut state = state_with_palette("policy set state");
+        let mut snapshot = crate::domain::mock::sample().expect("mock");
+        snapshot.status.version = Some("2.3.1".to_owned());
+        state.snapshot = Some(std::sync::Arc::new(snapshot));
+        let command = catalog(&state)
+            .into_iter()
+            .find(|command| command.action == UiAction::OpenForm(FormKind::SetPolicySetState))
+            .expect("policy-set command");
+        assert_eq!(
+            command.availability,
+            Availability::Disabled("requires firewalld 2.4+")
+        );
+
+        let mut snapshot = crate::domain::mock::sample().expect("mock");
+        snapshot.status.version = Some("2.4.0".to_owned());
+        state.snapshot = Some(std::sync::Arc::new(snapshot));
+        let command = catalog(&state)
+            .into_iter()
+            .find(|command| command.action == UiAction::OpenForm(FormKind::SetPolicySetState))
+            .expect("policy-set command");
+        assert_eq!(command.availability, Availability::Enabled);
+    }
+
+    #[test]
+    fn direct_migration_is_enabled_only_for_supported_selected_rules() {
+        let mut state = state_with_palette("migrate direct");
+        state.view = ViewId::Direct;
+        state.snapshot = Some(std::sync::Arc::new(
+            crate::domain::mock::sample().expect("mock"),
+        ));
+        let command = catalog(&state)
+            .into_iter()
+            .find(|command| command.action == UiAction::OpenForm(FormKind::MigrateDirectRule))
+            .expect("migration command");
+        assert_eq!(command.availability, Availability::Enabled);
+
+        let mut snapshot = crate::domain::mock::sample().expect("mock");
+        snapshot.direct_rules = vec!["ipv4 nat PREROUTING 0 -j DNAT".to_owned()];
+        state.snapshot = Some(std::sync::Arc::new(snapshot));
+        let command = catalog(&state)
+            .into_iter()
+            .find(|command| command.action == UiAction::OpenForm(FormKind::MigrateDirectRule))
+            .expect("migration command");
+        assert_eq!(
+            command.availability,
+            Availability::Disabled("selected rule requires manual migration")
         );
     }
 

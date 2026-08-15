@@ -9,7 +9,7 @@
 //! attributes) and the common zone mutations. IP sets, policies, direct rules,
 //! and permanent-only object lifecycle (create zone/service/ipset/policy) route
 //! through the CLI backend for now; the D-Bus backend reports them as
-//! unsupported rather than failing silently. See `docs/backend.md`.
+//! unsupported rather than failing silently. See `CONTRIBUTING.md`.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -397,16 +397,32 @@ impl FirewallBackend for DbusBackend {
             permanent,
             // Not yet fetched via D-Bus — the CLI backend is the full-featured
             // reference. Declared degraded so the UI shows "unknown", not "none".
-            ipsets: BTreeMap::new(),
+            ipsets: crate::domain::Scoped::default(),
             service_definitions: BTreeMap::new(),
             available_services,
-            policies: BTreeMap::new(),
+            policies: crate::domain::Scoped::default(),
             direct_rules: Vec::new(),
             degraded: vec![
-                "ipsets: not fetched by the D-Bus backend yet".to_owned(),
-                "policies: not fetched by the D-Bus backend yet".to_owned(),
-                "direct rules: not fetched by the D-Bus backend yet".to_owned(),
-                "service definitions: not fetched by the D-Bus backend yet".to_owned(),
+                crate::domain::DegradedSection::new(
+                    crate::domain::SnapshotSection::IpSets,
+                    None,
+                    "not fetched by the D-Bus backend yet",
+                ),
+                crate::domain::DegradedSection::new(
+                    crate::domain::SnapshotSection::Policies,
+                    None,
+                    "not fetched by the D-Bus backend yet",
+                ),
+                crate::domain::DegradedSection::new(
+                    crate::domain::SnapshotSection::DirectRules,
+                    Some(crate::domain::ConfigurationTarget::Runtime),
+                    "not fetched by the D-Bus backend yet",
+                ),
+                crate::domain::DegradedSection::new(
+                    crate::domain::SnapshotSection::ServiceDefinitions,
+                    None,
+                    "not fetched by the D-Bus backend yet",
+                ),
             ],
         })
     }
@@ -602,6 +618,21 @@ fn runtime_only(target: ConfigurationTarget, invocation: &[String]) -> Result<()
     })
 }
 
+fn map_method_error(name: &str, detail: &str, rendered: String) -> FirewallError {
+    if name == "org.freedesktop.DBus.Error.AccessDenied"
+        || name.contains("NotAuthorized")
+        || detail.starts_with("NOT_AUTHORIZED")
+    {
+        FirewallError::PermissionDenied { detail: rendered }
+    } else if name == "org.freedesktop.DBus.Error.ServiceUnknown"
+        || name == "org.freedesktop.DBus.Error.NameHasNoOwner"
+    {
+        FirewallError::DaemonNotRunning
+    } else {
+        FirewallError::Process(rendered)
+    }
+}
+
 // Owned by value so it can be used directly as a `map_err` function pointer.
 #[allow(clippy::needless_pass_by_value)]
 fn dbus_err(err: zbus::Error) -> FirewallError {
@@ -610,22 +641,11 @@ fn dbus_err(err: zbus::Error) -> FirewallError {
     // `…slip.dbus.service.PolKit.NotAuthorizedException…` and its own errors as
     // `org.fedoraproject.FirewallD1.Exception` with a `NOT_AUTHORIZED:` detail.
     if let zbus::Error::MethodError(name, detail, _) = &err {
-        let name = name.as_str();
-        let detail = detail.as_deref().unwrap_or("");
-        if name == "org.freedesktop.DBus.Error.AccessDenied"
-            || name.contains("NotAuthorized")
-            || detail.starts_with("NOT_AUTHORIZED")
-        {
-            return FirewallError::PermissionDenied {
-                detail: err.to_string(),
-            };
-        }
-        if name == "org.freedesktop.DBus.Error.ServiceUnknown"
-            || name == "org.freedesktop.DBus.Error.NameHasNoOwner"
-        {
-            return FirewallError::DaemonNotRunning;
-        }
-        return FirewallError::Process(err.to_string());
+        return map_method_error(
+            name.as_str(),
+            detail.as_deref().unwrap_or_default(),
+            err.to_string(),
+        );
     }
     // Transport-level errors (connection refused, disconnects, …).
     FirewallError::Process(err.to_string())
@@ -646,6 +666,73 @@ fn pair_to_port(port: &str, protocol: &str) -> Option<PortSpec> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_error_maps_access_denied_to_permission_denied() {
+        let error = map_method_error(
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "denied",
+            "rendered error".to_owned(),
+        );
+
+        assert!(matches!(error, FirewallError::PermissionDenied { .. }));
+    }
+
+    #[test]
+    fn method_error_maps_firewalld_authorization_failures_to_permission_denied() {
+        for (name, detail) in [
+            (
+                "org.fedoraproject.FirewallD1.Exception.NotAuthorized",
+                "denied",
+            ),
+            (
+                "org.fedoraproject.FirewallD1.Exception",
+                "NOT_AUTHORIZED: action denied",
+            ),
+        ] {
+            let error = map_method_error(name, detail, "rendered error".to_owned());
+            assert!(matches!(error, FirewallError::PermissionDenied { .. }));
+        }
+    }
+
+    #[test]
+    fn method_error_maps_missing_daemon_names_to_daemon_not_running() {
+        for name in [
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.NameHasNoOwner",
+        ] {
+            let error = map_method_error(name, "missing", "rendered error".to_owned());
+            assert!(matches!(error, FirewallError::DaemonNotRunning));
+        }
+    }
+
+    #[test]
+    fn method_error_preserves_unclassified_failure() {
+        let error = map_method_error(
+            "org.fedoraproject.FirewallD1.Exception.InvalidZone",
+            "INVALID_ZONE: missing",
+            "rendered error".to_owned(),
+        );
+
+        assert!(matches!(error, FirewallError::Process(message) if message == "rendered error"));
+    }
+
+    #[test]
+    fn port_pair_parser_accepts_valid_pair_and_rejects_invalid_protocol() {
+        assert_eq!(pair_to_port("443", "tcp"), "443/tcp".parse().ok());
+        assert_eq!(pair_to_port("443", "invalid"), None);
+    }
+
+    #[test]
+    fn parsed_values_drop_invalid_tokens() {
+        let values = vec!["ssh".to_owned(), "bad service".to_owned()];
+        let services = parsed(&values, ServiceName::parse);
+
+        assert_eq!(
+            services,
+            vec![ServiceName::parse("ssh").expect("valid service fixture")]
+        );
+    }
 
     #[test]
     fn gate_rejects_everything_but_runtime() {

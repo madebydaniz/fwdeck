@@ -6,23 +6,32 @@ mod lifecycle;
 mod plans;
 mod rows;
 
-use crate::domain::{ConfigurationTarget, FirewallOperation, ZoneName};
+use crate::application::MutationRequest;
+use crate::domain::{
+    ConfigurationTarget, FirewallOperation, SnapshotSection, ZoneName, translate_direct_rule,
+};
 
 use super::action::{Effect, UiAction};
 use super::details;
 use super::overlays::{Confirmation, DetailsContent, FormKind, FormState, Overlay};
 use super::palette::{self, Availability};
 use super::search;
-use super::state::{InputMode, ToastKind, UiState};
-use super::views::ViewId;
+use super::state::{InputMode, PlanRollbackReservations, ToastKind, UiState};
+use super::views::{RowId, Scope, ViewId, ViewRow};
 
 use forms::{form_submit, rich_builder_commit};
 use lifecycle::{fire_expired_rollbacks, fire_rollback};
 use plans::{apply_plan_now, apply_staged_plan, export_plan, stage_drift_sync};
-use rows::{activate_row, clone_entry, delete_entry, propose_from_log, toggle_mark, yank_row};
+use rows::{
+    activate_row, clone_entry, delete_entry, propose_from_log, selected_policy, toggle_mark,
+    yank_row,
+};
 
 // fixed page size; wire to the rendered table height if it ever matters.
 const PAGE_JUMP: i32 = 10;
+/// Hard cap per interactive field. This bounds memory and argv size even when
+/// a terminal pastes megabytes before validation gets a chance to run.
+const MAX_INTERACTIVE_INPUT_BYTES: usize = 4096;
 
 /// Applies one [`UiAction`] to the state and returns the side effects the
 /// shell must execute (engine requests, clipboard, file writes). This is the
@@ -158,9 +167,10 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::InputCancel => {
             if state.mode == InputMode::Filter {
+                let selected = selected_row_id(state);
                 state.view_state_mut().filter.clear();
                 state.mode = InputMode::Normal;
-                clamp_selection(state);
+                reconcile_selection(state, selected);
             }
         }
         UiAction::OpenHelp => {
@@ -184,16 +194,30 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             state.overlay_scroll = u16::try_from(next.max(0)).unwrap_or(u16::MAX);
         }
         UiAction::ConfirmAccept => {
+            let required = match state.overlays.last() {
+                Some(Overlay::Confirm(confirmation)) => {
+                    confirmation_engine_reservations(&confirmation.on_confirm, state.rollback_ticks)
+                }
+                _ => None,
+            };
+            if let Some(required) = required
+                && !engine_dispatch_allowed(state, required)
+            {
+                return Vec::new();
+            }
             if let Some(Overlay::Confirm(confirmation)) = state.overlays.pop() {
                 return update(state, confirmation.on_confirm);
             }
         }
         UiAction::ConfirmStage => {
             if let Some(Overlay::Confirm(confirmation)) = state.overlays.pop()
-                && let UiAction::ApplyOperation(operation) = confirmation.on_confirm
+                && let UiAction::ApplyOperation(request) = confirmation.on_confirm
             {
-                state.toast(ToastKind::Info, format!("staged: {}", operation.describe()));
-                state.staged.push(operation);
+                state.toast(
+                    ToastKind::Info,
+                    format!("staged: {}", request.operation.describe()),
+                );
+                state.staged.push(request.operation);
             }
         }
         UiAction::KeepChanges => {
@@ -235,6 +259,35 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state
                     .overlays
                     .push(Overlay::Details(details::policy_browse(&snapshot)));
+            } else {
+                state.toast(ToastKind::Info, "no data yet");
+            }
+        }
+        UiAction::BrowsePolicySets => {
+            if let Some(snapshot) = state.snapshot.clone() {
+                state
+                    .overlays
+                    .push(Overlay::Details(details::policy_set_browse(&snapshot)));
+            } else {
+                state.toast(ToastKind::Info, "no data yet");
+            }
+        }
+        UiAction::ShowPolicyDependencies => {
+            if let Some(snapshot) = state.snapshot.clone() {
+                state
+                    .overlays
+                    .push(Overlay::Details(details::policy_dependency_graph(
+                        &snapshot,
+                    )));
+            } else {
+                state.toast(ToastKind::Info, "no data yet");
+            }
+        }
+        UiAction::ShowDirectMigration => {
+            if let Some(snapshot) = state.snapshot.clone() {
+                state
+                    .overlays
+                    .push(Overlay::Details(details::direct_migration(&snapshot)));
             } else {
                 state.toast(ToastKind::Info, "no data yet");
             }
@@ -297,22 +350,8 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 state.toast(ToastKind::Info, "the last operation has no inverse");
                 return Vec::new();
             };
-            // Defensive: if this op were somehow still armed, disarm it so the
-            // deadline and watchdog can't fire the same inverse a second time.
-            let mut effects: Vec<Effect> = Vec::new();
-            state.pending_rollback.retain(|pending| {
-                if pending.forward == last {
-                    if let Some(unit) = &pending.watchdog_unit {
-                        effects.push(Effect::DisarmWatchdog { unit: unit.clone() });
-                    }
-                    false
-                } else {
-                    true
-                }
-            });
             // Undo is just another reviewed mutation: validation + confirmation.
-            effects.extend(request_operation(state, inverse));
-            return effects;
+            return request_operation(state, inverse);
         }
         UiAction::SaveSnapshot => match state.snapshot.clone() {
             Some(snapshot) => return vec![Effect::SaveSnapshot(snapshot)],
@@ -324,7 +363,10 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         UiAction::SnapshotsListed(entries) => {
             let mut lines: Vec<(String, String)> = entries
                 .iter()
-                .map(|entry| (entry.name.clone(), format!("{} bytes", entry.bytes)))
+                .map(|entry| {
+                    let state = if entry.pinned { " · pinned" } else { "" };
+                    (entry.name.clone(), format!("{} bytes{state}", entry.bytes))
+                })
                 .collect();
             if lines.is_empty() {
                 lines.push(("snapshots".to_owned(), "none saved yet".to_owned()));
@@ -338,10 +380,42 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             return plans::snapshot_loaded(state, &name, result);
         }
         UiAction::ShowStagedPlan => state.overlays.push(Overlay::Details(plan_details(state))),
-        UiAction::ApplyStagedPlan => return apply_staged_plan(state),
+        UiAction::ApplyStagedPlan => {
+            if !engine_dispatch_allowed(state, 0) {
+                return Vec::new();
+            }
+            let staged_before = state.staged.clone();
+            let toasts_before = state.toasts.clone();
+            let effects = apply_staged_plan(state);
+            let reservation = effects.iter().find_map(|effect| match effect {
+                Effect::ApplyPlan(plan) => Some((
+                    plan.id,
+                    risky_operation_count(&plan.operations, state.rollback_ticks),
+                )),
+                _ => None,
+            });
+            if let Some((id, required)) = reservation
+                && !reserve_plan_rollback_capacity(state, id, required)
+            {
+                let rejection = state.toasts.back().cloned();
+                state.staged = staged_before;
+                state.toasts = toasts_before;
+                if let Some(rejection) = rejection {
+                    state.toast(rejection.kind, rejection.text);
+                }
+                return Vec::new();
+            }
+            return effects;
+        }
         // The confirmed apply of a staged plan (carried by the plan confirm's
         // on_confirm): arms the dead-man's switch, then dispatches the batch.
-        UiAction::ApplyPlanConfirmed(ops) => return apply_plan_now(state, ops),
+        UiAction::ApplyPlanConfirmed(plan) => {
+            let required = risky_operation_count(&plan.operations, state.rollback_ticks);
+            if !reserve_plan_rollback_capacity(state, plan.id, required) {
+                return Vec::new();
+            }
+            return apply_plan_now(state, plan);
+        }
         UiAction::DiscardStagedPlan => {
             let count = state.staged.len();
             state.staged.clear();
@@ -363,20 +437,22 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }
         }
         UiAction::ClearFilter => {
+            let selected = selected_row_id(state);
             state.view_state_mut().filter.clear();
-            clamp_selection(state);
+            reconcile_selection(state, selected);
         }
         UiAction::RefreshRequested => return vec![Effect::Refresh],
         UiAction::ReloadRequested => {
             return request_operation(state, FirewallOperation::Reload);
         }
         UiAction::ToggleConfigView => {
+            let selected = selected_row_id(state);
             state.config_view = if state.config_view == ConfigurationTarget::Permanent {
                 ConfigurationTarget::Runtime
             } else {
                 ConfigurationTarget::Permanent
             };
-            clamp_selection(state);
+            reconcile_selection(state, selected);
         }
         UiAction::AddEntry => match state.view {
             ViewId::Services => return update(state, UiAction::OpenForm(FormKind::AddService)),
@@ -399,8 +475,31 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 };
                 return update(state, UiAction::OpenForm(kind));
             }
+            ViewId::Policies => {
+                if let Some(policy) = selected_policy(state) {
+                    return update(
+                        state,
+                        UiAction::OpenFormPrefilled(
+                            FormKind::AddPolicyService,
+                            format!("{policy} "),
+                        ),
+                    );
+                }
+                return update(state, UiAction::OpenForm(FormKind::CreatePolicy));
+            }
             ViewId::Direct => {
-                state.toast(ToastKind::Info, "no add action on this view");
+                let Some(RowId::Direct { rule, .. }) = selected_row_id(state) else {
+                    state.toast(ToastKind::Info, "select a direct-rule row first");
+                    return Vec::new();
+                };
+                if let Err(err) = translate_direct_rule(&rule) {
+                    state.toast(
+                        ToastKind::Warning,
+                        format!("manual migration required: {err}"),
+                    );
+                    return Vec::new();
+                }
+                return update(state, UiAction::OpenForm(FormKind::MigrateDirectRule));
             }
             // In the Logs view, `a` proposes an allow rule from the selected
             // denied flow (routed through the normal confirm/stage/apply path).
@@ -419,14 +518,30 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }));
         }
         UiAction::OpenFormPrefilled(kind, buffer) => {
-            state
-                .overlays
-                .push(Overlay::Form(FormState { kind, buffer }));
+            if buffer.len() > MAX_INTERACTIVE_INPUT_BYTES {
+                state.toast(
+                    ToastKind::Warning,
+                    format!(
+                        "prefilled value exceeds the {MAX_INTERACTIVE_INPUT_BYTES}-byte input limit"
+                    ),
+                );
+            } else {
+                state
+                    .overlays
+                    .push(Overlay::Form(FormState { kind, buffer }));
+            }
         }
         UiAction::CloneEntry => return clone_entry(state),
         UiAction::FormInput(c) => {
-            if let Some(Overlay::Form(form)) = state.overlays.last_mut() {
-                form.buffer.push(c);
+            let rejected = match state.overlays.last_mut() {
+                Some(Overlay::Form(form)) => !push_bounded_input(&mut form.buffer, c),
+                _ => false,
+            };
+            if rejected {
+                state.toast(
+                    ToastKind::Warning,
+                    format!("input limit reached ({MAX_INTERACTIVE_INPUT_BYTES} bytes)"),
+                );
             }
         }
         UiAction::FormBackspace => {
@@ -445,8 +560,15 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }
         }
         UiAction::RichBuilderInput(c) => {
-            if let Some(Overlay::RichBuilder(builder)) = state.overlays.last_mut() {
-                builder.buffer.push(c);
+            let rejected = match state.overlays.last_mut() {
+                Some(Overlay::RichBuilder(builder)) => !push_bounded_input(&mut builder.buffer, c),
+                _ => false,
+            };
+            if rejected {
+                state.toast(
+                    ToastKind::Warning,
+                    format!("input limit reached ({MAX_INTERACTIVE_INPUT_BYTES} bytes)"),
+                );
             }
         }
         UiAction::RichBuilderBackspace => {
@@ -456,22 +578,68 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::RichBuilderCommit => return rich_builder_commit(state),
         UiAction::RequestOperation(operation) => return request_operation(state, operation),
-        UiAction::ApplyOperation(operation) => {
+        UiAction::ApplyOperation(request) => {
+            let required = usize::from(operation_needs_rollback_reservation(
+                &request.operation,
+                state.rollback_ticks,
+            ));
+            if !reserve_single_rollback_capacity(state, required) {
+                return Vec::new();
+            }
             state.toast(
                 ToastKind::Info,
-                format!("applying: {}", operation.describe()),
+                format!("applying: {}", request.operation.describe()),
             );
-            // Pre-arm the rollback BEFORE the apply, so a crash or SIGKILL
-            // between here and a successful arm still reverts. The ArmWatchdog
-            // effect is ordered ahead of Apply and dispatched first by the shell.
-            let mut effects = lifecycle::pre_arm_rollback(state, &operation);
-            effects.push(Effect::Apply(operation));
-            return effects;
+            return vec![Effect::Apply(request)];
         }
-        UiAction::OperationFinished { op_id, outcome } => {
-            return lifecycle::operation_finished(state, op_id, outcome);
+        UiAction::OperationFinished(result) => {
+            let result = *result;
+            return lifecycle::operation_finished(
+                state,
+                result.op_id,
+                result.outcome,
+                result.rollback,
+                result.guard_warning,
+                result.completed_rollback.is_none(),
+            );
         }
-        UiAction::PlanFinished { applied, remaining } => {
+        UiAction::PlanFinished {
+            id,
+            applied,
+            remaining,
+        } => {
+            let Some(active) = state.in_flight_plan_rollback else {
+                state.toast(
+                    ToastKind::Error,
+                    format!(
+                        "internal error: stale plan completion {} without an active plan",
+                        id.get()
+                    ),
+                );
+                return Vec::new();
+            };
+            if active.id != id {
+                state.toast(
+                    ToastKind::Error,
+                    format!(
+                        "internal error: stale plan completion {} while plan {} is active",
+                        id.get(),
+                        active.id.get()
+                    ),
+                );
+                return Vec::new();
+            }
+            let Some(plan) = state.in_flight_plan_rollback.take() else {
+                return Vec::new();
+            };
+            let release = plan.total.checked_sub(plan.consumed).unwrap_or_else(|| {
+                state.toast(
+                    ToastKind::Error,
+                    "internal error: plan consumed more rollback reservations than it owned",
+                );
+                0
+            });
+            release_rollback_reservations(state, release, "halted plan");
             if remaining.is_empty() {
                 state.toast(
                     ToastKind::Success,
@@ -488,21 +656,39 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             }
         }
         UiAction::LogsReceived(entries) => {
+            let selected = (state.view == ViewId::Logs)
+                .then(|| selected_row_id(state))
+                .flatten();
             state.push_log_entries(entries);
             if state.view == ViewId::Logs {
-                clamp_selection(state);
+                reconcile_selection(state, selected);
             }
         }
-        UiAction::RefreshStarted => {
-            state.refreshing = true;
-            state.refresh_started_tick = Some(state.tick);
+        UiAction::RefreshStarted { id, .. } => {
+            let selected = selected_row_id(state);
+            state.active_refresh = Some(id);
+            state.refresh_overview = None;
+            reconcile_selection(state, selected);
         }
-        UiAction::RefreshCompleted(result) => {
-            state.refreshing = false;
-            // 250 ms tick granularity is plenty for a health metric.
-            if let Some(started) = state.refresh_started_tick.take() {
-                state.last_refresh_ms = Some(state.tick.saturating_sub(started) * 250);
+        UiAction::RefreshOverviewReady { id, overview } => {
+            if state.active_refresh == Some(id) {
+                let selected = selected_row_id(state);
+                state.refresh_overview = Some(super::state::RefreshOverviewState { id, overview });
+                reconcile_selection(state, selected);
             }
+        }
+        UiAction::RefreshCompleted {
+            schedule,
+            result,
+            observation,
+        } => {
+            if state.active_refresh != Some(schedule.id) {
+                return Vec::new();
+            }
+            let selected = selected_row_id(state);
+            state.active_refresh = None;
+            state.refresh_overview = None;
+            state.last_refresh = Some(observation);
             match result {
                 Ok(snapshot) => {
                     state.backend_error = None;
@@ -540,15 +726,224 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                         state.session_baseline = Some(std::sync::Arc::clone(&snapshot));
                     }
                     state.snapshot = Some(snapshot);
-                    clamp_selection(state);
                 }
                 // Keep the stale snapshot: outdated data plus a visible error
                 // beats an empty screen.
                 Err(error) => state.backend_error = Some(error),
             }
+            reconcile_selection(state, selected);
+        }
+        UiAction::RefreshCancelled { schedule, .. } => {
+            if state.active_refresh == Some(schedule.id) {
+                let selected = selected_row_id(state);
+                state.active_refresh = None;
+                state.refresh_overview = None;
+                reconcile_selection(state, selected);
+            }
+        }
+        UiAction::EngineOutboxChanged {
+            normal_pending,
+            rollback_pending,
+        } => {
+            let valid = rollback_capacity_used_with_outbox(state, rollback_pending)
+                .is_some_and(|used| used <= super::outbox::ROLLBACK_OUTBOX_CAPACITY);
+            if valid {
+                state.engine_normal_backpressured = normal_pending;
+                state.rollback_outbox_pending = rollback_pending;
+            } else {
+                state.toast(
+                    ToastKind::Error,
+                    "internal error: rollback capacity invariant rejected stale engine outbox state",
+                );
+            }
+        }
+        UiAction::ManualDemandRejected { count } => state.toast(
+            ToastKind::Error,
+            format!("manual refresh demand limit reached — {count} request(s) not queued"),
+        ),
+        UiAction::EngineStopped(error) => {
+            state.active_refresh = None;
+            state.refresh_overview = None;
+            state.backend_error = Some(error);
         }
     }
     Vec::new()
+}
+
+fn operation_needs_rollback_reservation(
+    operation: &FirewallOperation,
+    rollback_ticks: u64,
+) -> bool {
+    rollback_ticks != 0 && operation.connectivity_warning().is_some()
+}
+
+fn risky_operation_count(operations: &[FirewallOperation], rollback_ticks: u64) -> usize {
+    operations
+        .iter()
+        .filter(|operation| operation_needs_rollback_reservation(operation, rollback_ticks))
+        .count()
+}
+
+fn confirmation_engine_reservations(action: &UiAction, rollback_ticks: u64) -> Option<usize> {
+    match action {
+        UiAction::ApplyOperation(request) => Some(usize::from(
+            operation_needs_rollback_reservation(&request.operation, rollback_ticks),
+        )),
+        UiAction::ApplyPlanConfirmed(plan) => {
+            Some(risky_operation_count(&plan.operations, rollback_ticks))
+        }
+        _ => None,
+    }
+}
+
+fn rollback_capacity_used(state: &UiState) -> Option<usize> {
+    rollback_capacity_used_with_outbox(state, state.rollback_outbox_pending)
+}
+
+fn rollback_capacity_used_with_outbox(state: &UiState, rollback_pending: usize) -> Option<usize> {
+    state
+        .pending_rollback
+        .len()
+        .checked_add(rollback_pending)?
+        .checked_add(state.rollback_reservations)
+}
+
+fn engine_dispatch_allowed(state: &mut UiState, required: usize) -> bool {
+    if state.engine_normal_backpressured {
+        state.toast(
+            ToastKind::Warning,
+            "engine request queue is busy — retry shortly",
+        );
+        return false;
+    }
+    if state.in_flight_plan_rollback.is_some() {
+        state.toast(
+            ToastKind::Warning,
+            "a mutation plan is still running — retry after it finishes",
+        );
+        return false;
+    }
+    let Some(used) = rollback_capacity_used(state) else {
+        state.toast(
+            ToastKind::Error,
+            "internal error: rollback capacity accounting overflow",
+        );
+        return false;
+    };
+    let Some(next) = used.checked_add(required) else {
+        state.toast(
+            ToastKind::Error,
+            "internal error: rollback capacity accounting overflow",
+        );
+        return false;
+    };
+    if next > super::outbox::ROLLBACK_OUTBOX_CAPACITY {
+        state.toast(
+            ToastKind::Warning,
+            "rollback safety queue is full — keep or roll back pending changes first",
+        );
+        return false;
+    }
+    true
+}
+
+fn reserve_single_rollback_capacity(state: &mut UiState, required: usize) -> bool {
+    if !engine_dispatch_allowed(state, required) {
+        return false;
+    }
+    let Some(total) = state.rollback_reservations.checked_add(required) else {
+        state.toast(
+            ToastKind::Error,
+            "internal error: rollback reservation accounting overflow",
+        );
+        return false;
+    };
+    let Some(singles) = state.single_rollback_reservations.checked_add(required) else {
+        state.toast(
+            ToastKind::Error,
+            "internal error: single-operation rollback accounting overflow",
+        );
+        return false;
+    };
+    state.rollback_reservations = total;
+    state.single_rollback_reservations = singles;
+    true
+}
+
+fn reserve_plan_rollback_capacity(
+    state: &mut UiState,
+    id: crate::application::PlanId,
+    required: usize,
+) -> bool {
+    if !engine_dispatch_allowed(state, required) {
+        return false;
+    }
+    let Some(total) = state.rollback_reservations.checked_add(required) else {
+        state.toast(
+            ToastKind::Error,
+            "internal error: rollback reservation accounting overflow",
+        );
+        return false;
+    };
+    state.rollback_reservations = total;
+    state.in_flight_plan_rollback = Some(PlanRollbackReservations {
+        id,
+        total: required,
+        consumed: 0,
+    });
+    true
+}
+
+pub(super) fn consume_rollback_reservation(state: &mut UiState) -> bool {
+    if state.rollback_reservations == 0 {
+        state.single_rollback_reservations = 0;
+        return false;
+    }
+    if state.single_rollback_reservations != 0 {
+        state.single_rollback_reservations -= 1;
+    } else if let Some(plan) = &mut state.in_flight_plan_rollback
+        && plan.consumed < plan.total
+    {
+        plan.consumed += 1;
+    } else if state.rollback_reservations != 0 {
+        state.toast(
+            ToastKind::Error,
+            "internal error: consuming an unclassified rollback reservation",
+        );
+    } else {
+        return false;
+    }
+    let Some(remaining) = state.rollback_reservations.checked_sub(1) else {
+        state.toast(
+            ToastKind::Error,
+            "internal error: rollback reservation accounting underflow",
+        );
+        return false;
+    };
+    state.rollback_reservations = remaining;
+    true
+}
+
+fn release_rollback_reservations(state: &mut UiState, count: usize, context: &str) {
+    let Some(remaining) = state.rollback_reservations.checked_sub(count) else {
+        state.toast(
+            ToastKind::Error,
+            format!(
+                "internal error: {context} released {count} rollback reservation(s), but only {} remain",
+                state.rollback_reservations
+            ),
+        );
+        return;
+    };
+    state.rollback_reservations = remaining;
+}
+
+fn push_bounded_input(buffer: &mut String, character: char) -> bool {
+    if buffer.len().saturating_add(character.len_utf8()) > MAX_INTERACTIVE_INPUT_BYTES {
+        return false;
+    }
+    buffer.push(character);
+    true
 }
 
 /// Jumps to the selected global-search hit: switches to its view, clears that
@@ -563,13 +958,17 @@ fn execute_global_search(state: &mut UiState) -> Vec<Effect> {
         state.toast(ToastKind::Info, "no matches");
         return Vec::new();
     };
-    let (view, row) = (hit.view, hit.row);
+    let (view, row_id) = (hit.view, hit.row_id.clone());
     state.overlays.pop();
     state.view = view;
     state.mode = InputMode::Normal;
     state.views[view.index()].filter.clear();
     state.views[view.index()].marked.clear();
-    state.view_state_mut().selected = row;
+    state.view_state_mut().selected = state
+        .all_rows(view)
+        .iter()
+        .position(|row| row.id == row_id)
+        .unwrap_or(0);
     clamp_selection(state);
     Vec::new()
 }
@@ -614,12 +1013,8 @@ fn inspect_zone(state: &mut UiState) {
 fn zone_for_action(state: &UiState) -> Option<ZoneName> {
     if state.view == ViewId::Zones {
         let rows = state.visible_rows();
-        if let Some(Ok(zone)) = rows
-            .get(state.view_state().selected)
-            .and_then(|row| row.first())
-            .map(|name| ZoneName::parse(name))
-        {
-            return Some(zone);
+        if let Some(RowId::Zone(zone)) = rows.get(state.view_state().selected).map(|row| &row.id) {
+            return Some(zone.clone());
         }
     }
     state.effective_zone()
@@ -627,8 +1022,8 @@ fn zone_for_action(state: &UiState) -> Option<ZoneName> {
 
 /// Narrows the configured target to where the entry actually exists, so
 /// removing a runtime-only entry never issues a doomed `--permanent` call.
-fn target_for_scope(scope: &str, default: ConfigurationTarget) -> ConfigurationTarget {
-    super::views::Scope::parse(scope).target_or(default)
+fn target_for_scope(scope: Scope, default: ConfigurationTarget) -> ConfigurationTarget {
+    scope.target_or(default)
 }
 
 /// The single read-only gate for mutation entry points: toasts and reports
@@ -660,10 +1055,14 @@ fn blocked_stale(state: &mut UiState) -> bool {
 }
 
 /// The currently selected row of the visible (filtered) table, cloned out.
-fn selected_row(state: &UiState) -> Option<Vec<String>> {
+fn selected_row(state: &UiState) -> Option<ViewRow> {
     let mut rows = state.visible_rows();
     let index = state.view_state().selected;
     (index < rows.len()).then(|| rows.swap_remove(index))
+}
+
+fn selected_row_id(state: &UiState) -> Option<RowId> {
+    selected_row(state).map(|row| row.id)
 }
 
 fn toggle_masquerade(state: &mut UiState) -> Vec<Effect> {
@@ -753,6 +1152,16 @@ fn reload_ssh_lockout_warning(state: &UiState, operation: &FirewallOperation) ->
     ))
 }
 
+fn append_migration_context(body: &mut Vec<String>, operation: &FirewallOperation) {
+    if let FirewallOperation::MigrateDirectRule { migration } = operation {
+        body.push(format!("source direct rule: {}", migration.source_rule()));
+        body.push(
+            "candidate only: reload and validate real traffic before manually retiring the direct rule"
+                .to_owned(),
+        );
+    }
+}
+
 /// Central mutation gate: read-only check, snapshot validation, then the
 /// confirmation modal (or direct dispatch when confirmations are disabled).
 fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<Effect> {
@@ -772,6 +1181,8 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
         Some(zone)
             if !snapshot.runtime.contains_key(zone)
                 && snapshot.permanent.contains_key(zone)
+                && snapshot
+                    .section_is_complete(SnapshotSection::Zones, ConfigurationTarget::Runtime)
                 && operation.target() != ConfigurationTarget::Permanent =>
         {
             let retargeted = if operation.target() == ConfigurationTarget::RuntimeAndPermanent {
@@ -804,12 +1215,16 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
         return Vec::new();
     }
     if !state.confirm_destructive {
-        return update(state, UiAction::ApplyOperation(operation));
+        return update(
+            state,
+            UiAction::ApplyOperation(MutationRequest::new(operation, snapshot)),
+        );
     }
     let mut body = vec![
         operation.describe(),
         format!("target: {}", operation.target().label()),
     ];
+    append_migration_context(&mut body, &operation);
     if permanent_only_note {
         body.push(
             "zone is not active yet — applying to permanent; reload (ctrl-r) to activate"
@@ -858,7 +1273,7 @@ fn request_operation(state: &mut UiState, operation: FirewallOperation) -> Vec<E
     state.overlays.push(Overlay::Confirm(Confirmation {
         title: "Confirm".to_owned(),
         body,
-        on_confirm: UiAction::ApplyOperation(operation),
+        on_confirm: UiAction::ApplyOperation(MutationRequest::new(operation, snapshot)),
     }));
     Vec::new()
 }
@@ -944,8 +1359,31 @@ fn move_selection(state: &mut UiState, delta: i32) {
 }
 
 fn clamp_selection(state: &mut UiState) {
-    let len = state.visible_rows().len();
+    reconcile_selection(state, None);
+}
+
+/// Reconciles marks and selection after the row model changes. When the
+/// previously selected identity still exists, its new position wins over the
+/// stale numeric index.
+fn reconcile_selection(state: &mut UiState, preferred: Option<RowId>) {
+    let valid_ids: std::collections::BTreeSet<RowId> = state
+        .all_rows(state.view)
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    state
+        .view_state_mut()
+        .marked
+        .retain(|row_id| valid_ids.contains(row_id));
+    let visible = state.visible_rows();
+    let len = visible.len();
     let view_state = state.view_state_mut();
+    if let Some(selected) = preferred
+        && let Some(index) = visible.iter().position(|row| row.id == selected)
+    {
+        view_state.selected = index;
+        return;
+    }
     if len == 0 {
         view_state.selected = 0;
     } else if view_state.selected >= len {
@@ -959,11 +1397,11 @@ fn edit_filter(state: &mut UiState, edit: impl FnOnce(&mut String)) {
     let before = state.visible_rows();
     let selected_key = before
         .get(state.view_state().selected)
-        .and_then(|row| row.first().cloned());
+        .map(|row| row.id.clone());
     edit(&mut state.view_state_mut().filter);
     let after = state.visible_rows();
     let selected = selected_key
-        .and_then(|key| after.iter().position(|row| row.first() == Some(&key)))
+        .and_then(|key| after.iter().position(|row| row.id == key))
         .unwrap_or(0);
     state.view_state_mut().selected = selected;
 }
@@ -977,11 +1415,171 @@ mod tests {
     use crate::domain::ServiceName;
     use crate::domain::mock;
     use crate::ui::overlays::Confirmation;
+    use crate::ui::state::PendingRollback;
 
     fn state() -> UiState {
         let mut state = UiState::new(&Config::default(), "test".into(), false, None);
         state.snapshot = Some(std::sync::Arc::new(mock::sample().unwrap()));
         state
+    }
+
+    fn active_plan_id(state: &UiState) -> crate::application::PlanId {
+        state.in_flight_plan_rollback.unwrap().id
+    }
+
+    fn refresh_overview() -> crate::application::RefreshOverview {
+        let snapshot = mock::sample().unwrap();
+        crate::application::RefreshOverview {
+            status: snapshot.status,
+            default_zone: snapshot.default_zone,
+            active: snapshot.active,
+            runtime: snapshot.runtime,
+            permanent: snapshot.permanent,
+            available_services: snapshot.available_services,
+            policy_names: crate::domain::Scoped {
+                runtime: snapshot.policies.runtime.into_keys().collect(),
+                permanent: snapshot.policies.permanent.into_keys().collect(),
+            },
+            degraded: snapshot.degraded,
+        }
+    }
+
+    fn refresh_schedule_for(
+        id: crate::application::RefreshId,
+        trigger: crate::application::RefreshTrigger,
+    ) -> crate::application::RefreshScheduleObservation {
+        crate::application::RefreshScheduleObservation {
+            id,
+            trigger,
+            merged_manual_requests: 0,
+            coalesced_periodic_ticks: 0,
+        }
+    }
+
+    fn refresh_schedule() -> crate::application::RefreshScheduleObservation {
+        refresh_schedule_for(
+            crate::application::RefreshId::new(1),
+            crate::application::RefreshTrigger::Manual,
+        )
+    }
+
+    fn begin_refresh(state: &mut UiState) {
+        update(
+            state,
+            UiAction::RefreshStarted {
+                id: crate::application::RefreshId::new(1),
+                trigger: crate::application::RefreshTrigger::Manual,
+            },
+        );
+    }
+
+    fn reviewed(operation: FirewallOperation) -> MutationRequest {
+        MutationRequest::new(operation, std::sync::Arc::new(mock::sample().unwrap()))
+    }
+
+    fn rollback(
+        id: u64,
+        operation: &FirewallOperation,
+        watchdog_unit: Option<&str>,
+    ) -> crate::application::api::RollbackRegistration {
+        crate::application::api::RollbackRegistration {
+            id: crate::application::ports::RollbackGuardId::new(id),
+            inverse: operation.inverse().unwrap(),
+            watchdog_unit: watchdog_unit.map(str::to_owned),
+        }
+    }
+
+    fn finished(
+        op_id: u64,
+        outcome: crate::application::ports::OperationOutcome,
+        rollback: Option<crate::application::api::RollbackRegistration>,
+    ) -> UiAction {
+        UiAction::OperationFinished(Box::new(crate::application::api::OperationResult {
+            op_id,
+            outcome,
+            rollback,
+            guard_warning: None,
+            completed_rollback: None,
+        }))
+    }
+
+    fn state_with_confirmed_remove_service() -> UiState {
+        let mut state = state();
+        update(
+            &mut state,
+            UiAction::RequestOperation(FirewallOperation::RemoveService {
+                zone: ZoneName::parse("public").unwrap(),
+                service: ServiceName::parse("http").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            }),
+        );
+        assert!(matches!(state.overlays.last(), Some(Overlay::Confirm(_))));
+        state
+    }
+
+    fn state_with_confirmed_connectivity_change() -> UiState {
+        let mut state = state();
+        update(
+            &mut state,
+            UiAction::RequestOperation(FirewallOperation::RemoveService {
+                zone: ZoneName::parse("public").unwrap(),
+                service: ServiceName::parse("ssh").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            }),
+        );
+        assert!(matches!(state.overlays.last(), Some(Overlay::Confirm(_))));
+        state
+    }
+
+    fn pending_rollbacks(count: usize) -> Vec<PendingRollback> {
+        (0..count)
+            .map(|index| {
+                let forward = FirewallOperation::RemoveService {
+                    zone: ZoneName::parse("public").unwrap(),
+                    service: ServiceName::parse("http").unwrap(),
+                    target: ConfigurationTarget::Runtime,
+                };
+                PendingRollback {
+                    id: crate::application::ports::RollbackGuardId::new(
+                        u64::try_from(index).unwrap() + 1,
+                    ),
+                    inverse: forward.inverse().unwrap(),
+                    forward,
+                    deadline_tick: 1_000,
+                    description: format!("pending rollback {index}"),
+                    watchdog_unit: None,
+                }
+            })
+            .collect()
+    }
+
+    fn applied_risky_result_with_registration() -> UiAction {
+        use crate::application::ports::OperationOutcome;
+
+        let operation = FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("http").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        finished(
+            1,
+            OperationOutcome::Applied {
+                operation: operation.clone(),
+                steps: Vec::new(),
+            },
+            Some(rollback(1, &operation, None)),
+        )
+    }
+
+    fn two_risky_operations() -> Vec<FirewallOperation> {
+        ["http", "ssh"]
+            .into_iter()
+            .map(|service| FirewallOperation::RemoveService {
+                zone: ZoneName::parse("public").unwrap(),
+                service: ServiceName::parse(service).unwrap(),
+                target: ConfigurationTarget::Runtime,
+            })
+            .collect()
     }
 
     fn type_filter(s: &mut UiState, text: &str) {
@@ -1118,6 +1716,54 @@ mod tests {
     }
 
     #[test]
+    fn normal_backpressure_keeps_confirmation_open_without_emitting_effect() {
+        let mut state = state_with_confirmed_remove_service();
+        state.engine_normal_backpressured = true;
+        let overlay_count = state.overlays.len();
+        assert!(update(&mut state, UiAction::ConfirmAccept).is_empty());
+        assert_eq!(state.overlays.len(), overlay_count);
+    }
+
+    #[test]
+    fn risky_confirmation_is_refused_before_rollback_capacity_can_overflow() {
+        let mut state = state_with_confirmed_connectivity_change();
+        state.rollback_outbox_pending = 10;
+        state.rollback_reservations = 10;
+        state.pending_rollback = pending_rollbacks(12);
+        assert!(update(&mut state, UiAction::ConfirmAccept).is_empty());
+        assert_eq!(state.rollback_reservations, 10);
+    }
+
+    #[test]
+    fn stale_outbox_count_is_rejected_atomically_and_valid_update_recovers() {
+        let mut state = state();
+        state.rollback_outbox_pending = 10;
+
+        update(
+            &mut state,
+            UiAction::EngineOutboxChanged {
+                normal_pending: true,
+                rollback_pending: super::super::outbox::ROLLBACK_OUTBOX_CAPACITY + 1,
+            },
+        );
+        assert!(!state.engine_normal_backpressured);
+        assert_eq!(state.rollback_outbox_pending, 10);
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Error && toast.text.contains("rollback capacity invariant")
+        }));
+
+        update(
+            &mut state,
+            UiAction::EngineOutboxChanged {
+                normal_pending: true,
+                rollback_pending: 5,
+            },
+        );
+        assert!(state.engine_normal_backpressured);
+        assert_eq!(state.rollback_outbox_pending, 5);
+    }
+
+    #[test]
     fn enter_opens_details_on_rich_rules() {
         let mut s = state();
         update(&mut s, UiAction::SwitchView(ViewId::RichRules));
@@ -1144,6 +1790,24 @@ mod tests {
         update(&mut s, UiAction::ShowDrift);
         match s.overlays.last() {
             Some(Overlay::Details(content)) => assert!(content.title.starts_with("Drift (")),
+            other => panic!("expected details overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_policy_dependencies_opens_scoped_graph() {
+        let mut s = state();
+        update(&mut s, UiAction::ShowPolicyDependencies);
+        match s.overlays.last() {
+            Some(Overlay::Details(content)) => {
+                assert!(content.title.starts_with("Policy dependency graph"));
+                assert!(
+                    content
+                        .lines
+                        .iter()
+                        .any(|(_, value)| value.contains("public → mypolicy"))
+                );
+            }
             other => panic!("expected details overlay, got {other:?}"),
         }
     }
@@ -1182,28 +1846,715 @@ mod tests {
     }
 
     #[test]
+    fn matching_refresh_overview_becomes_visible() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(9);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert_eq!(
+            state.refresh_overview.as_ref().map(|preview| preview.id),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn stale_refresh_overview_is_ignored() {
+        let mut state = state();
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: crate::application::RefreshId::new(9),
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id: crate::application::RefreshId::new(8),
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert!(state.refresh_overview.is_none());
+    }
+
+    #[test]
+    fn authoritative_snapshot_remains_the_mutation_precondition_during_preview() {
+        let mut state = state();
+        let authoritative = std::sync::Arc::clone(state.snapshot.as_ref().unwrap());
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert!(update(&mut state, UiAction::ToggleMasqueradeRequested).is_empty());
+        let effects = update(&mut state, UiAction::ConfirmAccept);
+
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::Apply(request) if std::sync::Arc::ptr_eq(&request.expected, &authoritative))
+        }));
+    }
+
+    #[test]
+    fn newer_refresh_start_clears_the_previous_preview() {
+        let mut state = state();
+        let first = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: first,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id: first,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: crate::application::RefreshId::new(4),
+                trigger: crate::application::RefreshTrigger::Manual,
+            },
+        );
+
+        assert!(state.refresh_overview.is_none());
+    }
+
+    #[test]
+    fn matching_refresh_cancellation_clears_the_preview() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshCancelled {
+                schedule: refresh_schedule_for(id, crate::application::RefreshTrigger::Periodic),
+                reason: crate::application::RefreshCancellationReason::MutationPreempted,
+                elapsed: std::time::Duration::from_millis(10),
+            },
+        );
+
+        assert!(state.refresh_overview.is_none());
+    }
+
+    #[test]
+    fn matching_refresh_completion_clears_the_preview() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(id, crate::application::RefreshTrigger::Periodic),
+                result: Ok(std::sync::Arc::new(mock::sample().unwrap())),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::from_millis(20),
+                ),
+            },
+        );
+
+        assert!(state.refresh_overview.is_none());
+    }
+
+    #[test]
+    fn stale_refresh_completion_keeps_the_newer_preview() {
+        let mut state = state();
+        let stale_id = crate::application::RefreshId::new(3);
+        let current = crate::application::RefreshId::new(4);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: current,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id: current,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(
+                    stale_id,
+                    crate::application::RefreshTrigger::Manual,
+                ),
+                result: Ok(std::sync::Arc::new(mock::sample().unwrap())),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::from_millis(20),
+                ),
+            },
+        );
+
+        assert_eq!(
+            state.refresh_overview.as_ref().map(|preview| preview.id),
+            Some(current)
+        );
+    }
+
+    #[test]
+    fn preview_zone_rows_are_visible_before_the_first_full_snapshot() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Initial,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert!(!state.all_rows(ViewId::Zones).is_empty());
+    }
+
+    #[test]
+    fn startup_preview_does_not_enable_mutation_without_an_authoritative_snapshot() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Initial,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert!(update(&mut state, UiAction::ToggleMasqueradeRequested).is_empty());
+        assert!(!matches!(state.overlays.last(), Some(Overlay::Confirm(_))));
+    }
+
+    #[test]
+    fn preview_only_cross_zone_row_activation_reports_loading_details() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(3);
+        let work = ZoneName::parse("work").unwrap();
+        let port = "42424/tcp".parse().unwrap();
+        let mut overview = refresh_overview();
+        overview.default_zone = work.clone();
+        overview.runtime.get_mut(&work).unwrap().ports.push(port);
+        state.view = ViewId::Ports;
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+        state.view_state_mut().selected = state
+            .visible_rows()
+            .iter()
+            .position(|row| {
+                matches!(
+                    &row.id,
+                    RowId::Port { zone, port: row_port }
+                        if zone == &work && row_port == &port
+                )
+            })
+            .unwrap();
+
+        update(&mut state, UiAction::ActivateRow);
+
+        assert!(!matches!(state.overlays.last(), Some(Overlay::Details(_))));
+        assert!(
+            state
+                .toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("loading details"))
+        );
+    }
+
+    #[test]
+    fn preview_port_rows_replace_the_stale_authoritative_rows() {
+        let mut state = state();
+        let id = crate::application::RefreshId::new(3);
+        let mut overview = refresh_overview();
+        let public = ZoneName::parse("public").unwrap();
+        overview
+            .runtime
+            .get_mut(&public)
+            .unwrap()
+            .ports
+            .push("42424/tcp".parse().unwrap());
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+
+        let rows = state.all_rows(ViewId::Ports);
+        assert!(rows.iter().any(|row| {
+            matches!(&row.id, RowId::Port { port, .. } if port.to_string() == "42424/tcp")
+        }));
+    }
+
+    #[test]
+    fn service_rows_keep_authoritative_definition_details_during_preview() {
+        let mut state = state();
+        let authoritative = state.all_rows(ViewId::Services);
+        let id = crate::application::RefreshId::new(3);
+        let mut overview = refresh_overview();
+        overview.default_zone = ZoneName::parse("work").unwrap();
+        overview
+            .runtime
+            .get_mut(&ZoneName::parse("public").unwrap())
+            .unwrap()
+            .services
+            .clear();
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+
+        assert_eq!(state.all_rows(ViewId::Services), authoritative);
+    }
+
+    #[test]
+    fn unsupported_ipset_rows_keep_the_authoritative_snapshot_during_preview() {
+        let mut state = state();
+        let authoritative = state.all_rows(ViewId::IpSets);
+        let id = crate::application::RefreshId::new(3);
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        assert_eq!(state.all_rows(ViewId::IpSets), authoritative);
+    }
+
+    #[test]
+    fn stale_refresh_completion_cannot_replace_newer_lifecycle() {
+        use crate::application::{FirewallError, RefreshId, RefreshTrigger};
+        use crate::domain::RefreshObservation;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let mut s = state();
+        let original_snapshot = Arc::clone(s.snapshot.as_ref().unwrap());
+        let previous_refresh = RefreshObservation::total_only(Duration::from_secs(3));
+        s.last_refresh = Some(previous_refresh.clone());
+        s.backend_error = Some(FirewallError::DaemonNotRunning);
+        update(
+            &mut s,
+            UiAction::RefreshStarted {
+                id: RefreshId::new(1),
+                trigger: RefreshTrigger::Manual,
+            },
+        );
+        update(
+            &mut s,
+            UiAction::RefreshStarted {
+                id: RefreshId::new(2),
+                trigger: RefreshTrigger::Periodic,
+            },
+        );
+
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(RefreshId::new(1), RefreshTrigger::Manual),
+                result: Ok(Arc::new(mock::sample().unwrap())),
+                observation: RefreshObservation::total_only(Duration::from_secs(9)),
+            },
+        );
+
+        assert_eq!(s.active_refresh, Some(RefreshId::new(2)));
+        assert!(Arc::ptr_eq(
+            s.snapshot.as_ref().unwrap(),
+            &original_snapshot
+        ));
+        assert_eq!(s.last_refresh, Some(previous_refresh));
+        assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
+    }
+
+    #[test]
     fn refresh_error_keeps_stale_snapshot() {
         use crate::application::ports::FirewallError;
         let mut s = state();
-        update(&mut s, UiAction::RefreshStarted);
-        assert!(s.refreshing);
         update(
             &mut s,
-            UiAction::RefreshCompleted(Err(FirewallError::DaemonNotRunning)),
+            UiAction::RefreshStarted {
+                id: crate::application::RefreshId::new(1),
+                trigger: crate::application::RefreshTrigger::Manual,
+            },
         );
-        assert!(!s.refreshing);
+        assert_eq!(
+            s.active_refresh,
+            Some(crate::application::RefreshId::new(1))
+        );
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule(),
+                result: Err(FirewallError::DaemonNotRunning),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::ZERO,
+                ),
+            },
+        );
+        assert_eq!(s.active_refresh, None);
         assert!(s.snapshot.is_some(), "stale data must survive an error");
         assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
     }
 
     #[test]
+    fn refresh_error_reconciles_reordered_preview_selection_marks_and_priority() {
+        use crate::application::ports::FirewallError;
+
+        let mut state = state();
+        state.view = ViewId::Zones;
+        let id = crate::application::RefreshId::new(3);
+        let public = ZoneName::parse("public").unwrap();
+        let preview_only = ZoneName::parse("aaa-preview").unwrap();
+        let public_row = RowId::Zone(public.clone());
+        let preview_only_row = RowId::Zone(preview_only.clone());
+        let mut overview = refresh_overview();
+        overview.runtime.insert(
+            preview_only.clone(),
+            crate::domain::ZoneDetails::empty(preview_only.clone()),
+        );
+        overview.permanent.insert(
+            preview_only.clone(),
+            crate::domain::ZoneDetails::empty(preview_only),
+        );
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+        update(
+            &mut state,
+            UiAction::RefreshOverviewReady {
+                id,
+                overview: std::sync::Arc::new(overview),
+            },
+        );
+        state.view_state_mut().selected = state
+            .visible_rows()
+            .iter()
+            .position(|row| row.id == public_row)
+            .unwrap();
+        state
+            .view_state_mut()
+            .marked
+            .extend([public_row.clone(), preview_only_row.clone()]);
+
+        update(
+            &mut state,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(id, crate::application::RefreshTrigger::Periodic),
+                result: Err(FirewallError::DaemonNotRunning),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::ZERO,
+                ),
+            },
+        );
+
+        assert_eq!(selected_row_id(&state), Some(public_row.clone()));
+        assert_eq!(
+            state
+                .view_state()
+                .marked
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![public_row]
+        );
+        assert_eq!(state.refresh_priority().zone, Some(public));
+    }
+
+    #[test]
+    fn matching_cancellation_clears_spinner_without_error_or_snapshot_loss() {
+        use crate::application::{
+            FirewallError, RefreshCancellationReason, RefreshId, RefreshScheduleObservation,
+            RefreshTrigger,
+        };
+        use crate::domain::RefreshObservation;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let mut s = state();
+        let original_snapshot = Arc::clone(s.snapshot.as_ref().unwrap());
+        let previous_refresh = RefreshObservation::total_only(Duration::from_secs(7));
+        s.last_refresh = Some(previous_refresh.clone());
+        s.backend_error = Some(FirewallError::DaemonNotRunning);
+        update(
+            &mut s,
+            UiAction::RefreshStarted {
+                id: RefreshId::new(9),
+                trigger: RefreshTrigger::Manual,
+            },
+        );
+        update(
+            &mut s,
+            UiAction::RefreshOverviewReady {
+                id: RefreshId::new(9),
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+        assert_eq!(s.active_refresh, Some(RefreshId::new(9)));
+
+        update(
+            &mut s,
+            UiAction::RefreshCancelled {
+                schedule: RefreshScheduleObservation {
+                    id: RefreshId::new(9),
+                    trigger: RefreshTrigger::Manual,
+                    merged_manual_requests: 0,
+                    coalesced_periodic_ticks: 0,
+                },
+                reason: RefreshCancellationReason::MutationPreempted,
+                elapsed: Duration::from_millis(20),
+            },
+        );
+
+        assert_eq!(s.active_refresh, None);
+        assert!(Arc::ptr_eq(
+            s.snapshot.as_ref().unwrap(),
+            &original_snapshot
+        ));
+        assert_eq!(s.last_refresh, Some(previous_refresh));
+        assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
+    }
+
+    #[test]
+    fn manual_demand_rejection_preserves_lifecycle_and_allows_completion() {
+        use crate::application::{FirewallError, RefreshId, RefreshTrigger};
+        use crate::domain::RefreshObservation;
+        use std::num::NonZeroU64;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let mut s = state();
+        let refresh_id = RefreshId::new(9);
+        let original_snapshot = Arc::clone(s.snapshot.as_ref().unwrap());
+        let previous_refresh = RefreshObservation::total_only(Duration::from_secs(7));
+        s.active_refresh = Some(refresh_id);
+        s.backend_error = Some(FirewallError::DaemonNotRunning);
+        s.last_refresh = Some(previous_refresh.clone());
+        let toast_count = s.toasts.len();
+
+        assert!(
+            update(
+                &mut s,
+                UiAction::ManualDemandRejected {
+                    count: NonZeroU64::new(7).unwrap(),
+                },
+            )
+            .is_empty()
+        );
+
+        assert_eq!(s.active_refresh, Some(refresh_id));
+        assert!(Arc::ptr_eq(
+            s.snapshot.as_ref().unwrap(),
+            &original_snapshot
+        ));
+        assert_eq!(s.backend_error, Some(FirewallError::DaemonNotRunning));
+        assert_eq!(s.last_refresh, Some(previous_refresh));
+        assert_eq!(s.toasts.len(), toast_count + 1);
+        let toast = s.toasts.back().unwrap();
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert!(toast.text.contains("7 request(s) not queued"));
+
+        let completed_snapshot = Arc::new(mock::sample().unwrap());
+        let completed_refresh = RefreshObservation::total_only(Duration::from_millis(42));
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(refresh_id, RefreshTrigger::Manual),
+                result: Ok(Arc::clone(&completed_snapshot)),
+                observation: completed_refresh.clone(),
+            },
+        );
+
+        assert_eq!(s.active_refresh, None);
+        assert!(Arc::ptr_eq(
+            s.snapshot.as_ref().unwrap(),
+            &completed_snapshot
+        ));
+        assert_eq!(s.backend_error, None);
+        assert_eq!(s.last_refresh, Some(completed_refresh));
+    }
+
+    #[test]
+    fn mismatched_cancellation_does_not_clear_active_refresh() {
+        use crate::application::{
+            RefreshCancellationReason, RefreshId, RefreshScheduleObservation, RefreshTrigger,
+        };
+        use std::time::Duration;
+
+        let mut s = state();
+        update(
+            &mut s,
+            UiAction::RefreshStarted {
+                id: RefreshId::new(9),
+                trigger: RefreshTrigger::Manual,
+            },
+        );
+        update(
+            &mut s,
+            UiAction::RefreshOverviewReady {
+                id: RefreshId::new(9),
+                overview: std::sync::Arc::new(refresh_overview()),
+            },
+        );
+
+        update(
+            &mut s,
+            UiAction::RefreshCancelled {
+                schedule: RefreshScheduleObservation {
+                    id: RefreshId::new(8),
+                    trigger: RefreshTrigger::Periodic,
+                    merged_manual_requests: 0,
+                    coalesced_periodic_ticks: 0,
+                },
+                reason: RefreshCancellationReason::MutationPreempted,
+                elapsed: Duration::from_millis(20),
+            },
+        );
+
+        assert_eq!(s.active_refresh, Some(RefreshId::new(9)));
+        assert_eq!(
+            s.refresh_overview.as_ref().map(|preview| preview.id),
+            Some(RefreshId::new(9))
+        );
+    }
+
+    #[test]
     fn successful_refresh_clears_error_and_swaps_snapshot() {
         use crate::application::ports::FirewallError;
+        use crate::domain::RefreshObservation;
+        use std::time::Duration;
+
         let mut s = state();
         s.backend_error = Some(FirewallError::DaemonNotRunning);
         let snapshot = std::sync::Arc::new(mock::sample().unwrap());
-        update(&mut s, UiAction::RefreshCompleted(Ok(snapshot)));
+        let observation = RefreshObservation::total_only(Duration::from_millis(42));
+        begin_refresh(&mut s);
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule(),
+                result: Ok(snapshot),
+                observation: observation.clone(),
+            },
+        );
         assert!(s.backend_error.is_none());
+        assert_eq!(s.last_refresh, Some(observation));
     }
 
     #[test]
@@ -1226,12 +2577,44 @@ mod tests {
         }
         let effects = update(&mut s, UiAction::ConfirmAccept);
         match &effects[..] {
-            [Effect::Apply(FirewallOperation::AddService { service, .. })] => {
+            [Effect::Apply(request)] => {
+                let FirewallOperation::AddService { service, .. } = &request.operation else {
+                    panic!("expected AddService, got {:?}", request.operation);
+                };
                 assert_eq!(service.as_str(), "mdns");
             }
             other => panic!("expected apply effect, got {other:?}"),
         }
         assert!(s.overlays.is_empty());
+    }
+
+    #[test]
+    fn confirmation_keeps_the_snapshot_that_was_reviewed() {
+        let mut s = state();
+        let reviewed_snapshot = s.snapshot.clone().unwrap();
+        update(
+            &mut s,
+            UiAction::RequestOperation(FirewallOperation::AddService {
+                zone: ZoneName::parse("public").unwrap(),
+                service: ServiceName::parse("mdns").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            }),
+        );
+        assert!(matches!(s.overlays.last(), Some(Overlay::Confirm(_))));
+
+        let mut changed = (*reviewed_snapshot).clone();
+        changed.status.panic_mode = !changed.status.panic_mode;
+        s.snapshot = Some(std::sync::Arc::new(changed));
+
+        let effects = update(&mut s, UiAction::ConfirmAccept);
+        let [Effect::Apply(request)] = effects.as_slice() else {
+            panic!("expected one apply request, got {effects:?}");
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            &request.expected,
+            &reviewed_snapshot
+        ));
+        assert_ne!(request.expected, s.snapshot.clone().unwrap());
     }
 
     #[test]
@@ -1245,6 +2628,64 @@ mod tests {
         update(&mut s, UiAction::FormSubmit);
         assert!(matches!(s.overlays.last(), Some(Overlay::Form(_))));
         assert_eq!(s.toasts.back().map(|t| t.kind), Some(ToastKind::Warning));
+    }
+
+    #[test]
+    fn interactive_form_input_is_bounded_by_utf8_bytes() {
+        let mut s = state();
+        update(&mut s, UiAction::OpenForm(FormKind::AddRichRule));
+        let Some(Overlay::Form(form)) = s.overlays.last_mut() else {
+            panic!("expected form overlay");
+        };
+        form.buffer = "x".repeat(MAX_INTERACTIVE_INPUT_BYTES - 1);
+
+        update(&mut s, UiAction::FormInput('é'));
+
+        let Some(Overlay::Form(form)) = s.overlays.last() else {
+            panic!("expected form overlay");
+        };
+        assert_eq!(form.buffer.len(), MAX_INTERACTIVE_INPUT_BYTES - 1);
+        assert!(s.toasts.back().is_some_and(|toast| {
+            toast.kind == ToastKind::Warning && toast.text.contains("input limit")
+        }));
+    }
+
+    #[test]
+    fn rich_builder_input_is_bounded() {
+        let mut s = state();
+        update(&mut s, UiAction::OpenRichBuilder);
+        let Some(Overlay::RichBuilder(builder)) = s.overlays.last_mut() else {
+            panic!("expected rich-rule builder");
+        };
+        builder.buffer = "x".repeat(MAX_INTERACTIVE_INPUT_BYTES);
+
+        update(&mut s, UiAction::RichBuilderInput('x'));
+
+        let Some(Overlay::RichBuilder(builder)) = s.overlays.last() else {
+            panic!("expected rich-rule builder");
+        };
+        assert_eq!(builder.buffer.len(), MAX_INTERACTIVE_INPUT_BYTES);
+        assert!(s.toasts.back().is_some_and(|toast| {
+            toast.kind == ToastKind::Warning && toast.text.contains("input limit")
+        }));
+    }
+
+    #[test]
+    fn oversized_prefilled_form_value_is_rejected() {
+        let mut s = state();
+
+        update(
+            &mut s,
+            UiAction::OpenFormPrefilled(
+                FormKind::AddRichRule,
+                "x".repeat(MAX_INTERACTIVE_INPUT_BYTES + 1),
+            ),
+        );
+
+        assert!(s.overlays.is_empty());
+        assert!(s.toasts.back().is_some_and(|toast| {
+            toast.kind == ToastKind::Warning && toast.text.contains("prefilled value")
+        }));
     }
 
     #[test]
@@ -1271,14 +2712,70 @@ mod tests {
     }
 
     #[test]
-    fn mark_key_distinguishes_rows_sharing_a_first_cell() {
-        // 8080/tcp and 8080/udp must not share a mark key.
-        let tcp = vec!["8080".to_owned(), "tcp".to_owned(), "runtime".to_owned()];
-        let udp = vec!["8080".to_owned(), "udp".to_owned(), "runtime".to_owned()];
-        assert_ne!(
-            crate::ui::state::row_key(&tcp),
-            crate::ui::state::row_key(&udp)
+    fn typed_row_identity_distinguishes_protocol_and_zone() {
+        let public = ZoneName::parse("public").unwrap();
+        let dmz = ZoneName::parse("dmz").unwrap();
+        let tcp = RowId::Port {
+            zone: public.clone(),
+            port: "8080/tcp".parse().unwrap(),
+        };
+        let udp = RowId::Port {
+            zone: public,
+            port: "8080/udp".parse().unwrap(),
+        };
+        let other_zone = RowId::Port {
+            zone: dmz,
+            port: "8080/tcp".parse().unwrap(),
+        };
+        assert_ne!(tcp, udp);
+        assert_ne!(tcp, other_zone);
+    }
+
+    #[test]
+    fn refresh_reconciliation_drops_stale_typed_marks() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Services));
+        s.view_state_mut().marked.insert(RowId::Service {
+            zone: ZoneName::parse("ghost").unwrap(),
+            service: ServiceName::parse("ssh").unwrap(),
+        });
+        clamp_selection(&mut s);
+        assert!(s.view_state().marked.is_empty());
+    }
+
+    #[test]
+    fn refresh_keeps_selection_on_the_same_typed_row_after_reordering() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Services));
+        let ssh_index = s
+            .visible_rows()
+            .iter()
+            .position(|row| row[0] == "ssh")
+            .unwrap();
+        s.view_state_mut().selected = ssh_index;
+        let selected = selected_row_id(&s).unwrap();
+
+        let mut refreshed = mock::sample().unwrap();
+        refreshed
+            .runtime
+            .get_mut(&ZoneName::parse("public").unwrap())
+            .unwrap()
+            .services
+            .push(ServiceName::parse("aardvark").unwrap());
+        begin_refresh(&mut s);
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule(),
+                result: Ok(std::sync::Arc::new(refreshed)),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::ZERO,
+                ),
+            },
         );
+
+        assert_eq!(selected_row_id(&s), Some(selected));
+        assert!(s.view_state().selected > ssh_index);
     }
 
     #[test]
@@ -1323,8 +2820,9 @@ mod tests {
         update(&mut s, UiAction::ToggleForwardRequested);
         match s.overlays.last() {
             Some(Overlay::Confirm(c)) => assert!(matches!(
-                c.on_confirm,
-                UiAction::ApplyOperation(FirewallOperation::SetForward { .. })
+                &c.on_confirm,
+                UiAction::ApplyOperation(request)
+                    if matches!(request.operation, FirewallOperation::SetForward { .. })
             )),
             other => panic!("expected a SetForward confirmation, got {other:?}"),
         }
@@ -1340,8 +2838,9 @@ mod tests {
         update(&mut s, UiAction::FormSubmit);
         match s.overlays.last() {
             Some(Overlay::Confirm(c)) => assert!(matches!(
-                c.on_confirm,
-                UiAction::ApplyOperation(FirewallOperation::SetZoneTarget { .. })
+                &c.on_confirm,
+                UiAction::ApplyOperation(request)
+                    if matches!(request.operation, FirewallOperation::SetZoneTarget { .. })
             )),
             other => panic!("expected a SetZoneTarget confirmation, got {other:?}"),
         }
@@ -1358,13 +2857,16 @@ mod tests {
         update(&mut s, UiAction::DeleteEntry);
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => {
+                let UiAction::ApplyOperation(request) = &confirmation.on_confirm else {
+                    panic!("expected apply operation");
+                };
                 assert_eq!(
-                    confirmation.on_confirm,
-                    UiAction::ApplyOperation(FirewallOperation::RemoveService {
+                    request.operation,
+                    FirewallOperation::RemoveService {
                         zone: ZoneName::parse("public").unwrap(),
                         service: ServiceName::parse("http").unwrap(),
                         target: ConfigurationTarget::Runtime,
-                    })
+                    }
                 );
                 assert!(confirmation.body.iter().any(|l| l.contains("⚠")));
             }
@@ -1402,7 +2904,7 @@ mod tests {
         let effects = update(&mut s, UiAction::ReloadRequested);
         assert!(matches!(
             &effects[..],
-            [Effect::Apply(FirewallOperation::Reload)]
+            [Effect::Apply(request)] if request.operation == FirewallOperation::Reload
         ));
         assert!(s.overlays.is_empty());
     }
@@ -1414,9 +2916,9 @@ mod tests {
         let operation = FirewallOperation::Reload;
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Applied {
+            finished(
+                1,
+                OperationOutcome::Applied {
                     operation,
                     steps: vec![StepReport {
                         target: "global",
@@ -1424,7 +2926,8 @@ mod tests {
                         result: Ok(()),
                     }],
                 },
-            },
+                None,
+            ),
         );
         assert_eq!(s.toasts.back().map(|t| t.kind), Some(ToastKind::Success));
     }
@@ -1456,7 +2959,7 @@ mod tests {
                 },
             ],
         };
-        update(&mut s, UiAction::OperationFinished { op_id: 1, outcome });
+        update(&mut s, finished(1, outcome, None));
         assert_eq!(s.toasts.back().map(|t| t.kind), Some(ToastKind::Error));
         match s.overlays.last() {
             Some(Overlay::Details(content)) => {
@@ -1485,10 +2988,62 @@ mod tests {
             batch.push(entry(LogAction::Drop));
         }
         update(&mut s, UiAction::LogsReceived(batch));
-        assert_eq!(s.log_buffer.len(), 1000, "ring buffer is bounded");
+        assert_eq!(
+            s.all_rows(ViewId::Logs).len(),
+            1000,
+            "ring buffer is bounded"
+        );
         assert_eq!(s.denied_session, 1201);
         update(&mut s, UiAction::SwitchView(ViewId::Logs));
         assert_eq!(s.visible_rows().len(), 1000);
+    }
+
+    #[test]
+    fn duplicate_log_lines_receive_distinct_row_identities() {
+        use crate::domain::{LogAction, LogEntry};
+
+        let mut s = state();
+        let entry = LogEntry {
+            time: "10:00:00".into(),
+            action: LogAction::Drop,
+            src: "1.2.3.4".into(),
+            dst: "5.6.7.8".into(),
+            dport: "22".into(),
+            proto: "TCP".into(),
+            iface: "eth0".into(),
+        };
+        update(&mut s, UiAction::LogsReceived(vec![entry.clone(), entry]));
+        let rows = s.all_rows(ViewId::Logs);
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].id, rows[1].id);
+    }
+
+    #[test]
+    fn incoming_logs_keep_selection_on_the_same_entry() {
+        use crate::domain::{LogAction, LogEntry};
+
+        let entry = |time: &str| LogEntry {
+            time: time.into(),
+            action: LogAction::Drop,
+            src: "1.2.3.4".into(),
+            dst: "5.6.7.8".into(),
+            dport: "22".into(),
+            proto: "TCP".into(),
+            iface: "eth0".into(),
+        };
+        let mut s = state();
+        update(
+            &mut s,
+            UiAction::LogsReceived(vec![entry("10:00:00"), entry("10:00:01")]),
+        );
+        update(&mut s, UiAction::SwitchView(ViewId::Logs));
+        s.view_state_mut().selected = 1;
+        let selected = selected_row_id(&s).unwrap();
+
+        update(&mut s, UiAction::LogsReceived(vec![entry("10:00:02")]));
+
+        assert_eq!(selected_row_id(&s), Some(selected));
+        assert_eq!(s.view_state().selected, 2);
     }
 
     #[test]
@@ -1515,10 +3070,11 @@ mod tests {
         let Some(Overlay::Confirm(confirm)) = s.overlays.last() else {
             panic!("expected a confirmation overlay");
         };
-        let UiAction::ApplyOperation(FirewallOperation::AddRichRule { zone, rule, .. }) =
-            &confirm.on_confirm
-        else {
+        let UiAction::ApplyOperation(request) = &confirm.on_confirm else {
             panic!("expected AddRichRule, got {:?}", confirm.on_confirm);
+        };
+        let FirewallOperation::AddRichRule { zone, rule, .. } = &request.operation else {
+            panic!("expected AddRichRule, got {:?}", request.operation);
         };
         // Zone resolved from the ingress interface, not the (spoofable) source.
         assert_eq!(zone.as_str(), "public");
@@ -1604,6 +3160,7 @@ mod tests {
             target: ConfigurationTarget::Runtime,
         };
         s.pending_rollback.push(crate::ui::state::PendingRollback {
+            id: crate::application::ports::RollbackGuardId::new(1),
             inverse: op.inverse().unwrap(),
             description: op.describe(),
             forward: op,
@@ -1668,12 +3225,12 @@ mod tests {
             target: ConfigurationTarget::Runtime,
         };
         // Pre-armed at apply time; the successful outcome keeps it armed.
-        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        update(&mut s, UiAction::ApplyOperation(reviewed(op.clone())));
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Applied {
+            finished(
+                1,
+                OperationOutcome::Applied {
                     operation: op.clone(),
                     steps: vec![StepReport {
                         target: "runtime",
@@ -1681,12 +3238,23 @@ mod tests {
                         result: Ok(()),
                     }],
                 },
-            },
+                Some(rollback(1, &op, None)),
+            ),
         );
         assert!(!s.pending_rollback.is_empty(), "risky op arms rollback");
         // A refresh must NOT promote an armed op to undoable.
         let snap = std::sync::Arc::new(mock::sample().unwrap());
-        update(&mut s, UiAction::RefreshCompleted(Ok(snap)));
+        begin_refresh(&mut s);
+        update(
+            &mut s,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule(),
+                result: Ok(snap),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::ZERO,
+                ),
+            },
+        );
         assert!(
             s.undo_stack.is_empty(),
             "armed op must not also be undoable"
@@ -1699,6 +3267,7 @@ mod tests {
 
     #[test]
     fn undo_stack_reverts_operations_newest_first() {
+        use crate::application::ports::OperationOutcome;
         let mut s = state();
         s.rollback_ticks = 120;
         // Two risky, reversible ops; keeping resolves both onto the undo stack.
@@ -1712,8 +3281,21 @@ mod tests {
             port: "8080/tcp".parse().unwrap(),
             target: ConfigurationTarget::Runtime,
         };
-        update(&mut s, UiAction::ApplyOperation(a.clone()));
-        update(&mut s, UiAction::ApplyOperation(b.clone()));
+        update(&mut s, UiAction::ApplyOperation(reviewed(a.clone())));
+        update(&mut s, UiAction::ApplyOperation(reviewed(b.clone())));
+        for (id, operation) in [(1, a.clone()), (2, b.clone())] {
+            update(
+                &mut s,
+                finished(
+                    id,
+                    OperationOutcome::Applied {
+                        operation: operation.clone(),
+                        steps: Vec::new(),
+                    },
+                    Some(rollback(id, &operation, None)),
+                ),
+            );
+        }
         update(&mut s, UiAction::KeepChanges);
 
         // Both undoable, newest (the port) on top.
@@ -1874,13 +3456,127 @@ mod tests {
     }
 
     #[test]
+    fn policy_workspace_opens_typed_details() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Policies));
+        update(&mut s, UiAction::ActivateRow);
+
+        match s.overlays.last() {
+            Some(Overlay::Details(content)) => assert_eq!(content.title, "Policy `mypolicy`"),
+            other => panic!("expected policy details, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_on_policy_prefills_the_selected_policy() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Policies));
+        update(&mut s, UiAction::AddEntry);
+
+        match s.overlays.last() {
+            Some(Overlay::Form(form)) => {
+                assert_eq!(form.kind, FormKind::AddPolicyService);
+                assert_eq!(form.buffer, "mypolicy ");
+            }
+            other => panic!("expected prefilled policy form, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_rule_add_flow_builds_reviewed_migration_operation() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Direct));
+        update(&mut s, UiAction::AddEntry);
+        assert!(matches!(
+            s.overlays.last(),
+            Some(Overlay::Form(form)) if form.kind == FormKind::MigrateDirectRule
+        ));
+        for ch in "direct-web".chars() {
+            update(&mut s, UiAction::FormInput(ch));
+        }
+        update(&mut s, UiAction::FormSubmit);
+
+        match s.overlays.last() {
+            Some(Overlay::Confirm(confirmation)) => match &confirmation.on_confirm {
+                UiAction::ApplyOperation(request) => {
+                    let FirewallOperation::MigrateDirectRule { migration } = &request.operation
+                    else {
+                        panic!("expected migration operation, got {:?}", request.operation);
+                    };
+                    assert_eq!(migration.policy().as_str(), "direct-web");
+                    assert_eq!(migration.ingress_zone(), "ANY");
+                    assert_eq!(migration.egress_zone(), "HOST");
+                    assert!(migration.rich_rule().as_str().contains("port=\"12345\""));
+                }
+                other => panic!("expected migration operation, got {other:?}"),
+            },
+            other => panic!("expected migration confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_rule_add_flow_rejects_manual_only_rule_before_form() {
+        let mut s = state();
+        let mut snapshot = mock::sample().unwrap();
+        snapshot.direct_rules = vec!["ipv4 nat PREROUTING 0 -j DNAT".to_owned()];
+        s.snapshot = Some(std::sync::Arc::new(snapshot));
+        update(&mut s, UiAction::SwitchView(ViewId::Direct));
+        update(&mut s, UiAction::AddEntry);
+        assert!(s.overlays.is_empty());
+        assert!(
+            s.toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("manual migration required"))
+        );
+    }
+
+    #[test]
+    fn direct_migration_assistant_opens_classification_workspace() {
+        let mut s = state();
+        update(&mut s, UiAction::ShowDirectMigration);
+        match s.overlays.last() {
+            Some(Overlay::Details(content)) => {
+                assert!(content.title.contains("Direct migration assistant"));
+                assert!(content.title.contains("1/1 eligible"));
+            }
+            other => panic!("expected migration details, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_on_policy_uses_typed_identity() {
+        let mut s = state();
+        update(&mut s, UiAction::SwitchView(ViewId::Policies));
+        update(&mut s, UiAction::DeleteEntry);
+
+        match s.overlays.last() {
+            Some(Overlay::Confirm(confirmation)) => {
+                let UiAction::ApplyOperation(request) = &confirmation.on_confirm else {
+                    panic!("expected policy delete operation");
+                };
+                assert_eq!(
+                    request.operation,
+                    FirewallOperation::DeletePolicy {
+                        policy: crate::domain::PolicyName::parse("mypolicy").unwrap(),
+                    }
+                );
+            }
+            other => panic!("expected policy delete confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn delete_on_interfaces_follows_the_perspective() {
         let mut s = state();
         update(&mut s, UiAction::SwitchView(ViewId::Interfaces));
         update(&mut s, UiAction::DeleteEntry);
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => match &confirmation.on_confirm {
-                UiAction::ApplyOperation(FirewallOperation::RemoveInterface { target, .. }) => {
+                UiAction::ApplyOperation(request) => {
+                    let FirewallOperation::RemoveInterface { target, .. } = &request.operation
+                    else {
+                        panic!("unexpected operation: {:?}", request.operation);
+                    };
                     assert_eq!(*target, ConfigurationTarget::Runtime);
                 }
                 other => panic!("unexpected operation: {other:?}"),
@@ -1913,11 +3609,14 @@ mod tests {
         update(&mut s, UiAction::FormSubmit);
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => {
+                let UiAction::ApplyOperation(request) = &confirmation.on_confirm else {
+                    panic!("expected create-zone operation");
+                };
                 assert_eq!(
-                    confirmation.on_confirm,
-                    UiAction::ApplyOperation(FirewallOperation::CreateZone {
+                    request.operation,
+                    FirewallOperation::CreateZone {
                         zone: ZoneName::parse("staging").unwrap(),
-                    })
+                    }
                 );
             }
             other => panic!("expected confirmation, got {other:?}"),
@@ -1939,7 +3638,10 @@ mod tests {
         update(&mut s, UiAction::FormSubmit);
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => match &confirmation.on_confirm {
-                UiAction::ApplyOperation(FirewallOperation::AddIpSetEntry { name, .. }) => {
+                UiAction::ApplyOperation(request) => {
+                    let FirewallOperation::AddIpSetEntry { name, .. } = &request.operation else {
+                        panic!("unexpected operation: {:?}", request.operation);
+                    };
                     assert_eq!(name.as_str(), "blocklist");
                 }
                 other => panic!("unexpected operation: {other:?}"),
@@ -1982,7 +3684,11 @@ mod tests {
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => {
                 match &confirmation.on_confirm {
-                    UiAction::ApplyOperation(FirewallOperation::AddService { target, .. }) => {
+                    UiAction::ApplyOperation(request) => {
+                        let FirewallOperation::AddService { target, .. } = &request.operation
+                        else {
+                            panic!("unexpected operation: {:?}", request.operation);
+                        };
                         assert_eq!(*target, ConfigurationTarget::Permanent, "must narrow");
                     }
                     other => panic!("unexpected operation: {other:?}"),
@@ -2013,6 +3719,40 @@ mod tests {
                 .unwrap()
                 .text
                 .contains("reload (ctrl-r) first")
+        );
+    }
+
+    #[test]
+    fn incomplete_runtime_zone_state_is_not_mistaken_for_permanent_only() {
+        let mut s = state();
+        let mut snapshot = mock::sample().unwrap();
+        let staging = ZoneName::parse("staging").unwrap();
+        snapshot.permanent.insert(
+            staging.clone(),
+            crate::domain::ZoneDetails::empty(staging.clone()),
+        );
+        snapshot.degraded.push(crate::domain::DegradedSection::new(
+            SnapshotSection::Zones,
+            Some(ConfigurationTarget::Runtime),
+            "runtime zone listing failed",
+        ));
+        s.snapshot = Some(std::sync::Arc::new(snapshot));
+
+        update(
+            &mut s,
+            UiAction::RequestOperation(FirewallOperation::AddService {
+                zone: staging,
+                service: ServiceName::parse("https").unwrap(),
+                target: ConfigurationTarget::RuntimeAndPermanent,
+            }),
+        );
+        assert!(s.overlays.is_empty());
+        assert!(
+            s.toasts
+                .back()
+                .unwrap()
+                .text
+                .contains("snapshot is incomplete")
         );
     }
 
@@ -2093,26 +3833,31 @@ mod tests {
             service: ServiceName::parse("http").unwrap(),
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
-        // Pre-armed at apply time, before the outcome comes back.
-        update(&mut s, UiAction::ApplyOperation(operation.clone()));
+        // The execution layer owns pre-arming; the reducer registers the
+        // rollback only after it receives the successful outcome.
+        update(
+            &mut s,
+            UiAction::ApplyOperation(reviewed(operation.clone())),
+        );
         assert!(
-            !s.pending_rollback.is_empty(),
-            "risky op must pre-arm rollback"
+            s.pending_rollback.is_empty(),
+            "the reducer must not invent an armed guard before execution"
         );
         // The apply succeeds → the rollback stays armed for the countdown.
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Applied {
-                    operation,
+            finished(
+                1,
+                OperationOutcome::Applied {
+                    operation: operation.clone(),
                     steps: vec![StepReport {
                         target: "runtime",
                         invocation: vec!["x".to_owned()],
                         result: Ok(()),
                     }],
                 },
-            },
+                Some(rollback(1, &operation, Some("fwdeck-rollback-test-1"))),
+            ),
         );
         assert!(
             !s.pending_rollback.is_empty(),
@@ -2123,7 +3868,172 @@ mod tests {
     }
 
     #[test]
-    fn clean_failure_retracts_the_pre_armed_rollback() {
+    fn operation_outcome_converts_one_reservation_to_armed_or_releases_it() {
+        let mut state = state();
+        state.rollback_reservations = 1;
+        update(&mut state, applied_risky_result_with_registration());
+        assert_eq!(state.rollback_reservations, 0);
+        assert_eq!(state.pending_rollback.len(), 1);
+    }
+
+    #[test]
+    fn registration_without_reservation_immediately_dispatches_its_inverse() {
+        use crate::application::ports::OperationOutcome;
+
+        let mut state = state();
+        state.pending_rollback = pending_rollbacks(super::super::outbox::ROLLBACK_OUTBOX_CAPACITY);
+        let operation = FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("http").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+
+        let effects = update(
+            &mut state,
+            finished(
+                1,
+                OperationOutcome::Applied {
+                    operation: operation.clone(),
+                    steps: Vec::new(),
+                },
+                Some(rollback(1, &operation, Some("fwdeck-rollback-unreserved"))),
+            ),
+        );
+
+        assert_eq!(
+            state.pending_rollback.len(),
+            super::super::outbox::ROLLBACK_OUTBOX_CAPACITY
+        );
+        assert_eq!(
+            state.pending_rollback.len()
+                + state.rollback_outbox_pending
+                + state.rollback_reservations,
+            super::super::outbox::ROLLBACK_OUTBOX_CAPACITY
+        );
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Error && toast.text.contains("without a rollback reservation")
+        }));
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::ApplyRollback { .. }))
+                .count(),
+            1
+        );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ApplyRollback {
+                id,
+                operation: FirewallOperation::AddService { service, .. },
+                watchdog_unit: Some(unit),
+            } if *id == crate::application::ports::RollbackGuardId::new(1)
+                && service.as_str() == "http"
+                && unit == "fwdeck-rollback-unreserved"
+        )));
+    }
+
+    #[test]
+    fn completed_rollback_does_not_consume_a_forward_operation_reservation() {
+        use crate::application::ports::OperationOutcome;
+
+        let mut state = state();
+        state.rollback_reservations = 1;
+        let operation = FirewallOperation::SetDefaultZone {
+            zone: ZoneName::parse("public").unwrap(),
+        };
+        update(
+            &mut state,
+            UiAction::OperationFinished(Box::new(crate::application::api::OperationResult {
+                op_id: 1,
+                outcome: OperationOutcome::Applied {
+                    operation,
+                    steps: Vec::new(),
+                },
+                rollback: None,
+                guard_warning: None,
+                completed_rollback: Some(crate::application::ports::RollbackGuardId::new(1)),
+            })),
+        );
+        assert_eq!(state.rollback_reservations, 1);
+    }
+
+    #[test]
+    fn halted_plan_releases_reservations_for_unexecuted_risky_operations() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        state.staged = two_risky_operations();
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyStagedPlan).as_slice(),
+            [Effect::ApplyPlan(_)]
+        ));
+        let id = active_plan_id(&state);
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id,
+                applied: 0,
+                remaining: two_risky_operations(),
+            },
+        );
+        assert_eq!(state.rollback_reservations, 0);
+    }
+
+    #[test]
+    fn plan_preflight_event_pair_releases_only_unconsumed_reservations() {
+        use crate::application::ports::{FirewallError, OperationOutcome};
+
+        let mut state = state();
+        state.confirm_destructive = false;
+        let operations = two_risky_operations();
+        state.staged = operations.clone();
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyStagedPlan).as_slice(),
+            [Effect::ApplyPlan(_)]
+        ));
+        assert_eq!(state.rollback_reservations, 2);
+
+        update(
+            &mut state,
+            finished(
+                1,
+                OperationOutcome::Failed {
+                    operation: operations[0].clone(),
+                    steps: vec![crate::application::ports::StepReport {
+                        target: "runtime",
+                        invocation: Vec::new(),
+                        result: Err(FirewallError::DaemonNotRunning),
+                    }],
+                },
+                None,
+            ),
+        );
+        assert_eq!(state.rollback_reservations, 1);
+
+        let id = active_plan_id(&state);
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id,
+                applied: 0,
+                remaining: operations,
+            },
+        );
+        assert_eq!(state.rollback_reservations, 0);
+
+        let effects = update(
+            &mut state,
+            UiAction::ApplyOperation(reviewed(FirewallOperation::RemoveService {
+                zone: ZoneName::parse("public").unwrap(),
+                service: ServiceName::parse("http").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            })),
+        );
+        assert!(matches!(effects.as_slice(), [Effect::Apply(_)]));
+        assert_eq!(state.rollback_reservations, 1);
+    }
+
+    #[test]
+    fn clean_failure_does_not_register_a_rollback() {
         use crate::application::ports::{FirewallError, OperationOutcome, StepReport};
         let mut s = state();
         s.rollback_ticks = 120;
@@ -2132,15 +4042,18 @@ mod tests {
             service: ServiceName::parse("http").unwrap(),
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
-        update(&mut s, UiAction::ApplyOperation(operation.clone()));
-        assert!(!s.pending_rollback.is_empty(), "pre-armed before apply");
-        // The apply failed at the first step → nothing changed, so the
-        // pre-armed watchdog must be retracted (else it fires a stale inverse).
+        update(
+            &mut s,
+            UiAction::ApplyOperation(reviewed(operation.clone())),
+        );
+        assert!(s.pending_rollback.is_empty());
+        // The engine retracts the pre-armed guard before emitting a clean
+        // failure, so the UI must not receive or create a rollback entry.
         let effects = update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Failed {
+            finished(
+                1,
+                OperationOutcome::Failed {
                     operation,
                     steps: vec![StepReport {
                         target: "runtime",
@@ -2148,7 +4061,8 @@ mod tests {
                         result: Err(FirewallError::DaemonNotRunning),
                     }],
                 },
-            },
+                None,
+            ),
         );
         assert!(
             s.pending_rollback.is_empty(),
@@ -2157,9 +4071,54 @@ mod tests {
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::DisarmWatchdog { .. })),
-            "the stale watchdog must be disarmed"
+                .all(|effect| !matches!(effect, Effect::Apply(_))),
+            "a clean failure must never apply an inverse"
         );
+    }
+
+    #[test]
+    fn risky_failure_without_registration_releases_and_reuses_single_capacity() {
+        use crate::application::ports::{FirewallError, OperationOutcome, StepReport};
+
+        let mut state = state();
+        let operation = FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("http").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        assert!(matches!(
+            update(
+                &mut state,
+                UiAction::ApplyOperation(reviewed(operation.clone()))
+            )
+            .as_slice(),
+            [Effect::Apply(_)]
+        ));
+        assert_eq!(state.rollback_reservations, 1);
+
+        update(
+            &mut state,
+            finished(
+                1,
+                OperationOutcome::Failed {
+                    operation: operation.clone(),
+                    steps: vec![StepReport {
+                        target: "runtime",
+                        invocation: Vec::new(),
+                        result: Err(FirewallError::DaemonNotRunning),
+                    }],
+                },
+                None,
+            ),
+        );
+        assert_eq!(state.rollback_reservations, 0);
+        assert!(state.pending_rollback.is_empty());
+
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyOperation(reviewed(operation))).as_slice(),
+            [Effect::Apply(_)]
+        ));
+        assert_eq!(state.rollback_reservations, 1);
     }
 
     #[test]
@@ -2172,28 +4131,33 @@ mod tests {
             target: ConfigurationTarget::Runtime,
         };
         // Apply arms the rollback (its countdown is not started yet)...
-        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        update(&mut s, UiAction::ApplyOperation(reviewed(op.clone())));
         // ...the applied outcome lands, which starts the countdown from now...
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: crate::application::ports::OperationOutcome::Applied {
-                    operation: op,
+            finished(
+                1,
+                crate::application::ports::OperationOutcome::Applied {
+                    operation: op.clone(),
                     steps: Vec::new(),
                 },
-            },
+                Some(rollback(1, &op, Some("fwdeck-rollback-test-1"))),
+            ),
         );
         // ...the operator walks away: two ticks reach the deadline → the
-        // watchdog is disarmed (we revert in-process) and the inverse applies.
+        // the inverse is sent with its guard id; the engine applies it before
+        // attempting the bounded watchdog disarm.
         update(&mut s, UiAction::Tick);
         let effects = update(&mut s, UiAction::Tick);
         match &effects[..] {
             [
-                Effect::DisarmWatchdog { .. },
-                Effect::Apply(FirewallOperation::AddPort { .. }),
-            ] => {}
-            other => panic!("expected disarm + inverse AddPort, got {other:?}"),
+                Effect::ApplyRollback {
+                    operation: FirewallOperation::AddPort { .. },
+                    watchdog_unit: Some(unit),
+                    ..
+                },
+            ] if unit == "fwdeck-rollback-test-1" => {}
+            other => panic!("expected correlated inverse AddPort, got {other:?}"),
         }
         assert!(s.pending_rollback.is_empty());
     }
@@ -2206,21 +4170,19 @@ mod tests {
             port: "8080/tcp".parse().unwrap(),
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
-        update(&mut s, UiAction::ApplyOperation(op.clone()));
-        assert!(
-            !s.pending_rollback.is_empty(),
-            "a risky op arms the rollback"
-        );
+        update(&mut s, UiAction::ApplyOperation(reviewed(op.clone())));
+        assert!(s.pending_rollback.is_empty());
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: crate::application::ports::OperationOutcome::PartiallyApplied {
-                    operation: op,
+            finished(
+                1,
+                crate::application::ports::OperationOutcome::PartiallyApplied {
+                    operation: op.clone(),
                     steps: Vec::new(),
                     rollback_hint: None,
                 },
-            },
+                Some(rollback(1, &op, None)),
+            ),
         );
         assert!(
             !s.pending_rollback.is_empty(),
@@ -2236,16 +4198,17 @@ mod tests {
             port: "8080/tcp".parse().unwrap(),
             target: ConfigurationTarget::Runtime,
         };
-        update(&mut s, UiAction::ApplyOperation(op.clone()));
+        update(&mut s, UiAction::ApplyOperation(reviewed(op.clone())));
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: crate::application::ports::OperationOutcome::Indeterminate {
-                    operation: op,
+            finished(
+                1,
+                crate::application::ports::OperationOutcome::Indeterminate {
+                    operation: op.clone(),
                     steps: Vec::new(),
                 },
-            },
+                Some(rollback(1, &op, None)),
+            ),
         );
         assert!(
             !s.pending_rollback.is_empty(),
@@ -2254,24 +4217,19 @@ mod tests {
     }
 
     #[test]
-    fn arming_emits_a_watchdog_with_the_grace_delay() {
+    fn applying_a_risky_operation_only_dispatches_to_the_engine() {
         let mut s = state();
         s.rollback_ticks = 40;
         let effects = update(
             &mut s,
-            UiAction::ApplyOperation(FirewallOperation::RemovePort {
+            UiAction::ApplyOperation(reviewed(FirewallOperation::RemovePort {
                 zone: ZoneName::parse("public").unwrap(),
                 port: "8080/tcp".parse().unwrap(),
                 target: ConfigurationTarget::Runtime,
-            }),
+            })),
         );
-        let delay = effects.iter().find_map(|effect| match effect {
-            Effect::ArmWatchdog { delay_secs, .. } => Some(*delay_secs),
-            _ => None,
-        });
-        // The out-of-process net fires rollback_ticks/4 + 15s after arming, a
-        // grace margin past the in-process deadline.
-        assert_eq!(delay, Some(40 / 4 + 15), "watchdog grace delay formula");
+        assert!(matches!(effects.as_slice(), [Effect::Apply(_)]));
+        assert!(s.pending_rollback.is_empty());
     }
 
     #[test]
@@ -2280,11 +4238,11 @@ mod tests {
         s.rollback_ticks = 120;
         update(
             &mut s,
-            UiAction::ApplyOperation(FirewallOperation::AddService {
+            UiAction::ApplyOperation(reviewed(FirewallOperation::AddService {
                 zone: ZoneName::parse("public").unwrap(),
                 service: ServiceName::parse("mdns").unwrap(),
                 target: ConfigurationTarget::RuntimeAndPermanent,
-            }),
+            })),
         );
         assert!(
             s.pending_rollback.is_empty(),
@@ -2314,18 +4272,253 @@ mod tests {
         );
         assert_eq!(s.staged.len(), 1, "plan stays staged until confirmed");
 
-        // Confirming arms the dead-man's switch (removing http is risky) and
-        // dispatches the batch, draining the staging area.
+        // Confirming dispatches the batch. The engine arms each risky item at
+        // its execution boundary, never all future items here.
         let effects = update(&mut s, UiAction::ConfirmAccept);
         assert!(
             effects.iter().any(|e| matches!(e, Effect::ApplyPlan(_))),
             "the confirmed plan is dispatched"
         );
-        assert!(
-            !s.pending_rollback.is_empty(),
-            "a risky plan arms the rollback, just like a single risky op"
-        );
+        assert!(s.pending_rollback.is_empty());
         assert!(s.staged.is_empty(), "plan drained after apply");
+    }
+
+    #[test]
+    fn confirmed_plan_does_not_prearm_future_operations() {
+        let mut s = state();
+        s.confirm_destructive = false;
+        let zone = ZoneName::parse("public").unwrap();
+        let plan = ["8080/tcp", "8081/tcp", "8082/tcp"]
+            .into_iter()
+            .map(|port| FirewallOperation::RemovePort {
+                zone: zone.clone(),
+                port: port.parse().unwrap(),
+                target: ConfigurationTarget::Runtime,
+            })
+            .collect::<Vec<_>>();
+        s.staged = plan;
+
+        let effects = apply_staged_plan(&mut s);
+
+        assert!(matches!(effects.as_slice(), [Effect::ApplyPlan(_)]));
+        assert!(
+            s.pending_rollback.is_empty(),
+            "future plan items must not become rollback candidates"
+        );
+    }
+
+    #[test]
+    fn plan_without_confirmation_reserves_every_risky_operation_before_dispatch() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        state.staged = two_risky_operations();
+
+        let effects = update(&mut state, UiAction::ApplyStagedPlan);
+
+        assert!(matches!(effects.as_slice(), [Effect::ApplyPlan(_)]));
+        assert_eq!(state.rollback_reservations, 2);
+    }
+
+    #[test]
+    fn zero_risk_plan_blocks_mutations_until_plan_finished() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        state.staged = vec![FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("mdns").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        }];
+
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyStagedPlan).as_slice(),
+            [Effect::ApplyPlan(_)]
+        ));
+        assert_eq!(state.rollback_reservations, 0);
+        assert!(state.in_flight_plan_rollback.is_some());
+
+        let mutation = FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("samba-client").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        assert!(
+            update(
+                &mut state,
+                UiAction::ApplyOperation(reviewed(mutation.clone()))
+            )
+            .is_empty()
+        );
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Warning && toast.text.contains("plan is still running")
+        }));
+
+        let id = active_plan_id(&state);
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id,
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+        assert!(state.in_flight_plan_rollback.is_none());
+        assert_eq!(state.rollback_reservations, 0);
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyOperation(reviewed(mutation))).as_slice(),
+            [Effect::Apply(_)]
+        ));
+    }
+
+    #[test]
+    fn duplicate_zero_risk_plan_finished_is_safe_and_visible() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        state.staged = vec![FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("mdns").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        }];
+        assert!(matches!(
+            update(&mut state, UiAction::ApplyStagedPlan).as_slice(),
+            [Effect::ApplyPlan(_)]
+        ));
+        let id = active_plan_id(&state);
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id,
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+        state.toasts.clear();
+
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id,
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+
+        assert!(state.in_flight_plan_rollback.is_none());
+        assert_eq!(state.rollback_reservations, 0);
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Error && toast.text.contains("without an active plan")
+        }));
+    }
+
+    #[test]
+    fn stale_plan_completion_cannot_clear_the_active_plan() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        state.staged = vec![FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("mdns").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        }];
+        let effects = update(&mut state, UiAction::ApplyStagedPlan);
+        let active_id = match effects.as_slice() {
+            [Effect::ApplyPlan(plan)] => plan.id,
+            other => panic!("expected one plan effect, got {other:?}"),
+        };
+        let active_before = state.in_flight_plan_rollback;
+
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id: crate::application::PlanId::new(active_id.get() + 1),
+                applied: 0,
+                remaining: two_risky_operations(),
+            },
+        );
+
+        assert_eq!(state.in_flight_plan_rollback, active_before);
+        assert!(state.staged.is_empty());
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Error && toast.text.contains("stale plan completion")
+        }));
+    }
+
+    #[test]
+    fn duplicate_old_completion_cannot_finish_a_newer_plan() {
+        let mut state = state();
+        state.confirm_destructive = false;
+        let operation = || FirewallOperation::AddService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("mdns").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+
+        state.staged = vec![operation()];
+        let first = update(&mut state, UiAction::ApplyStagedPlan);
+        let first_id = match first.as_slice() {
+            [Effect::ApplyPlan(plan)] => plan.id,
+            other => panic!("expected first plan effect, got {other:?}"),
+        };
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id: first_id,
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+
+        state.staged = vec![operation()];
+        let second = update(&mut state, UiAction::ApplyStagedPlan);
+        let second_id = match second.as_slice() {
+            [Effect::ApplyPlan(plan)] => plan.id,
+            other => panic!("expected second plan effect, got {other:?}"),
+        };
+        assert_ne!(first_id, second_id);
+
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id: first_id,
+                applied: 1,
+                remaining: Vec::new(),
+            },
+        );
+
+        assert_eq!(active_plan_id(&state), second_id);
+        assert!(state.staged.is_empty());
+    }
+
+    #[test]
+    fn unexpected_plan_finished_does_not_release_single_reservation() {
+        let mut state = state();
+        let operation = FirewallOperation::RemoveService {
+            zone: ZoneName::parse("public").unwrap(),
+            service: ServiceName::parse("http").unwrap(),
+            target: ConfigurationTarget::Runtime,
+        };
+        assert!(matches!(
+            update(
+                &mut state,
+                UiAction::ApplyOperation(reviewed(operation.clone()))
+            )
+            .as_slice(),
+            [Effect::Apply(_)]
+        ));
+        assert_eq!(state.rollback_reservations, 1);
+
+        update(
+            &mut state,
+            UiAction::PlanFinished {
+                id: crate::application::PlanId::new(999),
+                applied: 0,
+                remaining: vec![operation],
+            },
+        );
+
+        assert_eq!(state.rollback_reservations, 1);
+        assert_eq!(state.single_rollback_reservations, 1);
+        assert!(state.toasts.iter().any(|toast| {
+            toast.kind == ToastKind::Error && toast.text.contains("without an active plan")
+        }));
     }
 
     #[test]
@@ -2340,6 +4533,7 @@ mod tests {
         s.tick = 100;
         // Two independent countdowns: one already due, one still live.
         s.pending_rollback.push(PendingRollback {
+            id: crate::application::ports::RollbackGuardId::new(1),
             forward: remove("http"),
             inverse: remove("http").inverse().unwrap(),
             deadline_tick: 100,
@@ -2347,6 +4541,7 @@ mod tests {
             watchdog_unit: None,
         });
         s.pending_rollback.push(PendingRollback {
+            id: crate::application::ports::RollbackGuardId::new(2),
             forward: remove("https"),
             inverse: remove("https").inverse().unwrap(),
             deadline_tick: 500,
@@ -2357,7 +4552,7 @@ mod tests {
         assert_eq!(
             effects
                 .iter()
-                .filter(|e| matches!(e, Effect::Apply(_)))
+                .filter(|e| matches!(e, Effect::ApplyRollback { .. }))
                 .count(),
             1,
             "only the due countdown fires"
@@ -2433,9 +4628,9 @@ mod tests {
         for svc in ["mdns", "samba-client"] {
             update(
                 &mut s,
-                UiAction::OperationFinished {
-                    op_id: 1,
-                    outcome: OperationOutcome::Applied {
+                finished(
+                    1,
+                    OperationOutcome::Applied {
                         operation: FirewallOperation::AddService {
                             zone: ZoneName::parse("public").unwrap(),
                             service: ServiceName::parse(svc).unwrap(),
@@ -2447,7 +4642,8 @@ mod tests {
                             result: Ok(()),
                         }],
                     },
-                },
+                    None,
+                ),
             );
         }
         assert_eq!(
@@ -2529,9 +4725,9 @@ mod tests {
         let mut s = state();
         update(
             &mut s,
-            UiAction::OperationFinished {
-                op_id: 1,
-                outcome: OperationOutcome::Applied {
+            finished(
+                1,
+                OperationOutcome::Applied {
                     operation: FirewallOperation::Reload,
                     steps: vec![StepReport {
                         target: "global",
@@ -2539,7 +4735,8 @@ mod tests {
                         result: Ok(()),
                     }],
                 },
-            },
+                None,
+            ),
         );
         assert_eq!(s.audit.len(), 1);
         assert_eq!(s.audit[0].status, "applied");

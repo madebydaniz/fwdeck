@@ -98,6 +98,7 @@ mod tests {
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
         s.pending_rollback.push(crate::ui::state::PendingRollback {
+            id: crate::application::ports::RollbackGuardId::new(1),
             inverse: op.inverse().unwrap(),
             description: op.describe(),
             forward: op,
@@ -325,6 +326,43 @@ mod tests {
     }
 
     #[test]
+    fn policy_set_workspace_renders_capability_and_members() {
+        let mut s = state();
+        let mut snapshot = mock::sample().unwrap();
+        snapshot.status.version = Some("2.4.2".to_owned());
+        for member in crate::domain::policy_set::GATEWAY_POLICY_MEMBERS {
+            let name = crate::domain::PolicyName::parse(member).unwrap();
+            let mut policy = crate::domain::PolicyDetails::empty(name.clone());
+            policy.disabled = true;
+            snapshot
+                .policies
+                .runtime
+                .insert(name.clone(), policy.clone());
+            snapshot.policies.permanent.insert(name, policy);
+        }
+        s.snapshot = Some(std::sync::Arc::new(snapshot));
+
+        update(&mut s, UiAction::BrowsePolicySets);
+        let content = draw(&mut s, 120, 36);
+        assert!(content.contains("Policy sets"));
+        assert!(content.contains("supported"));
+        assert!(content.contains("gateway-lan-to-world"));
+        assert!(content.contains("disabled"));
+    }
+
+    #[test]
+    fn policy_dependency_graph_overlay_renders() {
+        let mut s = state();
+        update(&mut s, UiAction::ShowPolicyDependencies);
+        let content = draw(&mut s, 120, 36);
+        assert!(content.contains("Policy dependency graph"));
+        assert!(content.contains("public"));
+        assert!(content.contains("mypolicy"));
+        assert!(content.contains("http"));
+        assert!(content.contains("pseudo-zone"));
+    }
+
+    #[test]
     fn direct_view_shows_deprecation_warning() {
         let mut s = state();
         update(
@@ -334,5 +372,20 @@ mod tests {
         let content = draw(&mut s, 120, 32);
         assert!(content.contains("deprecated"));
         assert!(content.contains("12345"));
+    }
+
+    #[test]
+    fn policy_workspace_renders_sidebar_shortcut_and_policy_state() {
+        let mut s = state();
+        update(
+            &mut s,
+            UiAction::SwitchView(crate::ui::views::ViewId::Policies),
+        );
+        let content = draw(&mut s, 140, 36);
+
+        assert!(content.contains("<p>"));
+        assert!(content.contains("mypolicy"));
+        assert!(content.contains("public"));
+        assert!(content.contains("active"));
     }
 }

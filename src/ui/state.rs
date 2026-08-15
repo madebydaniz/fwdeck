@@ -6,15 +6,17 @@ use std::sync::Arc;
 use ratatui::widgets::TableState;
 
 use crate::application::ports::FirewallError;
+use crate::application::{PlanId, RefreshId, RefreshOverview, RefreshPriority};
 use crate::config::Config;
 use crate::domain::LogEntry;
 use crate::domain::{
-    ConfigurationTarget, FirewallOperation, FirewallSnapshot, InterfaceName, ZoneName,
+    ConfigurationTarget, FirewallOperation, FirewallSnapshot, InterfaceName, RefreshObservation,
+    ZoneName,
 };
 
 use super::overlays::Overlay;
 use super::palette::PaletteState;
-use super::views::{self, VIEW_COUNT, ViewId};
+use super::views::{self, RowId, VIEW_COUNT, ViewId, ViewRow};
 
 /// How long a toast stays visible, in ticks (250 ms each).
 const TOAST_TTL_TICKS: u64 = 16;
@@ -25,13 +27,6 @@ const MAX_LOG_ENTRIES: usize = 1000;
 /// Bounded session audit history.
 const MAX_AUDIT_ENTRIES: usize = 200;
 
-/// Stable identity of a table row: every cell joined on a separator that
-/// cannot appear in cell text. Used as the multi-select key.
-#[must_use]
-pub fn row_key(row: &[String]) -> String {
-    row.join("\u{1f}")
-}
-
 /// Per-view UI state: selection, filter, marks, and scroll offset.
 #[derive(Debug, Default)]
 pub struct ViewState {
@@ -39,10 +34,8 @@ pub struct ViewState {
     pub selected: usize,
     /// Live substring filter (`/`); empty = no filtering.
     pub filter: String,
-    /// Multi-select set, keyed by the full row (`row_key`) — first cells are
-    /// not unique (e.g. 8080/tcp vs 8080/udp share "8080"; rich rules share a
-    /// family), so marking by first cell would select unrelated rows.
-    pub marked: std::collections::BTreeSet<String>,
+    /// Multi-select set keyed by typed, zone-aware row identity.
+    pub marked: std::collections::BTreeSet<RowId>,
     /// Scroll offset persistence for ratatui's stateful table render.
     pub table: TableState,
 }
@@ -88,6 +81,8 @@ pub struct AuditEntry {
 /// An armed dead-man's switch: unless kept, `inverse` fires at `deadline_tick`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingRollback {
+    /// Unique lifecycle identity; duplicate operations never share a guard.
+    pub id: crate::application::ports::RollbackGuardId,
     /// The risky operation itself — becomes the undo candidate once the
     /// countdown is resolved by "Keep changes".
     pub forward: FirewallOperation,
@@ -103,6 +98,18 @@ pub struct PendingRollback {
     pub watchdog_unit: Option<String>,
 }
 
+/// Reservation progress for the one sequential mutation plan currently
+/// submitted to the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlanRollbackReservations {
+    /// Identity of the only plan allowed to consume this reservation set.
+    pub(crate) id: PlanId,
+    /// Risky operations reserved before the plan was submitted.
+    pub(crate) total: usize,
+    /// Risky forward outcomes already received for this plan.
+    pub(crate) consumed: usize,
+}
+
 /// A transient notification rendered in the toast stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
@@ -112,6 +119,15 @@ pub struct Toast {
     pub text: String,
     /// UI tick after which the toast is pruned.
     pub expires_at_tick: u64,
+}
+
+/// Preview owned by one exact in-flight refresh lifecycle.
+#[derive(Debug, Clone)]
+pub struct RefreshOverviewState {
+    /// Identity used to reject stale overview and completion events.
+    pub id: RefreshId,
+    /// Preview-only overview; never used as a mutation precondition.
+    pub overview: Arc<RefreshOverview>,
 }
 
 /// The whole UI state tree: current view, data snapshot, overlays, and
@@ -139,14 +155,20 @@ pub struct UiState {
     /// The first successful snapshot of the session — the baseline the
     /// "session diff" compares the current state against.
     pub session_baseline: Option<Arc<FirewallSnapshot>>,
-    /// A refresh is in flight (engine sent `RefreshStarted`).
-    pub refreshing: bool,
+    /// Exact refresh lifecycle currently in flight, if any.
+    pub active_refresh: Option<RefreshId>,
+    /// Matching low-latency overview shown while full hydration continues.
+    pub refresh_overview: Option<RefreshOverviewState>,
     /// Last backend failure; cleared by the next successful refresh.
     pub backend_error: Option<FirewallError>,
     /// Denied packets seen this session (from the log tailer).
     pub denied_session: u64,
     /// Bounded ring buffer of kernel/netfilter log entries, newest last.
-    pub log_buffer: std::collections::VecDeque<LogEntry>,
+    log_buffer: std::collections::VecDeque<LogEntry>,
+    /// Session-unique sequence aligned one-to-one with [`Self::log_buffer`].
+    log_sequences: std::collections::VecDeque<u64>,
+    /// Next sequence assigned to an incoming log entry.
+    next_log_sequence: u64,
     /// SSH session detected at startup (`SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY`).
     pub ssh_session: bool,
     /// The interface carrying the SSH session, if resolved — enables a precise
@@ -158,10 +180,8 @@ pub struct UiState {
     pub audit: Vec<AuditEntry>,
     /// Operations staged via `s` in the confirmation modal.
     pub staged: Vec<FirewallOperation>,
-    /// Tick at which the in-flight refresh started (for the duration metric).
-    pub refresh_started_tick: Option<u64>,
-    /// Duration of the last completed refresh, in milliseconds (tick-derived).
-    pub last_refresh_ms: Option<u64>,
+    /// Exact telemetry for the last completed refresh attempt.
+    pub last_refresh: Option<RefreshObservation>,
     /// Stack of applied-and-verified reversible operations, oldest first. Undo
     /// pops the most recent; capped by [`UiState::push_undo`] so it can't grow
     /// without bound.
@@ -173,6 +193,18 @@ pub struct UiState {
     /// Armed dead-man's-switch rollbacks, oldest first. A stack, not a slot:
     /// a second risky change must never silently overwrite the first inverse.
     pub pending_rollback: Vec<PendingRollback>,
+    /// Whether the shell's single normal-priority engine-outbox slot is full.
+    pub engine_normal_backpressured: bool,
+    /// Rollback-priority requests waiting in the shell outbox.
+    pub rollback_outbox_pending: usize,
+    /// Capacity reserved by submitted risky operations awaiting outcomes.
+    pub rollback_reservations: usize,
+    /// Risky single-operation reservations submitted before any active plan.
+    pub(crate) single_rollback_reservations: usize,
+    /// Exact reservation progress for the active sequential plan.
+    pub(crate) in_flight_plan_rollback: Option<PlanRollbackReservations>,
+    /// Next process-local staged-plan identity; IDs are never reused.
+    next_plan_id: u64,
     /// Dead-man's switch window in ticks; 0 = disabled.
     pub rollback_ticks: u64,
     /// Monotonic UI clock, incremented every 250 ms tick.
@@ -226,20 +258,28 @@ impl UiState {
             overlay_scroll: 0,
             snapshot: None,
             session_baseline: None,
-            refreshing: false,
+            active_refresh: None,
+            refresh_overview: None,
             backend_error: None,
             denied_session: 0,
             log_buffer: std::collections::VecDeque::new(),
+            log_sequences: std::collections::VecDeque::new(),
+            next_log_sequence: 1,
             ssh_session,
             ssh_interface,
             toasts: std::collections::VecDeque::new(),
             audit: Vec::new(),
             staged: Vec::new(),
             undo_stack: Vec::new(),
-            refresh_started_tick: None,
-            last_refresh_ms: None,
+            last_refresh: None,
             verify_next_refresh: Vec::new(),
             pending_rollback: Vec::new(),
+            engine_normal_backpressured: false,
+            rollback_outbox_pending: 0,
+            rollback_reservations: 0,
+            single_rollback_reservations: 0,
+            in_flight_plan_rollback: None,
+            next_plan_id: 1,
             rollback_ticks: config.rollback_timeout.as_secs() * 4, // 250 ms ticks
             tick: 0,
             read_only: config.read_only,
@@ -254,6 +294,14 @@ impl UiState {
             hostname,
             size: (0, 0),
         }
+    }
+
+    /// Allocates the next plan identity, failing closed before numeric reuse.
+    pub(crate) fn allocate_plan_id(&mut self) -> Option<PlanId> {
+        let next = self.next_plan_id.checked_add(1)?;
+        let id = PlanId::new(self.next_plan_id);
+        self.next_plan_id = next;
+        Some(id)
     }
 
     /// The current view's state.
@@ -275,29 +323,105 @@ impl UiState {
             .or_else(|| self.snapshot.as_ref().map(|s| s.default_zone.clone()))
     }
 
+    /// Matching preview for the active lifecycle, if one has arrived.
+    #[must_use]
+    pub fn matching_refresh_overview(&self) -> Option<&RefreshOverview> {
+        self.refresh_overview
+            .as_ref()
+            .filter(|preview| Some(preview.id) == self.active_refresh)
+            .map(|preview| preview.overview.as_ref())
+    }
+
+    /// Whether the active preview can render this view without inventing details.
+    #[must_use]
+    pub fn matching_overview_supports(&self, view: ViewId) -> bool {
+        self.matching_refresh_overview().is_some() && views::overview_supports(view)
+    }
+
+    fn display_zone(&self) -> Option<ZoneName> {
+        self.selected_zone
+            .clone()
+            .or_else(|| {
+                self.matching_refresh_overview()
+                    .map(|overview| overview.default_zone.clone())
+            })
+            .or_else(|| {
+                self.snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.default_zone.clone())
+            })
+    }
+
+    /// Latest UI selection that staged hydration should fetch first.
+    #[must_use]
+    pub fn refresh_priority(&self) -> RefreshPriority {
+        let mut priority = RefreshPriority {
+            zone: self.display_zone(),
+            service: None,
+            policy: None,
+        };
+        let rows = self.visible_rows();
+        let Some(row) = rows.get(self.view_state().selected) else {
+            return priority;
+        };
+        match &row.id {
+            RowId::Zone(zone) => priority.zone = Some(zone.clone()),
+            RowId::Service { zone, service } => {
+                priority.zone = Some(zone.clone());
+                priority.service = Some(service.clone());
+            }
+            RowId::Policy { name } => priority.policy = Some(name.clone()),
+            RowId::Port { .. }
+            | RowId::Forwarding { .. }
+            | RowId::RichRule { .. }
+            | RowId::Interface { .. }
+            | RowId::Source { .. }
+            | RowId::IpSet { .. }
+            | RowId::Direct { .. }
+            | RowId::Log { .. } => {}
+        }
+        priority
+    }
+
     /// Unfiltered rows for a view.
     // rows are recomputed per keystroke/frame; snapshot scale (dozens of
     // zones) makes this free — add caching only if profiling ever disagrees.
     #[must_use]
-    pub fn all_rows(&self, view: ViewId) -> Vec<Vec<String>> {
+    pub fn all_rows(&self, view: ViewId) -> Vec<ViewRow> {
         if view == ViewId::Logs {
             // Newest first: tailing UX without chasing the scroll position.
             return self
-                .log_buffer
+                .log_sequences
                 .iter()
                 .rev()
-                .map(|entry| {
-                    vec![
-                        entry.time.clone(),
-                        entry.action.as_str().to_owned(),
-                        entry.src.clone(),
-                        entry.dst.clone(),
-                        entry.dport.clone(),
-                        entry.proto.clone(),
-                        entry.iface.clone(),
-                    ]
+                .zip(self.log_buffer.iter().rev())
+                .map(|(&sequence, entry)| {
+                    ViewRow::new(
+                        RowId::Log {
+                            sequence,
+                            entry: entry.clone(),
+                        },
+                        vec![
+                            entry.time.clone(),
+                            entry.action.as_str().to_owned(),
+                            entry.src.clone(),
+                            entry.dst.clone(),
+                            entry.dport.clone(),
+                            entry.proto.clone(),
+                            entry.iface.clone(),
+                        ],
+                    )
                 })
                 .collect();
+        }
+        if let Some(overview) = self.matching_refresh_overview() {
+            let zone = self
+                .selected_zone
+                .clone()
+                .unwrap_or_else(|| overview.default_zone.clone());
+            if let Some(rows) = views::overview_rows(view, overview, &zone, self.config_view) {
+                return rows;
+            }
         }
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
@@ -310,7 +434,7 @@ impl UiState {
 
     /// Rows of the current view with the live filter applied.
     #[must_use]
-    pub fn visible_rows(&self) -> Vec<Vec<String>> {
+    pub fn visible_rows(&self) -> Vec<ViewRow> {
         let rows = self.all_rows(self.view);
         let filter = &self.views[self.view.index()].filter;
         if filter.is_empty() {
@@ -354,8 +478,12 @@ impl UiState {
             }
             if self.log_buffer.len() >= MAX_LOG_ENTRIES {
                 self.log_buffer.pop_front();
+                self.log_sequences.pop_front();
             }
+            let sequence = self.next_log_sequence;
+            self.next_log_sequence = self.next_log_sequence.saturating_add(1);
             self.log_buffer.push_back(entry);
+            self.log_sequences.push_back(sequence);
         }
     }
 
@@ -424,5 +552,22 @@ impl UiState {
             Some(Overlay::Palette(palette)) => Some(palette),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod plan_identity_tests {
+    use super::*;
+
+    #[test]
+    fn plan_ids_are_monotonic_and_fail_before_reuse() {
+        let mut state = UiState::new(&Config::default(), "test".to_owned(), false, None);
+        assert_eq!(state.allocate_plan_id().unwrap(), PlanId::new(1));
+        assert_eq!(state.allocate_plan_id().unwrap(), PlanId::new(2));
+
+        state.next_plan_id = u64::MAX;
+        assert_eq!(state.allocate_plan_id(), None);
+        assert_eq!(state.next_plan_id, u64::MAX);
     }
 }

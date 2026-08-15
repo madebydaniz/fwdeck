@@ -37,7 +37,7 @@ pub fn ensure_state_dir() -> Option<PathBuf> {
             .mode(0o700)
             .create(&dir)
             .ok()?;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(&dir).ok()?;
@@ -75,6 +75,16 @@ pub fn init_tracing(config: &Config) -> bool {
     let Ok(file) = options.open(dir.join("fwdeck.log")) else {
         return false;
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .is_err()
+        {
+            return false;
+        }
+    }
     let writer = FileWriter(Arc::new(file));
     let filter = EnvFilter::try_new(&config.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -161,59 +171,112 @@ pub fn hostname() -> String {
         .unwrap_or_else(|| "localhost".to_owned())
 }
 
-/// Advisory single-instance lock: two `fwdeck` processes mutating one
-/// firewall is a recipe for conflicting plans. Creates `fwdeck.lock`
-/// (`O_EXCL`) in the state
-/// dir containing our PID; a stale lock (dead PID) is reclaimed. Returns the
-/// other instance's PID when the firewall is already being managed.
-pub fn acquire_instance_lock() -> Result<(), Option<u32>> {
-    let Some(dir) = ensure_state_dir() else {
-        return Ok(()); // no state dir → nothing to lock on
-    };
-    let path = dir.join("fwdeck.lock");
-    for _ in 0..2 {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(mut file) => {
-                use std::io::Write as _;
-                let _ = write!(file, "{}", std::process::id());
-                return Ok(());
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                let holder = std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|pid| pid.trim().parse::<u32>().ok());
-                if let Some(pid) = holder {
-                    // A dead holder leaves a stale lock — reclaim it.
-                    if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                }
-                return Err(holder);
-            }
-            Err(_) => return Ok(()), // lock trouble must never block the tool
-        }
-    }
-    Ok(())
+/// RAII guard for the advisory, process-wide mutation lock. The operating
+/// system releases the lock when this handle is dropped, including on panic or
+/// ordinary process termination; the lock file itself deliberately persists so
+/// unlink/recreate races can never create two independently locked inodes.
+#[derive(Debug)]
+pub struct InstanceLock {
+    file: File,
 }
 
-/// Removes the instance lock on clean shutdown.
-pub fn release_instance_lock() {
-    if let Some(dir) = state_dir() {
-        let _ = std::fs::remove_file(dir.join("fwdeck.lock"));
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Closing the file also releases the lock, but an explicit unlock makes
+        // guard-drop behavior deterministic before the descriptor is closed.
+        let _ = fs2::FileExt::unlock(&self.file);
     }
+}
+
+/// Acquires the advisory single-instance lock. Two `fwdeck` processes mutating
+/// one firewall is a recipe for conflicting plans, so the lock is held by the
+/// returned guard for the full mutation lifetime. Returns the current holder's
+/// PID when available; metadata is informational and never decides ownership.
+pub fn acquire_instance_lock() -> Result<InstanceLock, Option<u32>> {
+    let Some(dir) = ensure_state_dir() else {
+        return Err(None); // mutation without an enforceable lock is unsafe
+    };
+    acquire_instance_lock_at(&dir.join("fwdeck.lock"))
+}
+
+/// Reports PID metadata only when another process currently holds the OS lock.
+/// `Ok(None)` means the lock is available and any stale file is harmless.
+pub fn instance_lock_holder() -> Result<Option<u32>, String> {
+    let Some(dir) = state_dir() else {
+        return Err("no state directory available".to_owned());
+    };
+    instance_lock_holder_at(&dir.join("fwdeck.lock")).map_err(|error| error.to_string())
+}
+
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+fn acquire_instance_lock_at(path: &Path) -> Result<InstanceLock, Option<u32>> {
+    let mut file = open_lock_file(path, true).map_err(|_| None)?;
+    if let Err(error) = fs2::FileExt::try_lock_exclusive(&file) {
+        if error.kind() == fs2::lock_contended_error().kind() {
+            return Err(read_lock_pid(&mut file));
+        }
+        return Err(None);
+    }
+    if write_lock_pid(&mut file).is_err() {
+        return Err(None);
+    }
+    Ok(InstanceLock { file })
+}
+
+fn instance_lock_holder_at(path: &Path) -> std::io::Result<Option<u32>> {
+    let mut file = match open_lock_file(path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            fs2::FileExt::unlock(&file)?;
+            Ok(None)
+        }
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
+            Ok(read_lock_pid(&mut file))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_lock_pid(file: &mut File) -> Option<u32> {
+    use std::io::{Read as _, Seek as _};
+    file.rewind().ok()?;
+    let mut metadata = String::new();
+    file.read_to_string(&mut metadata).ok()?;
+    metadata.trim().parse().ok()
+}
+
+fn write_lock_pid(file: &mut File) -> std::io::Result<()> {
+    use std::io::{Seek as _, Write as _};
+    file.set_len(0)?;
+    file.rewind()?;
+    write!(file, "{}", std::process::id())?;
+    file.sync_data()
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
-    use super::parse_ip_addr_interface;
+    use super::{acquire_instance_lock_at, instance_lock_holder_at, parse_ip_addr_interface};
 
     const IP_ADDR: &str = "1: lo    inet 127.0.0.1/8 scope host lo\n\
 2: eth0    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0\n\
@@ -230,5 +293,36 @@ mod tests {
             Some("eth1")
         );
         assert_eq!(parse_ip_addr_interface(IP_ADDR, "8.8.8.8"), None);
+    }
+
+    #[test]
+    fn os_lock_is_exclusive_and_released_by_guard_drop() {
+        let dir = std::env::temp_dir().join(format!("fwdeck-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fwdeck.lock");
+        let first = acquire_instance_lock_at(&path).unwrap();
+        assert_eq!(
+            acquire_instance_lock_at(&path).unwrap_err(),
+            Some(std::process::id())
+        );
+        assert_eq!(
+            instance_lock_holder_at(&path).unwrap(),
+            Some(std::process::id())
+        );
+        drop(first);
+
+        assert_eq!(instance_lock_holder_at(&path).unwrap(), None);
+        let second = acquire_instance_lock_at(&path).unwrap();
+        assert!(path.exists(), "the stable lock inode must persist");
+        drop(second);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use super::action::UiAction;
 pub use super::details::DetailsContent;
 use super::keymap;
-use super::palette::{self, Availability, PaletteState};
+use super::palette::{self, Availability, PaletteCommand, PaletteState};
 use super::state::UiState;
 use super::theme::Theme;
 
@@ -89,6 +89,10 @@ pub enum FormKind {
     CreatePolicy,
     /// Add a service to a policy object.
     AddPolicyService,
+    /// Enable or disable a predefined policy set.
+    SetPolicySetState,
+    /// Create a reviewed policy replacement for the selected direct rule.
+    MigrateDirectRule,
     /// Stage a plan restoring a saved snapshot.
     RestoreSnapshot,
     /// Show a read-only diff of the current state against a saved snapshot.
@@ -125,6 +129,8 @@ impl FormKind {
             Self::RemoveServicePort => "Remove port from service",
             Self::CreatePolicy => "Create policy",
             Self::AddPolicyService => "Add service to policy",
+            Self::SetPolicySetState => "Set policy-set state",
+            Self::MigrateDirectRule => "Migrate selected direct rule",
             Self::RestoreSnapshot => "Restore snapshot (stages a plan)",
             Self::DiffSnapshot => "Diff against snapshot (read-only)",
             Self::ExplainTraffic => "Explain traffic",
@@ -159,8 +165,10 @@ impl FormKind {
             Self::CreateService => "service name (permanent-only; reload to activate)",
             Self::AddServicePort => "name port/proto (e.g. myapp 9200/tcp)",
             Self::RemoveServicePort => "name port/proto to remove (e.g. myapp 9200/tcp)",
-            Self::CreatePolicy => "policy name (permanent-only; reload to activate)",
+            Self::CreatePolicy => "policy name (max 17 chars; permanent-only)",
             Self::AddPolicyService => "policy service (e.g. mypolicy http)",
+            Self::SetPolicySetState => "<set> <enable|disable>  e.g. gateway enable",
+            Self::MigrateDirectRule => "new policy name (max 17 chars; direct rule remains)",
             Self::RestoreSnapshot => "snapshot filename (see \"Browse saved snapshots\")",
             Self::DiffSnapshot => "snapshot filename to diff against current",
             Self::ExplainTraffic => "<source-ip> <port>/<proto>  e.g. 203.0.113.7 443/tcp",
@@ -227,7 +235,162 @@ fn modal(f: &mut Frame, theme: &Theme, area: Rect, title: &str) -> Block<'static
         .style(theme.panel())
 }
 
+const TEXT_MODAL_PERCENT: u16 = 60;
+const TEXT_MODAL_MIN_WIDTH: u16 = 60;
+const MODAL_MARGIN: u16 = 2;
+const HELP_KEY_WIDTH: usize = 22;
+const PALETTE_VISIBLE_ROWS: usize = 12;
+const PALETTE_MARKER_WIDTH: usize = 2;
+const PALETTE_MIN_TITLE_WIDTH: usize = 24;
+const PALETTE_MIN_STATUS_WIDTH: usize = 24;
+
+fn text_modal_width(screen: Rect) -> u16 {
+    let available = screen.width.saturating_sub(MODAL_MARGIN).max(1);
+    let proportional = screen.width.saturating_mul(TEXT_MODAL_PERCENT) / 100;
+    proportional
+        .max(TEXT_MODAL_MIN_WIDTH.min(available))
+        .min(available)
+}
+
+fn display_width(text: &str) -> usize {
+    Line::from(text).width()
+}
+
+fn split_word(word: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for character in word.chars() {
+        let mut candidate = current.clone();
+        candidate.push(character);
+        if !current.is_empty() && display_width(&candidate) > width {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(character);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        for chunk in split_word(word, width) {
+            if current.is_empty() {
+                current = chunk;
+                continue;
+            }
+            let candidate = format!("{current} {chunk}");
+            if display_width(&candidate) <= width {
+                current = candidate;
+            } else {
+                rows.push(std::mem::take(&mut current));
+                current = chunk;
+            }
+        }
+    }
+    if !current.is_empty() || rows.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+fn truncate_display(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    let content_width = width.saturating_sub(1);
+    let mut result = String::new();
+    for character in text.chars() {
+        let mut candidate = result.clone();
+        candidate.push(character);
+        if display_width(&candidate) > content_width {
+            break;
+        }
+        result.push(character);
+    }
+    result.push('…');
+    result
+}
+
+fn pad_display(text: &str, width: usize, align_right: bool) -> String {
+    let padding = " ".repeat(width.saturating_sub(display_width(text)));
+    if align_right {
+        format!("{padding}{text}")
+    } else {
+        format!("{text}{padding}")
+    }
+}
+
+fn palette_status(command: &PaletteCommand) -> &'static str {
+    match command.availability {
+        Availability::Enabled => command.category.label(),
+        Availability::Disabled(reason) => reason,
+    }
+}
+
+fn palette_column_widths(commands: &[&PaletteCommand], inner_width: usize) -> (usize, usize) {
+    let available = inner_width.saturating_sub(PALETTE_MARKER_WIDTH);
+    let status_limit = available.saturating_sub(PALETTE_MIN_TITLE_WIDTH);
+    let longest_status = commands
+        .iter()
+        .map(|command| display_width(palette_status(command)))
+        .max()
+        .unwrap_or(0);
+    let status_width = longest_status
+        .max(PALETTE_MIN_STATUS_WIDTH.min(status_limit))
+        .min(status_limit);
+    (available.saturating_sub(status_width), status_width)
+}
+
+fn prefixed_rows(prefix: &str, text: &str, inner_width: usize) -> Vec<(String, String)> {
+    let prefix_width = display_width(prefix);
+    let continuation = " ".repeat(prefix_width);
+    let text_width = inner_width.saturating_sub(prefix_width).max(1);
+    wrap_text(text, text_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let prefix = if index == 0 {
+                prefix.to_owned()
+            } else {
+                continuation.clone()
+            };
+            (prefix, row)
+        })
+        .collect()
+}
+
+fn help_entry_rows(keys: &str, description: &str, inner_width: usize) -> Vec<(String, String)> {
+    let key_width = HELP_KEY_WIDTH.min(inner_width.saturating_sub(8).max(1));
+    let prefix = format!("   {keys:<key_width$}");
+    let continuation = " ".repeat(display_width(&prefix));
+    let description_width = inner_width.saturating_sub(display_width(&prefix)).max(1);
+    wrap_text(description, description_width)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let keys = if index == 0 {
+                prefix.clone()
+            } else {
+                continuation.clone()
+            };
+            (keys, row)
+        })
+        .collect()
+}
+
 fn render_help(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
     let mut lines = Vec::new();
     for (category, entries) in keymap::HELP {
         lines.push(Line::from(Span::styled(
@@ -235,16 +398,22 @@ fn render_help(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
             theme.accent(),
         )));
         for entry in *entries {
-            lines.push(Line::from(vec![
-                Span::styled(format!("   {:<22}", entry.keys), theme.hotkey()),
-                Span::styled(entry.desc, theme.text()),
-            ]));
+            lines.extend(
+                help_entry_rows(entry.keys, entry.desc, inner_width)
+                    .into_iter()
+                    .map(|(keys, description)| {
+                        Line::from(vec![
+                            Span::styled(keys, theme.hotkey()),
+                            Span::styled(description, theme.text()),
+                        ])
+                    }),
+            );
         }
         lines.push(Line::default());
     }
 
     let desired = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let area = centered(screen, 58, desired);
+    let area = centered(screen, width, desired);
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title("Help", scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
@@ -253,35 +422,66 @@ fn render_help(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
 }
 
 fn render_about(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
-    let field = |label: &str, value: &'static str| {
-        Line::from(vec![
-            Span::styled(format!("   {label:<10}"), theme.accent()),
-            Span::styled(value, theme.text()),
-        ])
-    };
-    let body = |text: &'static str| Line::from(Span::styled(format!(" {text}"), theme.text()));
-    let lines = vec![
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
+    let mut lines = vec![
         Line::from(Span::styled(
             format!(" FWDeck v{}", env!("CARGO_PKG_VERSION")),
             theme.brand(),
         )),
         Line::default(),
-        body("A safety-first terminal UI for firewalld — manage zones,"),
-        body("services, ports, and rich rules from the keyboard, with"),
-        body("runtime-vs-permanent scope on every row and a dead-man's"),
-        body("switch that auto-reverts a change that would cut your session."),
-        Line::default(),
-        field("Developer", "Daniel Niazmand"),
-        field("Website", "https://madebydaniz.com"),
-        field("Docs", "https://madebydaniz.github.io/fwdeck/"),
-        field("Source", "https://github.com/madebydaniz/fwdeck"),
-        field("Updates", "https://github.com/madebydaniz/fwdeck/releases"),
-        field("License", "MIT"),
-        Line::default(),
-        body("Run `fwdeck doctor` for your exact upgrade command."),
     ];
+    lines.extend(
+        prefixed_rows(
+            " ",
+            "A safety-first terminal UI for firewalld — manage zones, services, ports, and rich rules from the keyboard, with runtime-vs-permanent scope on every row and a dead-man's switch that auto-reverts a change that would cut your session.",
+            inner_width,
+        )
+        .into_iter()
+        .map(|(prefix, row)| {
+            Line::from(vec![
+                Span::styled(prefix, theme.text()),
+                Span::styled(row, theme.text()),
+            ])
+        }),
+    );
+    lines.push(Line::default());
+    for (label, value) in [
+        ("Developer", "Daniel Niazmand"),
+        ("Website", "https://madebydaniz.com"),
+        ("Docs", "https://madebydaniz.github.io/fwdeck/"),
+        ("Source", "https://github.com/madebydaniz/fwdeck"),
+        ("Updates", "https://github.com/madebydaniz/fwdeck/releases"),
+        ("License", "MIT"),
+    ] {
+        lines.extend(
+            prefixed_rows(&format!("   {label:<10}"), value, inner_width)
+                .into_iter()
+                .map(|(prefix, row)| {
+                    Line::from(vec![
+                        Span::styled(prefix, theme.accent()),
+                        Span::styled(row, theme.text()),
+                    ])
+                }),
+        );
+    }
+    lines.push(Line::default());
+    lines.extend(
+        prefixed_rows(
+            " ",
+            "Run `fwdeck doctor` for your exact upgrade command.",
+            inner_width,
+        )
+        .into_iter()
+        .map(|(prefix, row)| {
+            Line::from(vec![
+                Span::styled(prefix, theme.text()),
+                Span::styled(row, theme.text()),
+            ])
+        }),
+    );
     let desired = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let area = centered(screen, 62, desired);
+    let area = centered(screen, width, desired);
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title("About", scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
@@ -331,9 +531,12 @@ fn render_global_search(
 ) {
     let hits = super::search::hits(state, &search_state.query);
     let visible_rows = 12usize;
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
+    let label_width = inner_width.saturating_sub(13).max(1);
     let area = centered(
         screen,
-        72,
+        width,
         u16::try_from(visible_rows + 6).unwrap_or(u16::MAX),
     );
     let block = modal(f, theme, area, "Global search");
@@ -354,7 +557,7 @@ fn render_global_search(
     for (index, hit) in hits.iter().enumerate().skip(offset).take(visible_rows) {
         let is_selected = index == selected;
         let marker = if is_selected { "▸ " } else { "  " };
-        let label: String = hit.label.chars().take(54).collect();
+        let label: String = hit.label.chars().take(label_width).collect();
         let spans = vec![
             Span::styled(marker.to_owned(), theme.accent()),
             Span::styled(format!("{:<11}", hit.view.title()), theme.muted()),
@@ -386,15 +589,8 @@ fn render_palette(
     screen: Rect,
 ) {
     let commands = palette::filtered(state);
-    let visible_rows = 12usize;
-    let area = centered(
-        screen,
-        64,
-        u16::try_from(visible_rows + 6).unwrap_or(u16::MAX),
-    );
-    let block = modal(f, theme, area, "Commands");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
 
     let mut lines = vec![
         Line::from(vec![
@@ -406,25 +602,41 @@ fn render_palette(
     ];
 
     let selected = palette_state.selected.min(commands.len().saturating_sub(1));
-    // Keep the selection inside the visible window.
-    let offset = selected.saturating_sub(visible_rows.saturating_sub(1));
-    for (index, command) in commands.iter().enumerate().skip(offset).take(visible_rows) {
+    let offset = selected.saturating_sub(PALETTE_VISIBLE_ROWS.saturating_sub(1));
+    let visible_commands: Vec<_> = commands
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(PALETTE_VISIBLE_ROWS)
+        .collect();
+    let visible_command_refs: Vec<_> = visible_commands
+        .iter()
+        .map(|(_, command)| *command)
+        .collect();
+    let (title_width, status_width) = palette_column_widths(&visible_command_refs, inner_width);
+
+    for (index, command) in visible_commands {
         let is_selected = index == selected;
         let marker = if is_selected { "▸ " } else { "  " };
-        let mut spans = vec![Span::styled(marker.to_owned(), theme.accent())];
-        match command.availability {
-            Availability::Enabled => {
-                spans.push(Span::styled(format!("{:<40}", command.title), theme.text()));
-                spans.push(Span::styled(command.category.label(), theme.muted()));
-            }
-            Availability::Disabled(reason) => {
-                spans.push(Span::styled(
-                    format!("{:<40}", command.title),
-                    theme.muted(),
-                ));
-                spans.push(Span::styled(reason, theme.warn()));
-            }
-        }
+        let title = pad_display(
+            &truncate_display(&command.title, title_width),
+            title_width,
+            false,
+        );
+        let status = pad_display(
+            &truncate_display(palette_status(command), status_width),
+            status_width,
+            true,
+        );
+        let (title_style, status_style) = match command.availability {
+            Availability::Enabled => (theme.text(), theme.muted()),
+            Availability::Disabled(_) => (theme.muted(), theme.warn()),
+        };
+        let spans = vec![
+            Span::styled(marker, theme.accent()),
+            Span::styled(title, title_style),
+            Span::styled(status, status_style),
+        ];
         let line = Line::from(spans);
         lines.push(if is_selected {
             line.style(theme.selected())
@@ -441,15 +653,23 @@ fn render_palette(
 
     lines.push(Line::default());
     if let Some(command) = commands.get(selected) {
-        lines.push(Line::from(Span::styled(
-            format!(" {}", command.description),
-            theme.info(),
-        )));
+        lines.extend(
+            wrap_text(command.description, inner_width.saturating_sub(1))
+                .into_iter()
+                .map(|row| Line::from(Span::styled(format!(" {row}"), theme.info()))),
+        );
     }
     lines.push(Line::from(Span::styled(
         " enter run · esc close",
         theme.muted(),
     )));
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(screen.height);
+    let area = centered(screen, width, height);
+    let block = modal(f, theme, area, "Commands");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -460,40 +680,48 @@ fn render_details(
     screen: Rect,
     scroll: u16,
 ) -> u16 {
-    let mut lines: Vec<Line> = content
-        .lines
-        .iter()
-        .map(|(key, value)| {
-            if key.is_empty() {
-                Line::from(Span::styled(format!("   {value}"), theme.text()))
-            } else {
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
+    let mut lines = Vec::new();
+    for (key, value) in &content.lines {
+        let prefix = if key.is_empty() {
+            "   ".to_owned()
+        } else {
+            format!(" {key:<12}")
+        };
+        lines.extend(prefixed_rows(&prefix, value, inner_width).into_iter().map(
+            |(prefix, row)| {
                 Line::from(vec![
-                    Span::styled(format!(" {key:<12}"), theme.muted()),
-                    Span::styled(value.clone(), theme.text()),
+                    Span::styled(prefix, theme.muted()),
+                    Span::styled(row, theme.text()),
                 ])
-            }
-        })
-        .collect();
+            },
+        ));
+    }
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        " esc close  ·  : for actions on this object",
-        theme.muted(),
-    )));
+    lines.extend(
+        prefixed_rows(
+            " ",
+            "esc close  ·  : for actions on this object",
+            inner_width,
+        )
+        .into_iter()
+        .map(|(prefix, row)| {
+            Line::from(vec![
+                Span::styled(prefix, theme.muted()),
+                Span::styled(row, theme.muted()),
+            ])
+        }),
+    );
 
     let height = u16::try_from(lines.len() + 2)
         .unwrap_or(u16::MAX)
         .min(screen.height.saturating_sub(2));
-    let area = centered(screen, 68, height);
+    let area = centered(screen, width, height);
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title(&content.title, scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(block)
-            .scroll((scroll, 0)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
     scroll
 }
 
@@ -547,16 +775,26 @@ fn render_rich_builder(
     theme: &Theme,
     screen: Rect,
 ) {
-    let area = centered(screen, 66, 10);
-    let block = modal(f, theme, area, "Rich rule builder");
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(2));
     let (label, example) = builder.prompt();
-    let lines = vec![
-        Line::from(Span::styled(
-            format!(" preview: {}", builder.assemble()),
-            theme.info(),
-        )),
-        Line::default(),
-        Line::from(Span::styled(format!(" {label} — {example}"), theme.muted())),
+    let mut lines: Vec<Line> = wrap_text(
+        &format!("preview: {}", builder.assemble()),
+        inner_width.saturating_sub(1),
+    )
+    .into_iter()
+    .map(|row| Line::from(Span::styled(format!(" {row}"), theme.info())))
+    .collect();
+    lines.push(Line::default());
+    lines.extend(
+        wrap_text(
+            &format!("{label} — {example}"),
+            inner_width.saturating_sub(1),
+        )
+        .into_iter()
+        .map(|row| Line::from(Span::styled(format!(" {row}"), theme.muted()))),
+    );
+    lines.extend([
         Line::from(vec![
             Span::styled(" > ", theme.accent()),
             Span::styled(builder.buffer.clone(), theme.text()),
@@ -567,17 +805,36 @@ fn render_rich_builder(
             " enter next/finish · esc cancel",
             theme.muted(),
         )),
-    ];
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    ]);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(screen.height);
+    let area = centered(screen, width, height);
+    let block = modal(f, theme, area, "Rich rule builder");
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
 }
 
 fn render_confirm(f: &mut Frame, confirmation: &Confirmation, theme: &Theme, screen: Rect) {
-    let height = u16::try_from(confirmation.body.len() + 5).unwrap_or(u16::MAX);
-    let area = centered(screen, 60, height);
+    let width = text_modal_width(screen);
+    let inner_width = usize::from(width.saturating_sub(3));
+    let body: Vec<String> = confirmation
+        .body
+        .iter()
+        .flat_map(|entry| wrap_text(entry, inner_width))
+        .collect();
+    let height = u16::try_from(body.len() + 5)
+        .unwrap_or(u16::MAX)
+        .min(screen.height);
+    let area = centered(screen, width, height);
     let block = modal(f, theme, area, &confirmation.title);
 
     let mut lines: Vec<Line> = vec![Line::default()];
-    for entry in &confirmation.body {
+    for entry in body {
         lines.push(Line::from(Span::styled(format!(" {entry}"), theme.text())));
     }
     lines.push(Line::default());
@@ -604,5 +861,239 @@ fn centered(screen: Rect, width: u16, height: u16) -> Rect {
         y: screen.y + (screen.height.saturating_sub(height)) / 2,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::domain::mock;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn text_modal_width_is_sixty_percent_with_safe_bounds() {
+        assert_eq!(text_modal_width(Rect::new(0, 0, 100, 30)), 60);
+        assert_eq!(text_modal_width(Rect::new(0, 0, 200, 50)), 120);
+        assert_eq!(text_modal_width(Rect::new(0, 0, 40, 20)), 38);
+    }
+
+    #[test]
+    fn help_entry_wraps_under_the_description_column() {
+        let rows = help_entry_rows("u", "roll back last change now (during countdown)", 36);
+
+        assert!(rows.len() > 1);
+        assert!(rows.iter().all(|(keys, description)| {
+            Line::from(format!("{keys}{description}")).width() <= 36
+        }));
+        assert!(rows[1].0.chars().all(|character| character == ' '));
+        assert_eq!(rows[0].0.len(), rows[1].0.len());
+    }
+
+    #[test]
+    fn wide_help_keeps_the_full_long_description_visible() {
+        let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+
+        terminal
+            .draw(|frame| {
+                render_help(frame, &theme, frame.area(), 0);
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(content.contains("roll back last change now"));
+        assert!(content.contains("during a countdown"));
+    }
+
+    #[test]
+    fn narrow_confirmation_wraps_body_without_hiding_its_suffix_or_actions() {
+        let mut terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let confirmation = Confirmation {
+            title: "Apply staged plan".to_owned(),
+            body: vec![
+                "this deliberately long confirmation description must remain visible".to_owned(),
+            ],
+            on_confirm: UiAction::Quit,
+        };
+
+        terminal
+            .draw(|frame| {
+                render_confirm(frame, &confirmation, &theme, frame.area());
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(content.contains("description must"));
+        assert!(content.contains("remain visible"));
+        assert!(content.contains("confirm"));
+        assert!(content.contains("cancel"));
+    }
+
+    #[test]
+    fn wide_palette_keeps_the_full_selected_description_visible() {
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let mut state = UiState::new(&Config::default(), "testhost".to_owned(), false, None);
+        state.snapshot = Some(std::sync::Arc::new(mock::sample().unwrap()));
+        let palette_state = PaletteState {
+            query: "temporary service".to_owned(),
+            selected: 0,
+        };
+        state.overlays.push(Overlay::Palette(palette_state.clone()));
+
+        terminal
+            .draw(|frame| {
+                render_palette(frame, &state, &palette_state, &theme, frame.area());
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(
+            content.contains("removed automatically after N seconds"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn palette_keeps_every_arrow_position_visible() {
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let mut state = UiState::new(&Config::default(), "testhost".to_owned(), false, None);
+        state.snapshot = Some(std::sync::Arc::new(mock::sample().unwrap()));
+        state
+            .overlays
+            .push(Overlay::Palette(PaletteState::default()));
+        let commands = palette::filtered(&state);
+        for (selected, command) in commands.iter().enumerate() {
+            let mut terminal = Terminal::new(TestBackend::new(190, 40)).unwrap();
+            let palette_state = PaletteState {
+                query: String::new(),
+                selected,
+            };
+
+            terminal
+                .draw(|frame| {
+                    render_palette(frame, &state, &palette_state, &theme, frame.area());
+                })
+                .unwrap();
+
+            let content = buffer_text(&terminal);
+            assert!(
+                content.contains(&format!("▸ {}", command.title)),
+                "selection {selected} ({}) was outside the rendered viewport: {content}",
+                command.title
+            );
+        }
+    }
+
+    #[test]
+    fn palette_keeps_the_full_long_disabled_reason_on_one_row() {
+        let mut terminal = Terminal::new(TestBackend::new(190, 40)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let mut state = UiState::new(&Config::default(), "testhost".to_owned(), false, None);
+        state.snapshot = Some(std::sync::Arc::new(mock::sample().unwrap()));
+        let palette_state = PaletteState {
+            query: "Migrate selected direct rule".to_owned(),
+            selected: 0,
+        };
+        state.overlays.push(Overlay::Palette(palette_state.clone()));
+
+        terminal
+            .draw(|frame| {
+                render_palette(frame, &state, &palette_state, &theme, frame.area());
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(
+            content.contains("select a supported migration candidate in the Direct view"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn narrow_about_can_scroll_to_the_full_final_sentence() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+
+        terminal
+            .draw(|frame| {
+                render_about(frame, &theme, frame.area(), u16::MAX);
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(content.contains("for your exact"), "{content}");
+        assert!(content.contains("upgrade command."), "{content}");
+    }
+
+    #[test]
+    fn narrow_details_can_scroll_to_the_wrapped_value_suffix_and_actions() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let details = DetailsContent {
+            title: "Policy details".to_owned(),
+            lines: vec![(
+                "Description".to_owned(),
+                "a deliberately long policy description whose final suffix stays readable"
+                    .to_owned(),
+            )],
+        };
+
+        terminal
+            .draw(|frame| {
+                render_details(frame, &details, &theme, frame.area(), u16::MAX);
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(content.contains("stays readable"), "{content}");
+        assert!(content.contains("actions on this"), "{content}");
+        assert!(content.contains("object"), "{content}");
+    }
+
+    #[test]
+    fn wide_global_search_uses_the_responsive_modal_width() {
+        let screen_width = 160usize;
+        let screen_height = 40usize;
+        let mut terminal = Terminal::new(TestBackend::new(
+            u16::try_from(screen_width).unwrap(),
+            u16::try_from(screen_height).unwrap(),
+        ))
+        .unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let state = UiState::new(&Config::default(), "testhost".to_owned(), false, None);
+        let search = super::super::search::GlobalSearchState::default();
+
+        terminal
+            .draw(|frame| {
+                render_global_search(frame, &state, &search, &theme, frame.area());
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        let title_offset = content.find("╭ Global search").unwrap();
+        let expected_width = usize::from(text_modal_width(Rect::new(
+            0,
+            0,
+            u16::try_from(screen_width).unwrap(),
+            u16::try_from(screen_height).unwrap(),
+        )));
+        let expected_x = (screen_width - expected_width) / 2;
+        let expected_y = (screen_height - 18) / 2;
+        assert_eq!(title_offset, expected_y * screen_width + expected_x);
     }
 }

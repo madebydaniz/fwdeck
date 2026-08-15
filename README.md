@@ -81,6 +81,7 @@ Once installed:
 
 ```bash
 fwdeck doctor        # checks your environment — never touches the firewall
+fwdeck prune --dry-run # previews bounded local-state retention
 fwdeck --read-only   # look around safely; mutations are disabled
 sudo fwdeck          # full control
 ```
@@ -104,10 +105,18 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
   a reload.
 - 📋 **Staged plans** — batch changes, review once, apply once; or export as a
   `firewall-cmd` script, JSON, or Ansible playbook.
+- 🧩 **First-class policies** — inspect runtime/permanent policy objects,
+  dependency health, policy sets, and reviewed policy mutations.
+- ⚡ **Responsive refresh** — status and zones appear before bounded,
+  selection-prioritized service and policy hydration completes; only the final
+  snapshot is authoritative for mutations and exports.
+- 🧷 **Stale-state guard** — every mutation carries the exact snapshot reviewed
+  at confirmation. The engine bypasses refresh caches, revalidates, and fails
+  closed if firewalld changed before execution.
 - 🚨 **SSH-aware** — warns precisely when a change targets the zone your session
   depends on.
-- 📸 **Snapshots** with diff-based restore (staged, never automatic), plus
-  read-only snapshot and session diffs.
+- 📸 **Snapshots** with diff-based restore (staged, never automatic), read-only
+  snapshot/session diffs, pinning, and bounded enterprise retention.
 - 🧯 **Offline mode** (`--offline`) — fix the permanent config from rescue/chroot,
   no daemon needed.
 
@@ -117,12 +126,22 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
 - 🧭 Every firewalld object on one screen: zones, services, ports, source-ports, protocols, forwards, rich rules, interfaces, sources, ipsets, policies, direct rules — plus per-zone target, intra-zone forwarding, and icmp-block inversion.
 - ✅ A confirmation in front of every mutation: resource, zone, scope, connectivity risk.
 - 🧙 Guided rich-rule builder — assemble valid rich-language syntax step by step.
+- 🧭 Fail-closed direct-rule migration assistant — preview and create additive
+  policy candidates for a conservative subset; legacy rules are never removed automatically.
 - ↩️ Multi-level undo — every verified reversible change stacks; undo pops the most recent.
 - 📊 Live nftables rule-hit counters per chain (nftables backend).
 - ⌨️ Fuzzy command palette (`:`) with context-aware availability; live filtering (`/`); global search (`ctrl-f`) across every view at once.
 - 🗑️ Multi-select bulk delete with one reviewed confirmation.
 - 📜 Live kernel/netfilter log tail with a denied-packet counter.
-- 🪪 Honest results: partial failures reported as partial failures, with per-step diagnostics and a JSONL audit trail.
+- 🪪 Honest results: partial failures reported as partial failures, with per-step diagnostics and a private, rotated JSONL audit trail.
+- 🧱 Concurrent-change protection: stale single operations and whole staged
+  plans are rejected before commands or rollback guards start.
+- 🔒 One mutation session at a time through an OS-backed RAII lock; crashes
+  release ownership automatically, while read-only sessions remain concurrent.
+- 🧰 Bounded operational I/O: external commands time out, and interactive
+  mutation fields have explicit byte limits before validation.
+- 🧹 Configurable local-state retention with safe defaults, dry-run/apply CLI,
+  pinned snapshots, strict filename matching, and symlink refusal.
 - 🔌 Two backends behind one trait: `firewall-cmd` (default, full-featured) and native D-Bus (reads + runtime edits; refuses what it can't do fully).
 - 🔏 Every release checksummed and signed with Cosign keyless (Sigstore).
 - 🩺 `fwdeck doctor`, shell completions, man page, XDG config, three themes.

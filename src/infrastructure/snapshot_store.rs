@@ -8,10 +8,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::domain::FirewallSnapshot;
+use crate::domain::{DegradedSection, FirewallSnapshot, SnapshotSection};
 
 /// Current snapshot-file schema. Bump on breaking envelope changes.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The on-disk envelope around a saved snapshot: enough metadata to refuse a
 /// restore against the wrong host or an incompatible schema, and to tell the
@@ -39,10 +39,26 @@ pub struct SnapshotEntry {
     pub name: String,
     /// File size in bytes.
     pub bytes: u64,
+    /// Excluded from automatic retention pruning.
+    pub pinned: bool,
 }
 
 fn snapshot_dir() -> Option<std::path::PathBuf> {
     Some(crate::bootstrap::state_dir()?.join("snapshots"))
+}
+
+fn snapshot_file(snapshot: &FirewallSnapshot, stamp: u128, host: String) -> SnapshotFile {
+    SnapshotFile {
+        schema: SCHEMA_VERSION,
+        host,
+        fwdeck_version: env!("CARGO_PKG_VERSION").to_owned(),
+        firewalld_version: snapshot.status.version.clone(),
+        taken_at: stamp
+            .checked_div(1000)
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .unwrap_or(0),
+        snapshot: snapshot.clone(),
+    }
 }
 
 /// Serializes `snapshot` to a timestamped JSON file and returns its path.
@@ -52,91 +68,31 @@ pub fn save(snapshot: &FirewallSnapshot) -> Result<String, String> {
     // subdirectory inherits privacy from create_private_dir.
     crate::bootstrap::ensure_state_dir().ok_or_else(|| "no state directory".to_owned())?;
     let dir = snapshot_dir().ok_or_else(|| "no state directory".to_owned())?;
-    create_private_dir(&dir).map_err(|err| err.to_string())?;
+    super::state_file::create_private_dir(&dir).map_err(|err| err.to_string())?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
-    // Reserve a unique filename by *atomically* creating it (O_EXCL), bumping a
-    // suffix on collision. This closes the check-then-create race a
-    // `while path.exists()` loop leaves open: two saves in the same millisecond
-    // can no longer pick the same name and clobber each other.
-    let path = reserve_unique_path(&dir, stamp).map_err(|err| err.to_string())?;
-    let envelope = SnapshotFile {
-        schema: SCHEMA_VERSION,
-        host: crate::bootstrap::hostname(),
-        fwdeck_version: env!("CARGO_PKG_VERSION").to_owned(),
-        firewalld_version: snapshot.status.version.clone(),
-        taken_at: stamp
-            .checked_div(1000)
-            .and_then(|seconds| u64::try_from(seconds).ok())
-            .unwrap_or(0),
-        snapshot: snapshot.clone(),
-    };
+    let envelope = snapshot_file(snapshot, stamp, crate::bootstrap::hostname());
     let json = serde_json::to_string_pretty(&envelope).map_err(|err| err.to_string())?;
-    // Snapshots reveal firewall topology: private perms, written atomically
-    // (temp + fsync + rename) so a crash never leaves a torn file.
-    write_private_atomic(&path, json.as_bytes()).map_err(|err| err.to_string())?;
+    // The completed temp inode is linked into its final unique name only after
+    // fsync, so readers never observe an empty reservation or a torn file.
+    let path = write_snapshot_file(&dir, stamp, json.as_bytes()).map_err(|err| err.to_string())?;
     Ok(path.display().to_string())
 }
 
-/// Atomically claims a unique `snapshot-<stamp>[-<n>].json` name by creating it
-/// with `O_EXCL` (`0600`). Returns the reserved path; the caller fills it via
-/// the temp-file + rename in [`write_private_atomic`]. Reserving up front means
-/// two concurrent saves can never resolve to the same name.
-fn reserve_unique_path(dir: &std::path::Path, stamp: u128) -> std::io::Result<std::path::PathBuf> {
-    let mut counter = 0u32;
-    loop {
-        let name = if counter == 0 {
+fn write_snapshot_file(
+    dir: &std::path::Path,
+    stamp: u128,
+    bytes: &[u8],
+) -> std::io::Result<std::path::PathBuf> {
+    super::state_file::write_private_atomic_unique(dir, bytes, |collision| {
+        let name = if collision == 0 {
             format!("snapshot-{stamp}.json")
         } else {
-            format!("snapshot-{stamp}-{counter}.json")
+            format!("snapshot-{stamp}-{collision}.json")
         };
-        let path = dir.join(name);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(_reserved) => return Ok(path),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => counter += 1,
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-/// Creates `dir` (and parents) with `0700` on Unix.
-fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(dir)
-}
-
-/// Writes `bytes` to `path` with `0600` perms via temp file + fsync + rename.
-fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let tmp = path.with_extension("json.tmp");
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)
+        dir.join(name)
+    })
 }
 
 /// Loads and deserializes a saved snapshot by filename. Deserialization
@@ -145,12 +101,25 @@ fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result
 /// machine's firewall onto another is refused; legacy bare-snapshot files
 /// (pre-envelope) still load.
 pub fn load(name: &str) -> Result<FirewallSnapshot, String> {
+    let dir = snapshot_dir().ok_or_else(|| "no state directory".to_owned())?;
+    load_from_dir(&dir, name, &crate::bootstrap::hostname())
+}
+
+fn load_from_dir(
+    dir: &std::path::Path,
+    name: &str,
+    current_host: &str,
+) -> Result<FirewallSnapshot, String> {
     // Reject path separators: only files in the snapshot dir are loadable.
     if name.contains('/') || name.contains('\\') {
         return Err("invalid snapshot name".to_owned());
     }
-    let dir = snapshot_dir().ok_or_else(|| "no state directory".to_owned())?;
-    let raw = std::fs::read_to_string(dir.join(name)).map_err(|err| err.to_string())?;
+    let path = dir.join(name);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|err| err.to_string())?;
+    if !metadata.file_type().is_file() {
+        return Err("snapshot is not a regular file".to_owned());
+    }
+    let raw = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
     if let Ok(envelope) = serde_json::from_str::<SnapshotFile>(&raw) {
         if envelope.schema > SCHEMA_VERSION {
             return Err(format!(
@@ -158,17 +127,69 @@ pub fn load(name: &str) -> Result<FirewallSnapshot, String> {
                 envelope.schema
             ));
         }
-        let here = crate::bootstrap::hostname();
-        if envelope.host != here {
+        if envelope.host != current_host {
             return Err(format!(
-                "snapshot was taken on `{}` but this host is `{here}` — refusing a cross-host restore",
-                envelope.host
+                "snapshot was taken on `{}` but this host is `{current_host}` — refusing a cross-host restore",
+                envelope.host,
             ));
         }
-        return Ok(envelope.snapshot);
+        let mut snapshot = envelope.snapshot;
+        if envelope.schema < SCHEMA_VERSION {
+            snapshot.degraded.push(DegradedSection::new(
+                SnapshotSection::LegacySnapshot,
+                None,
+                format!(
+                    "schema v{} stored ipsets and policies without separate runtime/permanent state",
+                    envelope.schema
+                ),
+            ));
+        }
+        return Ok(snapshot);
     }
     // Legacy bare snapshot (pre-envelope files).
-    serde_json::from_str(&raw).map_err(|err| err.to_string())
+    let mut snapshot: FirewallSnapshot =
+        serde_json::from_str(&raw).map_err(|err| err.to_string())?;
+    snapshot.degraded.push(DegradedSection::new(
+        SnapshotSection::LegacySnapshot,
+        None,
+        "bare snapshot stored ipsets and policies without separate runtime/permanent state",
+    ));
+    Ok(snapshot)
+}
+
+/// Pins or unpins an app-generated snapshot. Pinned snapshots are excluded
+/// from automatic retention pruning.
+pub fn set_pinned(name: &str, pinned: bool) -> Result<(), String> {
+    let dir = snapshot_dir().ok_or_else(|| "no state directory".to_owned())?;
+    set_pinned_in_dir(&dir, name, pinned).map_err(|err| err.to_string())
+}
+
+fn set_pinned_in_dir(dir: &std::path::Path, name: &str, pinned: bool) -> std::io::Result<()> {
+    if !super::retention::is_snapshot_name(name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "only app-generated snapshot names can be pinned",
+        ));
+    }
+    let snapshot = dir.join(name);
+    let metadata = std::fs::symlink_metadata(&snapshot)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "snapshot is not a regular file",
+        ));
+    }
+    let marker = dir.join(super::retention::pin_name(name));
+    if pinned {
+        super::state_file::create_private_dir(dir)?;
+        super::state_file::write_private_atomic_replace(&marker, b"pinned\n")
+    } else {
+        match std::fs::remove_file(marker) {
+            Ok(()) => super::state_file::sync_dir(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 /// Lists saved snapshots, newest first (filenames sort lexically by timestamp).
@@ -177,7 +198,11 @@ pub fn list() -> Vec<SnapshotEntry> {
     let Some(dir) = snapshot_dir() else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    list_in_dir(&dir)
+}
+
+fn list_in_dir(dir: &std::path::Path) -> Vec<SnapshotEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut snapshots: Vec<SnapshotEntry> = entries
@@ -190,8 +215,18 @@ pub fn list() -> Vec<SnapshotEntry> {
             {
                 return None;
             }
-            let bytes = entry.metadata().ok().map_or(0, |m| m.len());
-            Some(SnapshotEntry { name, bytes })
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            let bytes = metadata.len();
+            let pinned = std::fs::symlink_metadata(dir.join(super::retention::pin_name(&name)))
+                .is_ok_and(|metadata| metadata.file_type().is_file());
+            Some(SnapshotEntry {
+                name,
+                bytes,
+                pinned,
+            })
         })
         .collect();
     snapshots.sort_by(|a, b| b.name.cmp(&a.name));
@@ -201,39 +236,196 @@ pub fn list() -> Vec<SnapshotEntry> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{reserve_unique_path, write_private_atomic};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::domain::{SnapshotSection, mock};
+
+    use super::{
+        SCHEMA_VERSION, list_in_dir, load_from_dir, set_pinned_in_dir, snapshot_file,
+        write_snapshot_file,
+    };
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let sequence = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "fwdeck-snapshot-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_json(path: &std::path::Path, value: &impl serde::Serialize) {
+        std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
 
     #[test]
-    fn atomic_write_is_exact_and_private() {
-        let dir = std::env::temp_dir().join(format!("fwdeck-snapw-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("snapshot-1.json");
-        write_private_atomic(&path, br#"{"schema":1}"#).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), br#"{"schema":1}"#);
-        // The temp file is renamed into place, never left behind.
-        assert!(!path.with_extension("json.tmp").exists());
+    fn envelope_round_trip_preserves_same_host_snapshot() {
+        let dir = temp_dir("round-trip");
+        let expected = mock::sample().unwrap();
+        let envelope = snapshot_file(&expected, 1_700_000_000_123, "host-a".to_owned());
+        let name = "snapshot-1700000000123.json";
+        write_json(&dir.join(name), &envelope);
+
+        let loaded = load_from_dir(&dir, name, "host-a").unwrap();
+
+        assert_eq!(loaded, expected);
+        assert_eq!(envelope.taken_at, 1_700_000_000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_rejects_future_schema_and_cross_host_envelopes() {
+        let dir = temp_dir("envelope-safety");
+        let snapshot = mock::sample().unwrap();
+        let name = "snapshot-1700000000000.json";
+        let mut envelope = snapshot_file(&snapshot, 1_700_000_000_000, "host-a".to_owned());
+        envelope.schema = SCHEMA_VERSION + 1;
+        write_json(&dir.join(name), &envelope);
+        assert!(
+            load_from_dir(&dir, name, "host-a")
+                .unwrap_err()
+                .contains("newer")
+        );
+
+        envelope.schema = SCHEMA_VERSION;
+        write_json(&dir.join(name), &envelope);
+        assert!(
+            load_from_dir(&dir, name, "host-b")
+                .unwrap_err()
+                .contains("cross-host")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_envelope_and_bare_snapshot_are_marked_degraded() {
+        let dir = temp_dir("legacy");
+        let snapshot = mock::sample().unwrap();
+        let envelope_name = "snapshot-1700000000000.json";
+        let mut envelope = snapshot_file(&snapshot, 1_700_000_000_000, "host-a".to_owned());
+        envelope.schema = SCHEMA_VERSION - 1;
+        write_json(&dir.join(envelope_name), &envelope);
+
+        let loaded = load_from_dir(&dir, envelope_name, "host-a").unwrap();
+        assert_eq!(
+            loaded.degraded.last().map(|entry| entry.section),
+            Some(SnapshotSection::LegacySnapshot)
+        );
+
+        let bare_name = "snapshot-1700000000001.json";
+        write_json(&dir.join(bare_name), &snapshot);
+        let loaded = load_from_dir(&dir, bare_name, "host-a").unwrap();
+        assert_eq!(
+            loaded.degraded.last().map(|entry| entry.section),
+            Some(SnapshotSection::LegacySnapshot)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_rejects_traversal_and_non_regular_inputs() {
+        let dir = temp_dir("invalid-input");
+        assert_eq!(
+            load_from_dir(&dir, "../snapshot-1.json", "host-a").unwrap_err(),
+            "invalid snapshot name"
+        );
+        std::fs::create_dir(dir.join("snapshot-2.json")).unwrap();
+        assert!(
+            load_from_dir(&dir, "snapshot-2.json", "host-a")
+                .unwrap_err()
+                .contains("regular file")
+        );
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "snapshot must be 0600");
+            std::os::unix::fs::symlink(dir.join("snapshot-2.json"), dir.join("snapshot-3.json"))
+                .unwrap();
+            assert!(
+                load_from_dir(&dir, "snapshot-3.json", "host-a")
+                    .unwrap_err()
+                    .contains("regular file")
+            );
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_returns_regular_json_files_newest_first_with_pin_state() {
+        let dir = temp_dir("list");
+        std::fs::write(dir.join("snapshot-100.json"), b"old").unwrap();
+        std::fs::write(dir.join("snapshot-200.json"), b"newer").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
+        std::fs::create_dir(dir.join("snapshot-300.json")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("snapshot-200.json"), dir.join("snapshot-400.json"))
+            .unwrap();
+        std::fs::write(
+            dir.join(super::super::retention::pin_name("snapshot-100.json")),
+            b"pinned\n",
+        )
+        .unwrap();
+
+        let entries = list_in_dir(&dir);
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["snapshot-200.json", "snapshot-100.json"]
+        );
+        assert_eq!(entries[0].bytes, 5);
+        assert!(!entries[0].pinned);
+        assert!(entries[1].pinned);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_millisecond_saves_publish_distinct_complete_files() {
+        let dir = temp_dir("same-millisecond");
+        let stamp = 1_700_000_000_000u128;
+        let first = write_snapshot_file(&dir, stamp, b"first").unwrap();
+        let second = write_snapshot_file(&dir, stamp, b"second").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first).unwrap(), b"first");
+        assert_eq!(std::fs::read(second).unwrap(), b"second");
+        assert!(std::fs::read_dir(&dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".fwdeck-")
+        }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn reserved_names_never_collide() {
-        let dir = std::env::temp_dir().join(format!("fwdeck-snap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // Two saves in the same millisecond must resolve to distinct files, and
-        // both names are actually reserved on disk (O_EXCL), not merely planned.
-        let stamp = 1_700_000_000_000u128;
-        let first = reserve_unique_path(&dir, stamp).unwrap();
-        let second = reserve_unique_path(&dir, stamp).unwrap();
-        assert_ne!(first, second);
-        assert!(first.exists() && second.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn pin_marker_is_private_and_reversible() {
+        let dir = temp_dir("pin");
+        let name = "snapshot-1700000000000.json";
+        std::fs::write(dir.join(name), "{}").unwrap();
+        set_pinned_in_dir(&dir, name, true).unwrap();
+        let marker = dir.join(super::super::retention::pin_name(name));
+        assert!(marker.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&marker).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        set_pinned_in_dir(&dir, name, false).unwrap();
+        assert!(!marker.exists());
+        set_pinned_in_dir(&dir, name, false).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pin_rejects_unknown_names() {
+        let dir = temp_dir("pin-bad");
+        std::fs::write(dir.join("import.json"), "{}").unwrap();
+        assert!(set_pinned_in_dir(&dir, "import.json", true).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

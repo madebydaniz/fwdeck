@@ -1,5 +1,6 @@
 //! Staged-plan lifecycle: apply, drift sync, snapshot restore, and export.
 
+use crate::application::MutationPlan;
 use crate::domain::{ConfigurationTarget, FirewallOperation};
 use crate::ui::action::{Effect, UiAction};
 use crate::ui::overlays::{Confirmation, Overlay};
@@ -15,41 +16,38 @@ pub(super) fn apply_staged_plan(state: &mut UiState) -> Vec<Effect> {
         state.toast(ToastKind::Info, "no staged operations");
         return Vec::new();
     }
+    let Some(snapshot) = state.snapshot.clone() else {
+        state.toast(ToastKind::Warning, "no firewall data yet — refresh first");
+        return Vec::new();
+    };
 
     // Re-check each edit against the *current* snapshot (state may have drifted
     // since staging), keeping "already satisfied" (a genuine no-op) distinct
-    // from "invalid" (a real error that must never be silently swallowed). With
-    // no snapshot (never refreshed; a failed refresh is caught by blocked_stale)
-    // there is nothing to re-validate against, so apply the plan as-is.
+    // from "invalid" (a real error that must never be silently swallowed).
     let mut satisfied = 0usize;
-    let ops: Vec<FirewallOperation> = if let Some(snapshot) = state.snapshot.clone() {
-        let mut validated: Vec<FirewallOperation> = Vec::new();
-        let mut rejected: Vec<String> = Vec::new();
-        for op in &state.staged {
-            let narrowed = op.narrowed_for(&snapshot);
-            match narrowed.validate(&snapshot) {
-                Ok(()) => validated.push(narrowed),
-                Err(crate::domain::OperationError::NothingToDo(_)) => satisfied += 1,
-                Err(err) => rejected.push(format!("{}: {err}", narrowed.describe())),
-            }
+    let mut ops: Vec<FirewallOperation> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+    for op in &state.staged {
+        let narrowed = op.narrowed_for(&snapshot);
+        match narrowed.validate(&snapshot) {
+            Ok(()) => ops.push(narrowed),
+            Err(crate::domain::OperationError::NothingToDo(_)) => satisfied += 1,
+            Err(err) => rejected.push(format!("{}: {err}", narrowed.describe())),
         }
-        if !rejected.is_empty() {
-            // A validation failure is not "already satisfied": stop, name the
-            // offenders, and leave the whole plan staged for the operator to fix.
-            let detail = rejected.join("; ");
-            state.toast(
-                ToastKind::Error,
-                format!(
-                    "plan not applied — {} operation(s) invalid: {detail}",
-                    rejected.len()
-                ),
-            );
-            return Vec::new();
-        }
-        validated
-    } else {
-        state.staged.clone()
-    };
+    }
+    if !rejected.is_empty() {
+        // A validation failure is not "already satisfied": stop, name the
+        // offenders, and leave the whole plan staged for the operator to fix.
+        let detail = rejected.join("; ");
+        state.toast(
+            ToastKind::Error,
+            format!(
+                "plan not applied — {} operation(s) invalid: {detail}",
+                rejected.len()
+            ),
+        );
+        return Vec::new();
+    }
 
     if ops.is_empty() {
         state.staged.clear();
@@ -60,35 +58,36 @@ pub(super) fn apply_staged_plan(state: &mut UiState) -> Vec<Effect> {
     // Route the whole batch through the same confirmation + dead-man's switch as
     // a single op. Staged plans, restores and bulk deletes are the flows most
     // likely to cut a remote admin off, so they must NOT skip the safety net.
+    let Some(id) = state.allocate_plan_id() else {
+        state.toast(ToastKind::Error, "plan identity exhausted — restart FWDeck");
+        return Vec::new();
+    };
+    let plan = MutationPlan::new(id, ops, snapshot);
     if state.confirm_destructive {
-        let body = plan_confirm_body(state, &ops, satisfied);
+        let body = plan_confirm_body(state, &plan.operations, satisfied);
         state.overlays.push(Overlay::Confirm(Confirmation {
             title: "Apply staged plan".to_owned(),
             body,
-            on_confirm: UiAction::ApplyPlanConfirmed(ops),
+            on_confirm: UiAction::ApplyPlanConfirmed(plan),
         }));
         return Vec::new();
     }
-    apply_plan_now(state, ops)
+    apply_plan_now(state, plan)
 }
 
-/// Applies a validated, confirmed plan: clears the staging area, pre-arms the
-/// dead-man's switch for every connectivity-affecting op, then dispatches the
-/// batch. Reached from the confirmation's `on_confirm`, or directly when
-/// destructive confirmation is disabled.
-pub(super) fn apply_plan_now(state: &mut UiState, ops: Vec<FirewallOperation>) -> Vec<Effect> {
+/// Applies a validated, confirmed plan: clears the staging area and dispatches
+/// the batch. The engine arms the dead-man's switch immediately before each
+/// individual item, so future fail-fast items can never own a live inverse.
+pub(super) fn apply_plan_now(state: &mut UiState, plan: MutationPlan) -> Vec<Effect> {
     state.staged.clear();
-    // Arm the rollback BEFORE dispatching, mirroring the single-op path.
-    let mut effects = super::lifecycle::pre_arm_plan_rollbacks(state, &ops);
     state.toast(
         ToastKind::Info,
-        format!("applying {} operation(s)", ops.len()),
+        format!("applying {} operation(s)", plan.operations.len()),
     );
     // The engine executes sequentially, stops on the first failure (fail-fast),
     // and refreshes once at the end. This is NOT atomic — a mid-plan failure
     // leaves earlier operations applied and re-stages the rest.
-    effects.push(Effect::ApplyPlan(ops));
-    effects
+    vec![Effect::ApplyPlan(plan)]
 }
 
 /// Builds the confirmation body for a staged plan, surfacing per-batch

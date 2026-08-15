@@ -22,6 +22,7 @@ if firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd -q --permanent --new-ipset=blocklist --type=hash:ip 2>/dev/null || true
     firewall-cmd -q --permanent --ipset=blocklist --add-entry=203.0.113.9 2>/dev/null || true
     firewall-cmd -q --permanent --add-service=https || true
+    firewall-cmd -q --permanent --direct --add-rule ipv4 filter INPUT 9 -p tcp --dport 12345 -j ACCEPT || true
     firewall-cmd -q --reload || true
 
     # Runtime-only seeds so the runtime/permanent drift indicator ("different")
@@ -33,8 +34,6 @@ if firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd -q --zone=home --add-source=192.168.1.0/24 || true
     firewall-cmd -q --add-forward-port=port=8080:proto=tcp:toport=80:toaddr=10.0.0.5 || true
     firewall-cmd -q --add-rich-rule='rule family="ipv4" source address="203.0.113.0/24" reject' || true
-    firewall-cmd -q --direct --add-rule ipv4 filter INPUT 9 -p tcp --dport 12345 -j ACCEPT || true
-
     # FWDECK_DEMO_LOGS=1 injects sample netfilter lines into the kernel ring so
     # the Logs view has data. Needed because container-VM kernels (OrbStack /
     # Docker Desktop) cannot emit real netfilter logs from a container netns

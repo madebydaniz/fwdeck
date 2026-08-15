@@ -3,12 +3,18 @@
 //! as rollback metadata (ADR-3).
 
 use super::address::{IpSetEntry, SourceAddress};
+use super::capability::{FeatureSupport, FirewalldFeature};
+use super::dependency::{PolicyDependencyGraph, PolicyDependencyResource};
+use super::direct_migration::{DirectPolicyMigration, translate_direct_rule};
 use super::ids::IpProtocol;
-use super::ids::{IcmpType, InterfaceName, IpSetName, PolicyName, ServiceName, ZoneName};
+use super::ids::{
+    IcmpType, InterfaceName, IpSetName, PolicyName, PolicySetName, ServiceName, ZoneName,
+};
 use super::policy::PolicyTarget;
+use super::policy_set::PolicySetDetails;
 use super::port::{ForwardPort, PortSpec};
 use super::rich_rule::RichRule;
-use super::snapshot::{ConfigurationTarget, FirewallSnapshot, LogDenied};
+use super::snapshot::{ConfigurationTarget, FirewallSnapshot, LogDenied, SnapshotSection};
 use super::zone::ZoneTarget;
 
 /// One typed firewall mutation — everything the UI can do to firewalld.
@@ -260,6 +266,12 @@ pub enum FirewallOperation {
         /// Name for the new policy.
         policy: PolicyName,
     },
+    /// Create and populate a permanent policy replacement for one conservatively
+    /// translated direct rule. The legacy rule is deliberately left untouched.
+    MigrateDirectRule {
+        /// Reviewed source-to-policy translation.
+        migration: DirectPolicyMigration,
+    },
     /// Delete a policy object (permanent-only; reload applies).
     DeletePolicy {
         /// Policy to delete.
@@ -303,6 +315,15 @@ pub enum FirewallOperation {
         /// Service to remove.
         service: ServiceName,
         /// Configuration scope the change applies to.
+        target: ConfigurationTarget,
+    },
+    /// Enable or disable every member of a predefined policy set.
+    SetPolicySetEnabled {
+        /// Predefined set name, currently `gateway`.
+        policy_set: PolicySetName,
+        /// `true` removes the administrative disable; `false` adds it.
+        enabled: bool,
+        /// Runtime, permanent, or both configurations.
         target: ConfigurationTarget,
     },
     /// Permanent-only, like zones; reload activates.
@@ -392,6 +413,30 @@ pub const IPSET_TYPES: &[&str] = &[
     "hash:net,port",
     "hash:net,port,net",
 ];
+
+fn scoped_postcondition(
+    target: ConfigurationTarget,
+    runtime: Option<bool>,
+    permanent: Option<bool>,
+) -> Option<bool> {
+    match target {
+        ConfigurationTarget::Runtime => runtime,
+        ConfigurationTarget::Permanent => permanent,
+        ConfigurationTarget::RuntimeAndPermanent => Some(runtime? && permanent?),
+    }
+}
+
+enum PostconditionProbe {
+    NotApplicable,
+    Unknown,
+    Holds(bool),
+}
+
+impl PostconditionProbe {
+    fn from_option(value: Option<bool>) -> Self {
+        value.map_or(Self::Unknown, Self::Holds)
+    }
+}
 
 impl FirewallOperation {
     /// Short imperative summary for the confirmation modal.
@@ -502,6 +547,10 @@ impl FirewallOperation {
                 format!("unblock ICMP `{icmp}` in zone `{zone}`")
             }
             Self::CreatePolicy { policy } => format!("create policy `{policy}` (permanent)"),
+            Self::MigrateDirectRule { migration } => format!(
+                "create policy `{}` as a reviewed replacement for one direct rule",
+                migration.policy()
+            ),
             Self::DeletePolicy { policy } => format!("delete policy `{policy}` (permanent)"),
             Self::SetPolicyTarget {
                 policy,
@@ -525,6 +574,14 @@ impl FirewallOperation {
             } => {
                 format!("remove service `{service}` from policy `{policy}`")
             }
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => format!(
+                "{} policy set `{policy_set}`",
+                if *enabled { "enable" } else { "disable" }
+            ),
             Self::CreateService { service } => {
                 format!("create service `{service}` (permanent)")
             }
@@ -716,6 +773,10 @@ impl FirewallOperation {
             Self::CreatePolicy { policy } => {
                 format!("policy `{policy}` created (permanent) — reload (ctrl-r) to activate")
             }
+            Self::MigrateDirectRule { migration } => format!(
+                "policy `{}` created (permanent) — reload and verify before retiring the direct rule",
+                migration.policy()
+            ),
             Self::DeletePolicy { policy } => {
                 format!("policy `{policy}` deleted (permanent) — reload (ctrl-r) to apply")
             }
@@ -745,6 +806,17 @@ impl FirewallOperation {
                 target,
             } => scoped(
                 format!("service `{service}` removed from policy `{policy}`"),
+                *target,
+            ),
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                target,
+            } => scoped(
+                format!(
+                    "policy set `{policy_set}` {}",
+                    if *enabled { "enabled" } else { "disabled" }
+                ),
                 *target,
             ),
             Self::CreateService { service } => {
@@ -860,7 +932,10 @@ impl FirewallOperation {
             | Self::AddProtocol { target: t, .. }
             | Self::RemoveProtocol { target: t, .. }
             | Self::SetForward { target: t, .. }
-            | Self::SetIcmpBlockInversion { target: t, .. } => {
+            | Self::SetIcmpBlockInversion { target: t, .. }
+            | Self::AddPolicyService { target: t, .. }
+            | Self::RemovePolicyService { target: t, .. }
+            | Self::SetPolicySetEnabled { target: t, .. } => {
                 *t = target;
                 Some(retargeted)
             }
@@ -948,12 +1023,124 @@ impl FirewallOperation {
         }
     }
 
+    fn ipset_postcondition(&self, snapshot: &FirewallSnapshot) -> PostconditionProbe {
+        let target = self.target();
+        let complete = snapshot.section_is_complete(SnapshotSection::IpSets, target);
+        match self {
+            Self::CreateIpSet { name, .. } => PostconditionProbe::from_option(
+                complete.then(|| snapshot.ipsets.permanent.contains_key(name)),
+            ),
+            Self::DeleteIpSet { name } => PostconditionProbe::from_option(
+                complete.then(|| !snapshot.ipsets.permanent.contains_key(name)),
+            ),
+            Self::AddIpSetEntry { name, entry, .. }
+            | Self::RemoveIpSetEntry { name, entry, .. } => {
+                if !complete {
+                    return PostconditionProbe::Unknown;
+                }
+                let entry = entry.to_string();
+                let adding = matches!(self, Self::AddIpSetEntry { .. });
+                let desired =
+                    |info: &super::snapshot::IpSetInfo| info.entries.contains(&entry) == adding;
+                PostconditionProbe::from_option(scoped_postcondition(
+                    target,
+                    snapshot.ipsets.runtime.get(name).map(&desired),
+                    snapshot.ipsets.permanent.get(name).map(&desired),
+                ))
+            }
+            _ => PostconditionProbe::NotApplicable,
+        }
+    }
+
+    fn policy_postcondition(&self, snapshot: &FirewallSnapshot) -> PostconditionProbe {
+        let target = self.target();
+        let complete = snapshot.section_is_complete(SnapshotSection::Policies, target);
+        let permanent = |policy: &PolicyName| snapshot.policies.permanent.get(policy);
+        let result = match self {
+            Self::CreatePolicy { policy } => complete.then(|| permanent(policy).is_some()),
+            Self::MigrateDirectRule { migration } => complete.then(|| {
+                permanent(migration.policy()).is_some_and(|policy| {
+                    policy
+                        .ingress_zones
+                        .iter()
+                        .any(|zone| zone == migration.ingress_zone())
+                        && policy
+                            .egress_zones
+                            .iter()
+                            .any(|zone| zone == migration.egress_zone())
+                        && policy.rich_rules.contains(migration.rich_rule())
+                })
+            }),
+            Self::DeletePolicy { policy } => complete.then(|| permanent(policy).is_none()),
+            Self::SetPolicyTarget {
+                policy,
+                policy_target,
+            } => complete.then(|| permanent(policy).is_some_and(|p| p.target == *policy_target)),
+            Self::AddPolicyIngressZone { policy, zone } => {
+                complete.then(|| permanent(policy).is_some_and(|p| p.ingress_zones.contains(zone)))
+            }
+            Self::AddPolicyEgressZone { policy, zone } => {
+                complete.then(|| permanent(policy).is_some_and(|p| p.egress_zones.contains(zone)))
+            }
+            Self::AddPolicyService {
+                policy, service, ..
+            }
+            | Self::RemovePolicyService {
+                policy, service, ..
+            } => {
+                if !complete {
+                    return PostconditionProbe::Unknown;
+                }
+                let adding = matches!(self, Self::AddPolicyService { .. });
+                let desired = |details: &super::policy::PolicyDetails| {
+                    details.services.contains(service) == adding
+                };
+                return PostconditionProbe::from_option(scoped_postcondition(
+                    target,
+                    snapshot.policies.runtime.get(policy).map(&desired),
+                    permanent(policy).map(&desired),
+                ));
+            }
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => {
+                if !complete {
+                    return PostconditionProbe::Unknown;
+                }
+                let set = PolicySetDetails::from_snapshot(snapshot, policy_set.clone());
+                return PostconditionProbe::from_option(scoped_postcondition(
+                    target,
+                    set.runtime.state.matches(*enabled),
+                    set.permanent.state.matches(*enabled),
+                ));
+            }
+            _ => return PostconditionProbe::NotApplicable,
+        };
+        PostconditionProbe::from_option(result)
+    }
+
     /// Whether this operation's desired state is visible in `snapshot`:
     /// an add's item present (a remove's absent) in every targeted scope
     /// whose zone exists. `None` when the operation has no checkable
     /// zone-collection postcondition.
     #[must_use]
     pub fn postcondition_holds(&self, snapshot: &FirewallSnapshot) -> Option<bool> {
+        let target = self.target();
+        match self.ipset_postcondition(snapshot) {
+            PostconditionProbe::Holds(holds) => return Some(holds),
+            PostconditionProbe::Unknown => return None,
+            PostconditionProbe::NotApplicable => {}
+        }
+        match self.policy_postcondition(snapshot) {
+            PostconditionProbe::Holds(holds) => return Some(holds),
+            PostconditionProbe::Unknown => return None,
+            PostconditionProbe::NotApplicable => {}
+        }
+        if !snapshot.section_is_complete(SnapshotSection::Zones, target) {
+            return None;
+        }
         let zone = self.zone()?.clone();
         let (contains, adding) = self.zone_probe()?;
         let satisfied = |details: &super::zone::ZoneDetails| {
@@ -963,22 +1150,11 @@ impl FirewallOperation {
                 !contains(details)
             }
         };
-        let target = self.target();
-        let mut checked = false;
-        let mut holds = true;
-        if target != ConfigurationTarget::Permanent
-            && let Some(details) = snapshot.runtime.get(&zone)
-        {
-            checked = true;
-            holds &= satisfied(details);
-        }
-        if target != ConfigurationTarget::Runtime
-            && let Some(details) = snapshot.permanent.get(&zone)
-        {
-            checked = true;
-            holds &= satisfied(details);
-        }
-        checked.then_some(holds)
+        scoped_postcondition(
+            target,
+            snapshot.runtime.get(&zone).map(&satisfied),
+            snapshot.permanent.get(&zone).map(&satisfied),
+        )
     }
 
     /// Desired-state narrowing: shrinks a `RuntimeAndPermanent` target to only
@@ -993,6 +1169,72 @@ impl FirewallOperation {
     pub fn narrowed_for(&self, snapshot: &FirewallSnapshot) -> Self {
         if self.target() != ConfigurationTarget::RuntimeAndPermanent {
             return self.clone();
+        }
+        let observed_section = match self {
+            Self::AddIpSetEntry { .. } | Self::RemoveIpSetEntry { .. } => {
+                Some(SnapshotSection::IpSets)
+            }
+            Self::AddPolicyService { .. }
+            | Self::RemovePolicyService { .. }
+            | Self::SetPolicySetEnabled { .. } => Some(SnapshotSection::Policies),
+            _ if self.zone_probe().is_some() => Some(SnapshotSection::Zones),
+            _ => None,
+        };
+        if observed_section.is_some_and(|section| {
+            !snapshot.section_is_complete(section, ConfigurationTarget::RuntimeAndPermanent)
+        }) {
+            return self.clone();
+        }
+        let scoped_needs = match self {
+            Self::AddIpSetEntry { name, entry, .. }
+            | Self::RemoveIpSetEntry { name, entry, .. } => {
+                let entry = entry.to_string();
+                let adding = matches!(self, Self::AddIpSetEntry { .. });
+                let needs =
+                    |info: &super::snapshot::IpSetInfo| info.entries.contains(&entry) != adding;
+                Some((
+                    snapshot.ipsets.runtime.get(name).is_some_and(&needs),
+                    snapshot.ipsets.permanent.get(name).is_some_and(&needs),
+                ))
+            }
+            Self::AddPolicyService {
+                policy, service, ..
+            }
+            | Self::RemovePolicyService {
+                policy, service, ..
+            } => {
+                let adding = matches!(self, Self::AddPolicyService { .. });
+                let needs = |details: &super::policy::PolicyDetails| {
+                    details.services.contains(service) != adding
+                };
+                Some((
+                    snapshot.policies.runtime.get(policy).is_some_and(&needs),
+                    snapshot.policies.permanent.get(policy).is_some_and(&needs),
+                ))
+            }
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => {
+                let set = PolicySetDetails::from_snapshot(snapshot, policy_set.clone());
+                let Some(runtime_matches) = set.runtime.state.matches(*enabled) else {
+                    return self.clone();
+                };
+                let Some(permanent_matches) = set.permanent.state.matches(*enabled) else {
+                    return self.clone();
+                };
+                Some((!runtime_matches, !permanent_matches))
+            }
+            _ => None,
+        };
+        if let Some((runtime_needs, permanent_needs)) = scoped_needs {
+            let narrowed = match (runtime_needs, permanent_needs) {
+                (true, false) => ConfigurationTarget::Runtime,
+                (false, true) => ConfigurationTarget::Permanent,
+                _ => return self.clone(),
+            };
+            return self.with_target(narrowed).unwrap_or_else(|| self.clone());
         }
         let Some(zone) = self.zone().cloned() else {
             return self.clone();
@@ -1050,7 +1292,8 @@ impl FirewallOperation {
             | Self::SetForward { target, .. }
             | Self::SetIcmpBlockInversion { target, .. }
             | Self::AddPolicyService { target, .. }
-            | Self::RemovePolicyService { target, .. } => *target,
+            | Self::RemovePolicyService { target, .. }
+            | Self::SetPolicySetEnabled { target, .. } => *target,
             // Panic mode and timed rules are inherently runtime-only.
             Self::SetPanicMode { .. } | Self::AddTemporaryService { .. } => {
                 ConfigurationTarget::Runtime
@@ -1064,6 +1307,7 @@ impl FirewallOperation {
             | Self::AddServicePort { .. }
             | Self::RemoveServicePort { .. }
             | Self::CreatePolicy { .. }
+            | Self::MigrateDirectRule { .. }
             | Self::DeletePolicy { .. }
             | Self::SetPolicyTarget { .. }
             | Self::AddPolicyIngressZone { .. }
@@ -1117,6 +1361,12 @@ impl FirewallOperation {
             Self::DeletePolicy { .. } => {
                 Some("traffic governed by this policy falls back to zone rules")
             }
+            Self::SetPolicySetEnabled { enabled: true, .. } => Some(
+                "enabling a policy set may allow forwarding, NAT, and host services across multiple zones",
+            ),
+            Self::SetPolicySetEnabled { enabled: false, .. } => {
+                Some("disabling a policy set may interrupt routed traffic and gateway services")
+            }
             Self::DeleteIpSet { .. } => {
                 Some("zones referencing this ipset lose those sources after the next reload")
             }
@@ -1143,6 +1393,65 @@ impl FirewallOperation {
     /// a UX guard, not a race-free guarantee — firewalld revalidates anyway.
     #[allow(clippy::too_many_lines)] // one arm per operation
     pub fn validate(&self, snapshot: &FirewallSnapshot) -> Result<(), OperationError> {
+        let target = self.target();
+        let required_section = match self {
+            Self::CreateIpSet { .. }
+            | Self::DeleteIpSet { .. }
+            | Self::AddIpSetEntry { .. }
+            | Self::RemoveIpSetEntry { .. } => Some(SnapshotSection::IpSets),
+            Self::CreatePolicy { .. }
+            | Self::MigrateDirectRule { .. }
+            | Self::DeletePolicy { .. }
+            | Self::SetPolicyTarget { .. }
+            | Self::AddPolicyIngressZone { .. }
+            | Self::AddPolicyEgressZone { .. }
+            | Self::AddPolicyService { .. }
+            | Self::RemovePolicyService { .. }
+            | Self::SetPolicySetEnabled { .. } => Some(SnapshotSection::Policies),
+            Self::CreateService { .. }
+            | Self::DeleteService { .. }
+            | Self::AddServicePort { .. }
+            | Self::RemoveServicePort { .. } => Some(SnapshotSection::Services),
+            Self::AddService { .. }
+            | Self::AddTemporaryService { .. }
+            | Self::RemoveService { .. }
+            | Self::AddPort { .. }
+            | Self::RemovePort { .. }
+            | Self::SetDefaultZone { .. }
+            | Self::SetMasquerade { .. }
+            | Self::SetZoneTarget { .. }
+            | Self::AddForwardPort { .. }
+            | Self::RemoveForwardPort { .. }
+            | Self::AddRichRule { .. }
+            | Self::RemoveRichRule { .. }
+            | Self::AddInterface { .. }
+            | Self::RemoveInterface { .. }
+            | Self::AddSource { .. }
+            | Self::RemoveSource { .. }
+            | Self::CreateZone { .. }
+            | Self::DeleteZone { .. }
+            | Self::AddIcmpBlock { .. }
+            | Self::RemoveIcmpBlock { .. }
+            | Self::AddSourcePort { .. }
+            | Self::RemoveSourcePort { .. }
+            | Self::AddProtocol { .. }
+            | Self::RemoveProtocol { .. }
+            | Self::SetForward { .. }
+            | Self::SetIcmpBlockInversion { .. } => Some(SnapshotSection::Zones),
+            Self::SetPanicMode { .. }
+            | Self::RuntimeToPermanent
+            | Self::SetLogDenied { .. }
+            | Self::Reload => None,
+        };
+        if let Some(section) = required_section
+            && !snapshot.section_is_complete(section, target)
+        {
+            return Err(OperationError::Invalid(format!(
+                "cannot safely validate {} {} state because the latest snapshot is incomplete",
+                target.label(),
+                section.label()
+            )));
+        }
         let zone_exists = |zone: &ZoneName| {
             if snapshot.runtime.contains_key(zone) || snapshot.permanent.contains_key(zone) {
                 Ok(())
@@ -1156,6 +1465,23 @@ impl FirewallOperation {
                 snapshot.permanent.get(zone).is_some_and(check),
             )
         };
+        let zone_exists_for = |zone: &ZoneName| {
+            let runtime = snapshot.runtime.contains_key(zone);
+            let permanent = snapshot.permanent.contains_key(zone);
+            let exists = match target {
+                ConfigurationTarget::Runtime => runtime,
+                ConfigurationTarget::Permanent => permanent,
+                ConfigurationTarget::RuntimeAndPermanent => runtime && permanent,
+            };
+            if exists {
+                Ok(())
+            } else {
+                Err(OperationError::Invalid(format!(
+                    "zone `{zone}` does not exist in the {} configuration",
+                    target.label()
+                )))
+            }
+        };
         // The shared body of every zone-collection add/remove arm: the zone
         // must exist, and adding an item present in both configs (or removing
         // one present in neither) is a no-op the modal should never offer.
@@ -1164,12 +1490,22 @@ impl FirewallOperation {
                           check: &dyn Fn(&super::zone::ZoneDetails) -> bool,
                           message: String|
          -> Result<(), OperationError> {
-            zone_exists(zone)?;
+            zone_exists_for(zone)?;
             let (runtime, permanent) = presence(zone, check);
-            if adding && runtime && permanent {
+            let all_present = match target {
+                ConfigurationTarget::Runtime => runtime,
+                ConfigurationTarget::Permanent => permanent,
+                ConfigurationTarget::RuntimeAndPermanent => runtime && permanent,
+            };
+            let all_absent = match target {
+                ConfigurationTarget::Runtime => !runtime,
+                ConfigurationTarget::Permanent => !permanent,
+                ConfigurationTarget::RuntimeAndPermanent => !runtime && !permanent,
+            };
+            if adding && all_present {
                 return Err(OperationError::NothingToDo(message));
             }
-            if !adding && !runtime && !permanent {
+            if !adding && all_absent {
                 return Err(OperationError::NothingToDo(message));
             }
             Ok(())
@@ -1215,9 +1551,16 @@ impl FirewallOperation {
                 }
             }
             Self::SetMasquerade { zone, enabled, .. } => {
-                zone_exists(zone)?;
+                zone_exists_for(zone)?;
                 let (runtime, permanent) = presence(zone, &|z| z.masquerade);
-                if runtime == *enabled && permanent == *enabled {
+                let already_set = match target {
+                    ConfigurationTarget::Runtime => runtime == *enabled,
+                    ConfigurationTarget::Permanent => permanent == *enabled,
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime == *enabled && permanent == *enabled
+                    }
+                };
+                if already_set {
                     return Err(OperationError::NothingToDo(format!(
                         "masquerade is already {} in zone `{zone}`",
                         if *enabled { "enabled" } else { "disabled" }
@@ -1225,9 +1568,16 @@ impl FirewallOperation {
                 }
             }
             Self::SetForward { zone, enabled, .. } => {
-                zone_exists(zone)?;
+                zone_exists_for(zone)?;
                 let (runtime, permanent) = presence(zone, &|z| z.forward);
-                if runtime == *enabled && permanent == *enabled {
+                let already_set = match target {
+                    ConfigurationTarget::Runtime => runtime == *enabled,
+                    ConfigurationTarget::Permanent => permanent == *enabled,
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime == *enabled && permanent == *enabled
+                    }
+                };
+                if already_set {
                     return Err(OperationError::NothingToDo(format!(
                         "intra-zone forwarding is already {} in zone `{zone}`",
                         if *enabled { "enabled" } else { "disabled" }
@@ -1235,9 +1585,16 @@ impl FirewallOperation {
                 }
             }
             Self::SetIcmpBlockInversion { zone, enabled, .. } => {
-                zone_exists(zone)?;
+                zone_exists_for(zone)?;
                 let (runtime, permanent) = presence(zone, &|z| z.icmp_block_inversion);
-                if runtime == *enabled && permanent == *enabled {
+                let already_set = match target {
+                    ConfigurationTarget::Runtime => runtime == *enabled,
+                    ConfigurationTarget::Permanent => permanent == *enabled,
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime == *enabled && permanent == *enabled
+                    }
+                };
+                if already_set {
                     return Err(OperationError::NothingToDo(format!(
                         "icmp-block inversion is already {} in zone `{zone}`",
                         if *enabled { "on" } else { "off" }
@@ -1245,7 +1602,11 @@ impl FirewallOperation {
                 }
             }
             Self::SetZoneTarget { zone, zone_target } => {
-                zone_exists(zone)?;
+                if !snapshot.permanent.contains_key(zone) {
+                    return Err(OperationError::Invalid(format!(
+                        "zone `{zone}` does not exist in permanent configuration"
+                    )));
+                }
                 if snapshot
                     .permanent
                     .get(zone)
@@ -1344,20 +1705,136 @@ impl FirewallOperation {
                 }
             }
             Self::CreatePolicy { policy } => {
-                if snapshot.policies.contains_key(policy) {
+                if !policy.is_user_creatable() {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{policy}` exceeds firewalld's 17-character creation limit"
+                    )));
+                }
+                if snapshot.policies.permanent.contains_key(policy) {
                     return Err(OperationError::Invalid(format!(
                         "policy `{policy}` already exists"
+                    )));
+                }
+            }
+            Self::MigrateDirectRule { migration } => {
+                if !snapshot
+                    .section_is_complete(SnapshotSection::DirectRules, ConfigurationTarget::Runtime)
+                {
+                    return Err(OperationError::Invalid(
+                        "cannot migrate from an incomplete direct-rule snapshot".to_owned(),
+                    ));
+                }
+                if !snapshot
+                    .direct_rules
+                    .iter()
+                    .any(|rule| rule == migration.source_rule())
+                {
+                    return Err(OperationError::Invalid(
+                        "the source direct rule is no longer present; refresh and review again"
+                            .to_owned(),
+                    ));
+                }
+                if !migration.policy().is_user_creatable() {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{}` exceeds firewalld's 17-character creation limit",
+                        migration.policy()
+                    )));
+                }
+                if snapshot.policies.permanent.contains_key(migration.policy()) {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{}` already exists",
+                        migration.policy()
+                    )));
+                }
+                let verified = translate_direct_rule(migration.source_rule())
+                    .map_err(|err| OperationError::Invalid(err.to_string()))?
+                    .into_migration(migration.policy().clone());
+                if &verified != migration {
+                    return Err(OperationError::Invalid(
+                        "direct-rule translation no longer matches the verified migration subset"
+                            .to_owned(),
+                    ));
+                }
+            }
+            Self::DeletePolicy { policy } => {
+                if !snapshot.policies.permanent.contains_key(policy) {
+                    return Err(OperationError::NothingToDo(format!(
+                        "policy `{policy}` does not exist in permanent configuration"
+                    )));
+                }
+            }
+            Self::SetPolicyTarget {
+                policy,
+                policy_target,
+            } => match snapshot.policies.permanent.get(policy) {
+                None => {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{policy}` does not exist in permanent configuration"
+                    )));
+                }
+                Some(details) if details.target == *policy_target => {
+                    return Err(OperationError::NothingToDo(format!(
+                        "policy `{policy}` already targets {}",
+                        policy_target.as_str()
+                    )));
+                }
+                Some(_) => {}
+            },
+            Self::AddPolicyIngressZone { policy, zone } => {
+                let Some(details) = snapshot.policies.permanent.get(policy) else {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{policy}` does not exist in permanent configuration"
+                    )));
+                };
+                if details.ingress_zones.contains(zone) {
+                    return Err(OperationError::NothingToDo(format!(
+                        "zone `{zone}` is already an ingress zone for policy `{policy}`"
+                    )));
+                }
+            }
+            Self::AddPolicyEgressZone { policy, zone } => {
+                let Some(details) = snapshot.policies.permanent.get(policy) else {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{policy}` does not exist in permanent configuration"
+                    )));
+                };
+                if details.egress_zones.contains(zone) {
+                    return Err(OperationError::NothingToDo(format!(
+                        "zone `{zone}` is already an egress zone for policy `{policy}`"
                     )));
                 }
             }
             Self::AddPolicyService {
                 policy, service, ..
             } => {
-                if snapshot
-                    .policies
-                    .get(policy)
-                    .is_some_and(|p| p.services.contains(service))
-                {
+                let runtime = snapshot.policies.runtime.get(policy);
+                let permanent = snapshot.policies.permanent.get(policy);
+                let exists = match target {
+                    ConfigurationTarget::Runtime => runtime.is_some(),
+                    ConfigurationTarget::Permanent => permanent.is_some(),
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some() && permanent.is_some()
+                    }
+                };
+                if !exists {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{policy}` does not exist in {} configuration",
+                        target.label()
+                    )));
+                }
+                let already_set = match target {
+                    ConfigurationTarget::Runtime => {
+                        runtime.is_some_and(|p| p.services.contains(service))
+                    }
+                    ConfigurationTarget::Permanent => {
+                        permanent.is_some_and(|p| p.services.contains(service))
+                    }
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some_and(|p| p.services.contains(service))
+                            && permanent.is_some_and(|p| p.services.contains(service))
+                    }
+                };
+                if already_set {
                     return Err(OperationError::NothingToDo(format!(
                         "service `{service}` is already in policy `{policy}`"
                     )));
@@ -1366,13 +1843,93 @@ impl FirewallOperation {
             Self::RemovePolicyService {
                 policy, service, ..
             } => {
-                if snapshot
-                    .policies
-                    .get(policy)
-                    .is_some_and(|p| !p.services.contains(service))
-                {
+                let runtime = snapshot.policies.runtime.get(policy);
+                let permanent = snapshot.policies.permanent.get(policy);
+                let exists = match target {
+                    ConfigurationTarget::Runtime => runtime.is_some(),
+                    ConfigurationTarget::Permanent => permanent.is_some(),
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some() && permanent.is_some()
+                    }
+                };
+                if !exists {
+                    return Err(OperationError::Invalid(format!(
+                        "policy `{policy}` does not exist in {} configuration",
+                        target.label()
+                    )));
+                }
+                let already_absent = match target {
+                    ConfigurationTarget::Runtime => {
+                        runtime.is_some_and(|p| !p.services.contains(service))
+                    }
+                    ConfigurationTarget::Permanent => {
+                        permanent.is_some_and(|p| !p.services.contains(service))
+                    }
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some_and(|p| !p.services.contains(service))
+                            && permanent.is_some_and(|p| !p.services.contains(service))
+                    }
+                };
+                if already_absent {
                     return Err(OperationError::NothingToDo(format!(
                         "service `{service}` is not in policy `{policy}`"
+                    )));
+                }
+            }
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => {
+                match FirewalldFeature::PolicySets.support_for(snapshot.status.version.as_deref()) {
+                    FeatureSupport::Supported => {}
+                    FeatureSupport::Unsupported => {
+                        return Err(OperationError::Invalid(format!(
+                            "policy sets require firewalld {} or newer (current: {})",
+                            FirewalldFeature::PolicySets.minimum_version(),
+                            snapshot.status.version.as_deref().unwrap_or("unknown")
+                        )));
+                    }
+                    FeatureSupport::Unknown => {
+                        return Err(OperationError::Invalid(
+                            "cannot safely use policy sets because the firewalld version is unknown"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                if !PolicySetDetails::is_known(policy_set) {
+                    return Err(OperationError::Invalid(format!(
+                        "policy set `{policy_set}` is not in FWDeck's verified upstream manifest"
+                    )));
+                }
+                let set = PolicySetDetails::from_snapshot(snapshot, policy_set.clone());
+                let runtime = set.runtime.state.matches(*enabled);
+                let permanent = set.permanent.state.matches(*enabled);
+                let exists = match target {
+                    ConfigurationTarget::Runtime => runtime.is_some(),
+                    ConfigurationTarget::Permanent => permanent.is_some(),
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some() && permanent.is_some()
+                    }
+                };
+                if !exists {
+                    return Err(OperationError::Invalid(format!(
+                        "policy set `{policy_set}` has no observed members in {} configuration",
+                        target.label()
+                    )));
+                }
+                let already_set = match target {
+                    ConfigurationTarget::Runtime => runtime == Some(true),
+                    ConfigurationTarget::Permanent => permanent == Some(true),
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime == Some(true) && permanent == Some(true)
+                    }
+                };
+                if already_set {
+                    return Err(OperationError::NothingToDo(format!(
+                        "policy set `{policy_set}` is already {} in {} configuration",
+                        if *enabled { "enabled" } else { "disabled" },
+                        target.label()
                     )));
                 }
             }
@@ -1383,25 +1940,84 @@ impl FirewallOperation {
                         "unknown ipset type `{kind}` (e.g. hash:ip, hash:net)"
                     )));
                 }
-                if snapshot.ipsets.contains_key(name) {
+                if snapshot.ipsets.permanent.contains_key(name) {
                     return Err(OperationError::Invalid(format!(
                         "ipset `{name}` already exists"
                     )));
                 }
             }
+            Self::DeleteIpSet { name } => {
+                if !snapshot.ipsets.permanent.contains_key(name) {
+                    return Err(OperationError::NothingToDo(format!(
+                        "ipset `{name}` does not exist in permanent configuration"
+                    )));
+                }
+            }
             Self::AddIpSetEntry { name, entry, .. } => {
-                if let Some(info) = snapshot.ipsets.get(name)
-                    && info.entries.contains(&entry.to_string())
-                {
+                let runtime = snapshot.ipsets.runtime.get(name);
+                let permanent = snapshot.ipsets.permanent.get(name);
+                let exists = match target {
+                    ConfigurationTarget::Runtime => runtime.is_some(),
+                    ConfigurationTarget::Permanent => permanent.is_some(),
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some() && permanent.is_some()
+                    }
+                };
+                if !exists {
+                    return Err(OperationError::Invalid(format!(
+                        "ipset `{name}` does not exist in {} configuration",
+                        target.label()
+                    )));
+                }
+                let entry = entry.to_string();
+                let already_set = match target {
+                    ConfigurationTarget::Runtime => {
+                        runtime.is_some_and(|info| info.entries.contains(&entry))
+                    }
+                    ConfigurationTarget::Permanent => {
+                        permanent.is_some_and(|info| info.entries.contains(&entry))
+                    }
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some_and(|info| info.entries.contains(&entry))
+                            && permanent.is_some_and(|info| info.entries.contains(&entry))
+                    }
+                };
+                if already_set {
                     return Err(OperationError::NothingToDo(format!(
                         "{entry} is already in ipset `{name}`"
                     )));
                 }
             }
             Self::RemoveIpSetEntry { name, entry, .. } => {
-                if let Some(info) = snapshot.ipsets.get(name)
-                    && !info.entries.contains(&entry.to_string())
-                {
+                let runtime = snapshot.ipsets.runtime.get(name);
+                let permanent = snapshot.ipsets.permanent.get(name);
+                let exists = match target {
+                    ConfigurationTarget::Runtime => runtime.is_some(),
+                    ConfigurationTarget::Permanent => permanent.is_some(),
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some() && permanent.is_some()
+                    }
+                };
+                if !exists {
+                    return Err(OperationError::Invalid(format!(
+                        "ipset `{name}` does not exist in {} configuration",
+                        target.label()
+                    )));
+                }
+                let entry = entry.to_string();
+                let already_absent = match target {
+                    ConfigurationTarget::Runtime => {
+                        runtime.is_some_and(|info| !info.entries.contains(&entry))
+                    }
+                    ConfigurationTarget::Permanent => {
+                        permanent.is_some_and(|info| !info.entries.contains(&entry))
+                    }
+                    ConfigurationTarget::RuntimeAndPermanent => {
+                        runtime.is_some_and(|info| !info.entries.contains(&entry))
+                            && permanent.is_some_and(|info| !info.entries.contains(&entry))
+                    }
+                };
+                if already_absent {
                     return Err(OperationError::NothingToDo(format!(
                         "{entry} is not in ipset `{name}`"
                     )));
@@ -1415,10 +2031,41 @@ impl FirewallOperation {
                 }
             }
             Self::DeleteZone { zone } => {
-                zone_exists(zone)?;
+                if !snapshot.permanent.contains_key(zone) {
+                    return Err(OperationError::Invalid(format!(
+                        "zone `{zone}` does not exist in permanent configuration"
+                    )));
+                }
                 if *zone == snapshot.default_zone {
                     return Err(OperationError::Invalid(format!(
                         "`{zone}` is the default zone — set another default first"
+                    )));
+                }
+                if !snapshot
+                    .section_is_complete(SnapshotSection::Policies, ConfigurationTarget::Permanent)
+                {
+                    return Err(OperationError::Invalid(
+                        "cannot safely delete a zone while permanent policy dependencies are unknown"
+                            .to_owned(),
+                    ));
+                }
+                let graph =
+                    PolicyDependencyGraph::from_snapshot(snapshot, ConfigurationTarget::Permanent);
+                let references: Vec<_> = graph
+                    .references_zone(zone.as_str())
+                    .map(|dependency| {
+                        let direction = match &dependency.resource {
+                            PolicyDependencyResource::IngressZone(_) => "ingress",
+                            PolicyDependencyResource::EgressZone(_) => "egress",
+                            PolicyDependencyResource::Service(_) => "service",
+                        };
+                        format!("{} ({direction})", dependency.policy)
+                    })
+                    .collect();
+                if !references.is_empty() {
+                    return Err(OperationError::Invalid(format!(
+                        "zone `{zone}` is referenced by permanent policies: {}; remove those policy edges first",
+                        references.join(", ")
                     )));
                 }
             }
@@ -1457,20 +2104,48 @@ impl FirewallOperation {
                     )));
                 }
             }
-            // Not existence-checked: permanent-only objects (deleted sets, custom
-            // service internals) are invisible to the runtime snapshot, so
-            // firewalld gives the final word.
-            // Not existence-checked: permanent-only or pseudo-zone (ANY/HOST)
-            // details are invisible to the runtime snapshot — firewalld decides.
-            Self::DeleteIpSet { .. }
-            | Self::DeleteService { .. }
-            | Self::AddServicePort { .. }
-            | Self::RemoveServicePort { .. }
-            | Self::DeletePolicy { .. }
-            | Self::SetPolicyTarget { .. }
-            | Self::AddPolicyIngressZone { .. }
-            | Self::AddPolicyEgressZone { .. }
-            | Self::Reload => {}
+            Self::DeleteService { service } => {
+                let dependencies_known = snapshot
+                    .section_is_complete(SnapshotSection::Zones, ConfigurationTarget::Permanent)
+                    && snapshot.section_is_complete(
+                        SnapshotSection::Policies,
+                        ConfigurationTarget::Permanent,
+                    );
+                if !dependencies_known {
+                    return Err(OperationError::Invalid(
+                        "cannot safely delete a service while permanent zone/policy dependencies are unknown"
+                            .to_owned(),
+                    ));
+                }
+                let zones: Vec<_> = snapshot
+                    .permanent
+                    .iter()
+                    .filter(|(_, details)| details.services.contains(service))
+                    .map(|(zone, _)| zone.to_string())
+                    .collect();
+                let graph =
+                    PolicyDependencyGraph::from_snapshot(snapshot, ConfigurationTarget::Permanent);
+                let policies: Vec<_> = graph
+                    .references_service(service)
+                    .map(|dependency| dependency.policy.to_string())
+                    .collect();
+                if !zones.is_empty() || !policies.is_empty() {
+                    let mut references = Vec::new();
+                    if !zones.is_empty() {
+                        references.push(format!("zones: {}", zones.join(", ")));
+                    }
+                    if !policies.is_empty() {
+                        references.push(format!("policies: {}", policies.join(", ")));
+                    }
+                    return Err(OperationError::Invalid(format!(
+                        "service `{service}` is still referenced by {}; remove those references first",
+                        references.join("; ")
+                    )));
+                }
+            }
+            // Service definition internals are fetched only for referenced
+            // services, so firewalld gives the final word for port edits.
+            Self::AddServicePort { .. } | Self::RemoveServicePort { .. } | Self::Reload => {}
         }
         Ok(())
     }
@@ -1640,6 +2315,18 @@ impl FirewallOperation {
                 service: service.clone(),
                 target: runtime,
             }),
+            Self::SetPolicySetEnabled {
+                policy_set,
+                enabled,
+                ..
+            } => Some(Self::SetPolicySetEnabled {
+                policy_set: policy_set.clone(),
+                enabled: !enabled,
+                target: runtime,
+            }),
+            Self::MigrateDirectRule { migration } => Some(Self::DeletePolicy {
+                policy: migration.policy().clone(),
+            }),
             Self::RemoveServicePort { service, port } => Some(Self::AddServicePort {
                 service: service.clone(),
                 port: *port,
@@ -1678,6 +2365,25 @@ mod tests {
 
     fn service(name: &str) -> ServiceName {
         ServiceName::parse(name).unwrap()
+    }
+
+    fn gateway_snapshot(
+        version: &str,
+        runtime_disabled: bool,
+        permanent_disabled: bool,
+    ) -> FirewallSnapshot {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot.status.version = Some(version.to_owned());
+        for name in super::super::policy_set::GATEWAY_POLICY_MEMBERS {
+            let name = PolicyName::parse(name).unwrap();
+            let mut runtime = super::super::policy::PolicyDetails::empty(name.clone());
+            runtime.disabled = runtime_disabled;
+            let mut permanent = runtime.clone();
+            permanent.disabled = permanent_disabled;
+            snapshot.policies.runtime.insert(name.clone(), runtime);
+            snapshot.policies.permanent.insert(name, permanent);
+        }
+        snapshot
     }
 
     #[test]
@@ -1961,6 +2667,64 @@ mod tests {
     }
 
     #[test]
+    fn policy_set_validation_is_capability_gated_and_reversible() {
+        let supported = gateway_snapshot("2.4.0", true, true);
+        let enable = FirewallOperation::SetPolicySetEnabled {
+            policy_set: PolicySetName::parse("gateway").unwrap(),
+            enabled: true,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+        assert!(enable.validate(&supported).is_ok());
+        assert_eq!(enable.postcondition_holds(&supported), Some(false));
+        assert!(enable.connectivity_warning().is_some());
+        assert!(matches!(
+            enable.inverse(),
+            Some(FirewallOperation::SetPolicySetEnabled { enabled: false, .. })
+        ));
+
+        let unsupported = gateway_snapshot("2.3.1", true, true);
+        let error = enable.validate(&unsupported).unwrap_err();
+        assert!(error.to_string().contains("require firewalld 2.4.0"));
+    }
+
+    #[test]
+    fn policy_set_narrowing_repairs_only_the_drifted_scope() {
+        let snapshot = gateway_snapshot("2.4.2", false, true);
+        let enable = FirewallOperation::SetPolicySetEnabled {
+            policy_set: PolicySetName::parse("gateway").unwrap(),
+            enabled: true,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+
+        assert_eq!(
+            enable.narrowed_for(&snapshot).target(),
+            ConfigurationTarget::Permanent
+        );
+        assert!(enable.validate(&snapshot).is_ok());
+
+        let already_enabled = gateway_snapshot("2.4.2", false, false);
+        assert_eq!(enable.postcondition_holds(&already_enabled), Some(true));
+        assert!(matches!(
+            enable.validate(&already_enabled),
+            Err(OperationError::NothingToDo(_))
+        ));
+
+        let mut partial = gateway_snapshot("2.4.2", true, true);
+        let missing =
+            PolicyName::parse(super::super::policy_set::GATEWAY_POLICY_MEMBERS[0]).unwrap();
+        partial.policies.runtime.remove(&missing);
+        assert_eq!(
+            enable.narrowed_for(&partial).target(),
+            ConfigurationTarget::RuntimeAndPermanent,
+            "an unknown scope must never be narrowed away"
+        );
+        assert!(matches!(
+            enable.validate(&partial),
+            Err(OperationError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn service_lifecycle_validations_and_inverse() {
         let snapshot = mock::sample().unwrap();
         // ssh already exists in the mock catalog
@@ -2025,6 +2789,87 @@ mod tests {
     }
 
     #[test]
+    fn zone_deletion_is_blocked_by_permanent_policy_dependencies() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot
+            .policies
+            .permanent
+            .values_mut()
+            .next()
+            .unwrap()
+            .ingress_zones
+            .push("home".to_owned());
+
+        let error = FirewallOperation::DeleteZone { zone: zone("home") }
+            .validate(&snapshot)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("mypolicy (ingress)"));
+        assert!(
+            error
+                .to_string()
+                .contains("remove those policy edges first")
+        );
+    }
+
+    #[test]
+    fn service_deletion_reports_zone_and_policy_dependencies() {
+        let snapshot = mock::sample().unwrap();
+
+        let policy_error = FirewallOperation::DeleteService {
+            service: service("http"),
+        }
+        .validate(&snapshot)
+        .unwrap_err();
+        assert!(policy_error.to_string().contains("policies: mypolicy"));
+
+        let zone_error = FirewallOperation::DeleteService {
+            service: service("ssh"),
+        }
+        .validate(&snapshot)
+        .unwrap_err();
+        assert!(zone_error.to_string().contains("zones:"));
+        assert!(zone_error.to_string().contains("public"));
+
+        assert!(
+            FirewallOperation::DeleteService {
+                service: service("mysql")
+            }
+            .validate(&snapshot)
+            .is_ok(),
+            "an unreferenced service must remain deletable"
+        );
+    }
+
+    #[test]
+    fn destructive_dependency_checks_fail_closed_on_degraded_data() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot
+            .degraded
+            .push(super::super::snapshot::DegradedSection::new(
+                SnapshotSection::Policies,
+                Some(ConfigurationTarget::Permanent),
+                "permission denied",
+            ));
+
+        let zone_error = FirewallOperation::DeleteZone { zone: zone("home") }
+            .validate(&snapshot)
+            .unwrap_err();
+        assert!(zone_error.to_string().contains("dependencies are unknown"));
+
+        let service_error = FirewallOperation::DeleteService {
+            service: service("mysql"),
+        }
+        .validate(&snapshot)
+        .unwrap_err();
+        assert!(
+            service_error
+                .to_string()
+                .contains("zone/policy dependencies are unknown")
+        );
+    }
+
+    #[test]
     fn narrowing_repairs_drift_scope() {
         let snapshot = mock::sample().unwrap();
         // `http` is runtime-only in the mock: adding with Both must narrow to
@@ -2067,6 +2912,168 @@ mod tests {
             explicit.narrowed_for(&snapshot).target(),
             ConfigurationTarget::Runtime
         );
+    }
+
+    #[test]
+    fn validation_honors_an_explicit_zone_target() {
+        let snapshot = mock::sample().unwrap();
+        // `http` is runtime-only in the mock. Runtime is already satisfied,
+        // while permanent is a valid drift-repair target.
+        let runtime = FirewallOperation::AddService {
+            zone: zone("public"),
+            service: service("http"),
+            target: ConfigurationTarget::Runtime,
+        };
+        assert!(matches!(
+            runtime.validate(&snapshot),
+            Err(OperationError::NothingToDo(_))
+        ));
+        let permanent = runtime.with_target(ConfigurationTarget::Permanent).unwrap();
+        assert!(permanent.validate(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn ipset_validation_narrowing_and_postconditions_are_scoped() {
+        let mut snapshot = mock::sample().unwrap();
+        let name = IpSetName::parse("blocklist").unwrap();
+        let entry = IpSetEntry::parse("203.0.113.9").unwrap();
+        snapshot
+            .ipsets
+            .permanent
+            .get_mut(&name)
+            .unwrap()
+            .entries
+            .clear();
+        assert!(!snapshot.all_synced(), "ipset drift is configuration drift");
+
+        let add = FirewallOperation::AddIpSetEntry {
+            name,
+            entry,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        };
+        assert_eq!(
+            add.narrowed_for(&snapshot).target(),
+            ConfigurationTarget::Permanent
+        );
+        assert_eq!(add.postcondition_holds(&snapshot), Some(false));
+        assert!(matches!(
+            add.with_target(ConfigurationTarget::Runtime)
+                .unwrap()
+                .validate(&snapshot),
+            Err(OperationError::NothingToDo(_))
+        ));
+        assert!(
+            add.with_target(ConfigurationTarget::Permanent)
+                .unwrap()
+                .validate(&snapshot)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn incomplete_scope_blocks_only_dependent_mutations() {
+        let mut snapshot = mock::sample().unwrap();
+        snapshot
+            .degraded
+            .push(super::super::snapshot::DegradedSection::new(
+                SnapshotSection::IpSets,
+                Some(ConfigurationTarget::Permanent),
+                "permission denied",
+            ));
+        let name = IpSetName::parse("blocklist").unwrap();
+        let entry = IpSetEntry::parse("198.51.100.2").unwrap();
+        let permanent = FirewallOperation::AddIpSetEntry {
+            name: name.clone(),
+            entry: entry.clone(),
+            target: ConfigurationTarget::Permanent,
+        };
+        assert!(matches!(
+            permanent.validate(&snapshot),
+            Err(OperationError::Invalid(_))
+        ));
+        let both = permanent
+            .with_target(ConfigurationTarget::RuntimeAndPermanent)
+            .unwrap();
+        assert_eq!(
+            both.narrowed_for(&snapshot).target(),
+            ConfigurationTarget::RuntimeAndPermanent,
+            "unknown permanent state must never be narrowed away"
+        );
+        let runtime = FirewallOperation::AddIpSetEntry {
+            name,
+            entry,
+            target: ConfigurationTarget::Runtime,
+        };
+        assert!(runtime.validate(&snapshot).is_ok());
+        assert_eq!(permanent.postcondition_holds(&snapshot), None);
+    }
+
+    #[test]
+    fn direct_migration_validates_source_and_verifies_complete_policy() {
+        let mut snapshot = mock::sample().unwrap();
+        let policy = PolicyName::parse_user_created("direct-web").unwrap();
+        let migration = translate_direct_rule(&snapshot.direct_rules[0])
+            .unwrap()
+            .into_migration(policy.clone());
+        let operation = FirewallOperation::MigrateDirectRule {
+            migration: migration.clone(),
+        };
+        assert!(operation.validate(&snapshot).is_ok());
+        assert_eq!(operation.target(), ConfigurationTarget::Permanent);
+        assert_eq!(
+            operation.inverse(),
+            Some(FirewallOperation::DeletePolicy {
+                policy: policy.clone()
+            })
+        );
+        assert_eq!(operation.postcondition_holds(&snapshot), Some(false));
+
+        let mut details = super::super::PolicyDetails::empty(policy.clone());
+        details
+            .ingress_zones
+            .push(migration.ingress_zone().to_owned());
+        details
+            .egress_zones
+            .push(migration.egress_zone().to_owned());
+        details.rich_rules.push(migration.rich_rule().clone());
+        snapshot.policies.permanent.insert(policy, details);
+        assert_eq!(operation.postcondition_holds(&snapshot), Some(true));
+    }
+
+    #[test]
+    fn direct_migration_fails_closed_on_stale_or_incomplete_input() {
+        let mut snapshot = mock::sample().unwrap();
+        let migration = translate_direct_rule(&snapshot.direct_rules[0])
+            .unwrap()
+            .into_migration(PolicyName::parse_user_created("direct-web").unwrap());
+        let operation = FirewallOperation::MigrateDirectRule { migration };
+        snapshot.direct_rules.clear();
+        assert!(matches!(
+            operation.validate(&snapshot),
+            Err(OperationError::Invalid(message)) if message.contains("no longer present")
+        ));
+
+        snapshot.degraded.push(super::super::DegradedSection::new(
+            SnapshotSection::DirectRules,
+            Some(ConfigurationTarget::Runtime),
+            "permission denied",
+        ));
+        assert!(matches!(
+            operation.validate(&snapshot),
+            Err(OperationError::Invalid(message)) if message.contains("incomplete direct-rule")
+        ));
+    }
+
+    #[test]
+    fn create_policy_rejects_long_observed_only_names() {
+        let snapshot = mock::sample().unwrap();
+        let operation = FirewallOperation::CreatePolicy {
+            policy: PolicyName::parse("gateway-lan-to-world").unwrap(),
+        };
+        assert!(matches!(
+            operation.validate(&snapshot),
+            Err(OperationError::Invalid(message)) if message.contains("17-character")
+        ));
     }
 
     #[test]

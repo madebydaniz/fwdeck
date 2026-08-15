@@ -1,0 +1,136 @@
+name: release-build
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: SemVer tag used in archive and package names
+        required: true
+        type: string
+      checkout_ref:
+        description: Exact tag or commit to build
+        required: true
+        type: string
+      build_matrix:
+        description: JSON matrix; callers may select a canary subset
+        required: false
+        type: string
+        default: >-
+          {"include":[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu"},{"os":"ubuntu-latest","target":"x86_64-unknown-linux-musl"},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu"},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-musl"}]}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate build inputs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release tag and checkout ref
+        shell: bash
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::unexpected release tag '${RELEASE_TAG}'"
+            exit 1
+          fi
+          if [[ -z "${CHECKOUT_REF}" ]]; then
+            echo "::error::checkout_ref must not be empty"
+            exit 1
+          fi
+
+  build:
+    needs: validate
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.build_matrix) }}
+
+    steps:
+      - name: Checkout exact build ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.88"
+          targets: ${{ matrix.target }}
+
+      # Release artifacts are built without a shared cache so cached objects
+      # can never cross the signed package boundary.
+      - name: Build fwdeck
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: cargo build --release --locked --features dbus --target "${BUILD_TARGET}"
+
+      - name: Package archive
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          NAME="fwdeck-${TAG}-${TARGET}"
+          BIN="target/${TARGET}/release/fwdeck"
+          mkdir -p "${NAME}/completions"
+          cp "${BIN}" "${NAME}/"
+          cp README.md LICENSE CHANGELOG.md "${NAME}/"
+          for shell in bash zsh fish; do
+            "${BIN}" completions "${shell}" > "${NAME}/completions/fwdeck.${shell}"
+          done
+          "${BIN}" manpage > "${NAME}/fwdeck.1"
+          mkdir -p dist
+          tar -czf "dist/${NAME}.tar.gz" "${NAME}"
+
+      - name: Build RPM and DEB packages
+        if: endsWith(matrix.target, '-gnu')
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET: ${{ matrix.target }}
+          NFPM_IMAGE: ghcr.io/goreleaser/nfpm@sha256:a662cb167d7b6d3a83920c83d76b12d02b8ac5dd2c13e5c62c15270b23f6df0c # v2.47.0
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG}"
+          NAME="fwdeck-${TAG}-${TARGET}"
+          case "${TARGET}" in
+            x86_64-*)  ARCH=amd64 ;;
+            aarch64-*) ARCH=arm64 ;;
+            *) echo "::error::no package arch mapping for ${TARGET}"; exit 1 ;;
+          esac
+          gzip -9 -n -c "${NAME}/fwdeck.1" > "${NAME}/fwdeck.1.gz"
+          sed -e "s|\${NFPM_ARCH}|${ARCH}|g" \
+              -e "s|\${NFPM_VERSION}|${TAG#v}|g" \
+              -e "s|\${NFPM_STAGING}|${NAME}|g" \
+              packaging/nfpm.yaml > nfpm.rendered.yaml
+          for packager in rpm deb; do
+            docker run --rm \
+              --volume "${PWD}:/work" \
+              --workdir /work \
+              "${NFPM_IMAGE}" package \
+              --config nfpm.rendered.yaml \
+              --packager "${packager}" \
+              --target dist/
+          done
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fwdeck-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.rpm
+            dist/*.deb
+          if-no-files-found: error

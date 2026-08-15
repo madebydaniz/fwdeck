@@ -4,6 +4,15 @@
 pub mod api;
 pub mod engine;
 pub mod ports;
+mod refresh_scheduler;
 
-pub use api::{EngineEvent, EngineHandle, EngineRequest};
-pub use ports::{FirewallBackend, FirewallError, OperationOutcome, StepReport};
+pub use api::{
+    EngineEvent, EngineHandle, EngineRequest, ManualRefreshRequest, MutationPlan, MutationRequest,
+    OperationResult, PlanId, RefreshCancellationReason, RefreshId, RefreshOverview,
+    RefreshPriority, RefreshPriorityPublisher, RefreshPrioritySource, RefreshScheduleObservation,
+    RefreshTrigger, RollbackRegistration, RollbackRequest, refresh_priority_channel,
+};
+pub use ports::{
+    FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardError,
+    RollbackGuardId, StepReport,
+};

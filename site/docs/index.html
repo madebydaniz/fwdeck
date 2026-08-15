@@ -164,7 +164,7 @@ curl -fsSLO "https://github.com/madebydaniz/fwdeck/releases/download/${VERSION}/
 
 cosign verify-blob \
   --bundle checksums.txt.bundle \
-  --certificate-identity-regexp "^https://github.com/madebydaniz/fwdeck/\.github/workflows/release-binaries\.yml@refs/(heads/main|tags/.+)$" \
+  --certificate-identity-regexp "^https://github.com/madebydaniz/fwdeck/\.github/workflows/release-binaries\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
   checksums.txt
 
@@ -199,6 +199,7 @@ CLI. If you know firewalld, here is where each command lives:</p>
 <tr><td><code>--add-masquerade</code> · <code>--add-forward</code> · <code>--add-icmp-block-inversion</code></td><td>Zones → <kbd>m</kbd> · <kbd>:</kbd> → <em>Toggle forwarding</em> / <em>Toggle inversion</em></td></tr>
 <tr><td><code>--add-source-port</code> · <code>--add-protocol</code></td><td>Zones → <kbd>:</kbd> → <em>Add source-port</em> / <em>Allow protocol</em></td></tr>
 <tr><td><code>--new-ipset</code> / <code>--ipset ... --add-entry</code></td><td>IPSets (<kbd>7</kbd>) → <kbd>:</kbd> → <em>Create ipset</em> / <em>Add ipset entry</em></td></tr>
+<tr><td><code>--get-policies</code> / <code>--info-policy</code></td><td>Policies (<kbd>p</kbd>) → <kbd>enter</kbd> for full runtime/permanent details</td></tr>
 <tr><td><code>--set-default-zone</code></td><td>Zones → <kbd>:</kbd> → <em>Set default zone</em></td></tr>
 <tr><td><code>--permanent</code> (scope)</td><td>the mutation <strong>target</strong> (<code>--target</code> / config, or narrowed per-op); <kbd>t</kbd> flips the runtime/permanent view</td></tr>
 <tr><td><code>--reload</code></td><td><kbd>ctrl-r</kbd></td></tr>
@@ -219,18 +220,22 @@ runtime-vs-permanent state (<code>synced</code> / <code>different</code>),
 LogDenied, and live counters (zones, active, denied this session).</li>
 <li><strong>Breadcrumb</strong> — where you are: zone › view · scope ·
 <code>[viewing: runtime|permanent]</code> perspective.</li>
-<li><strong>Views sidebar</strong> — the ten views with row counts; switch with
-<kbd>0</kbd>–<kbd>9</kbd>.</li>
+<li><strong>Views sidebar</strong> — eleven views with row counts; switch with
+<kbd>0</kbd>–<kbd>9</kbd>, and <kbd>p</kbd> for Policies.</li>
 <li><strong>Table</strong> — the current view's rows. Inactive zones are dimmed;
 the <code>≠</code> marker means that row differs between runtime and permanent.</li>
 <li><strong>Status bar</strong> — mutation target and the three always-on
 entries: <kbd>:</kbd> palette · <kbd>/</kbd> filter · <kbd>?</kbd> help.</li>
+<li><strong>Dialogs</strong> — text-heavy overlays use the available terminal
+width and wrap long descriptions instead of clipping them. In Help, About, and
+Details, use <kbd>↑</kbd>/<kbd>↓</kbd> when the title shows a scroll indicator.</li>
 </ul>
 </section>
 
 <section id="views">
 <h2>Views — the complete guide</h2>
-<p>Ten views, switched with <kbd>0</kbd>–<kbd>9</kbd> (or the sidebar). Each
+<p>Eleven views, switched with <kbd>0</kbd>–<kbd>9</kbd> plus <kbd>p</kbd> for
+Policies (or the sidebar). Each
 section below shows the view, explains what it is for, and walks through every
 action with a hands-on example. Every mutation opens a confirmation first —
 <kbd>y</kbd> applies, <kbd>s</kbd> stages it for a batch, <kbd>n</kbd> cancels.</p>
@@ -427,10 +432,19 @@ entry</em> → <code>203.0.113.9</code>.</li>
 <img class="shot" src="../assets/direct.png" alt="Direct rules view">
 <p><strong>What you see</strong> — firewalld's legacy direct (raw
 iptables/nftables passthrough) rules, with a deprecation warning.</p>
-<p><strong>What you can do here</strong> — this view is <strong>read-only</strong>.
-Direct rules bypass firewalld's model; FWDeck surfaces them for visibility but
-deliberately does not edit them. Manage them with <code>firewall-cmd
---direct</code> if you must, and prefer rich rules or policies instead.</p>
+<p><strong>What you can do here</strong> — the legacy rule itself stays
+<strong>read-only</strong>. Press <kbd>enter</kbd> to see whether FWDeck has a
+conservative policy candidate, or open <kbd>:</kbd> → <em>Direct-rule migration
+assistant</em> to classify every rule. The assistant fails closed: only
+IPv4/IPv6 filter rules on INPUT, OUTPUT, or FORWARD with supported address,
+protocol, port, and ACCEPT/DROP/REJECT matches are translated.</p>
+<p><strong>Safe migration</strong> — highlight an eligible rule and press
+<kbd>a</kbd> (or choose <em>Migrate selected direct rule</em>), then provide a
+new policy name. FWDeck creates an additive permanent policy with the mapped
+ANY/HOST direction and a reviewed rich rule. It never removes the direct rule:
+reload, validate real traffic, then retire the legacy rule manually with
+<code>firewall-cmd --direct</code>. Unsupported tables, custom chains, match
+modules, negation, NAT, and ambiguous expressions stay manual.</p>
 
 <h3>9 · Logs</h3>
 <img class="shot" src="../assets/logs.png" alt="Logs view">
@@ -447,6 +461,33 @@ real time and filter it. This view is read-only.</p>
 <li><strong>Filter</strong>: <kbd>/</kbd> → type an address or port to narrow
 the tail; <kbd>ctrl-f</kbd> searches log rows alongside every other view.</li>
 </ul>
+
+<h3>p · Policies</h3>
+<p><strong>What you see</strong> — first-class firewalld policy objects with
+target, ingress → egress direction, services, aggregate rule count, active
+state, and runtime/permanent scope. A <code>broken</code> state means a
+referenced zone or service is missing.</p>
+<p><strong>What you can do here</strong> — press <kbd>enter</kbd> for the full
+configuration (priority, ports, protocols, forwarding, source ports, ICMP,
+masquerade, rich rules, and dependency health). Press <kbd>a</kbd> to add a
+service to the selected policy, or to create the first policy when the view is
+empty. Press <kbd>d</kbd> to review deletion of the selected permanent policy.
+All changes still use the normal validation and confirmation flow.</p>
+<p><strong>Dependency safety</strong> — open <kbd>:</kbd> → <em>Policy
+dependency graph</em> to inspect runtime and permanent ingress, egress, and
+service edges, including missing or unknown references. FWDeck blocks permanent
+zone or service deletion while a policy still references it, and fails closed
+when the relevant dependency data could not be read.</p>
+<p><strong>Policy sets</strong> — on firewalld 2.4 or newer, open
+<kbd>:</kbd> → <em>Browse policy sets</em> to inspect the shipped
+<code>gateway</code> set, its member policies, and separate runtime/permanent
+administrative state. Use <em>Set policy-set state</em> with
+<code>gateway enable</code> or <code>gateway disable</code>. The change uses the
+normal confirmation, exact command preview, staged-plan, verification, and
+rollback flow. Older or unknown firewalld versions are blocked explicitly.</p>
+<p>Policies are stateful and unidirectional: an ingress → egress policy does
+not automatically govern the reverse direction. See the
+<a href="https://firewalld.org/documentation/man-pages/firewalld.policies">official firewalld policy model</a>.</p>
 </section>
 
 <section id="power">
@@ -516,6 +557,11 @@ command turns it off.</p>
 input are rejected before any modal opens.</li>
 <li><strong>Confirmation modals</strong> — every mutation states the exact
 resource, zone, scope, and connectivity risk.</li>
+<li><strong>Stale-state guard</strong> — the exact observed snapshot reviewed at
+confirmation travels with the mutation. Immediately before execution the engine
+bypasses refresh caches, reads firewalld again, repeats validation, and rejects
+the operation or entire staged plan if state changed. No mutation command or
+rollback guard starts on that rejected path.</li>
 <li><strong>Dead-man's switch</strong> — risky changes auto-revert after
 <code>rollback_timeout_seconds</code>, on <kbd>u</kbd>, or when you quit inside
 the countdown, unless you confirm a working session. An out-of-process systemd
@@ -531,6 +577,12 @@ under <code>~/.local/state/fwdeck/</code> with its exact invocations. It is an
 <em>advisory, append-only</em> record (files are <code>0600</code>), not a
 cryptographically tamper-evident log — treat it as an operational history, and
 ship it to a central log store if you need integrity guarantees.</li>
+<li><strong>Single mutation owner</strong> — an OS-backed lock permits only one
+writer at a time and releases ownership automatically when that process exits.
+Read-only sessions do not claim the mutation lock.</li>
+<li><strong>Bounded inputs and probes</strong> — interactive mutation fields have
+an explicit byte cap, and external probes such as nftables counters run behind
+a hard timeout.</li>
 <li><strong>Read-only mode</strong> — <code>--read-only</code> disables mutations
 in the engine, not just the UI.</li>
 </ul>
@@ -687,7 +739,39 @@ rollback_timeout_seconds = 30   # dead-man's switch; 0 disables
 read_only = false
 
 [logging]
-level = "info"                  # file log: ~/.local/state/fwdeck/fwdeck.log</pre>
+level = "info"                  # file log: ~/.local/state/fwdeck/fwdeck.log
+
+[retention.snapshots]
+max_count = 100
+max_age_days = 90
+min_keep = 10                   # pinned snapshots never auto-delete
+
+[retention.exports]
+max_count = 20
+max_age_days = 30
+
+[retention.audit]
+max_files = 10                  # includes the active audit.jsonl
+max_file_size_mb = 5</pre>
+<p><code>refresh_interval_ms</code> is a fixed delay after the previous refresh
+attempt completes. Manual refresh requests are reliable and coalesced. A
+confirmed change or rollback takes priority over an ordinary background read;
+FWDeck then completes a fresh reconciliation before accepting the next change.</p>
+<p>FWDeck shows status and zone data as soon as the overview stage completes.
+Service and policy details continue loading in the same cancellable refresh;
+only the final complete or explicitly degraded snapshot becomes authoritative
+for validation, snapshots, and exports. The latest selected zone, service, or
+policy reprioritizes detail batches that have not started yet. An active
+subprocess is allowed to finish, so changing selection does not create a
+cancellation storm or a second backend owner.</p>
+<p>Retention runs at startup and after new state is written. It only removes
+regular files with FWDeck-generated names; symlinks, imported snapshots, and
+unknown files are ignored. Preview the exact plan before applying it:</p>
+<pre>fwdeck prune --dry-run       # read-only; this is also the default mode
+fwdeck prune --apply         # apply the displayed policy
+fwdeck snapshots list       # show managed/pinned snapshots
+fwdeck snapshots pin snapshot-1700000000000.json
+fwdeck snapshots unpin snapshot-1700000000000.json</pre>
 <h3>CLI flags</h3>
 <pre>fwdeck --read-only          # inspection only
 fwdeck --zone public        # open with a zone selected
@@ -695,6 +779,7 @@ fwdeck --target runtime     # default mutation target
 fwdeck --backend dbus       # native D-Bus backend (build with --features dbus)
 fwdeck --offline            # permanent config via firewall-offline-cmd
 fwdeck --no-color           # reduced-color terminals
+fwdeck prune --dry-run      # inspect retention without deleting files
 fwdeck completions zsh      # shell completions (bash|zsh|fish)
 fwdeck manpage              # man page to stdout</pre>
 </section>
@@ -773,7 +858,10 @@ container kernels can't emit netfilter logs at all.</p>
 binding permanent, or set the zone on the NM connection itself.</p>
 <h3>Where are logs, audit, snapshots?</h3>
 <p><code>~/.local/state/fwdeck/</code> — <code>fwdeck.log</code>,
-<code>audit.jsonl</code>, <code>snapshots/</code>, <code>exports/</code>.</p>
+<code>audit.jsonl</code> plus bounded timestamped archives,
+<code>snapshots/</code>, and versioned <code>exports/</code>. Files are private;
+<code>fwdeck doctor</code> reports recognized file counts, bytes, pin state, and
+how many files the current retention policy would prune.</p>
 </section>
 
 <section id="development">
@@ -783,10 +871,13 @@ container — the host firewall is never touched:</p>
 <pre><span class="g">$</span> docker compose run --rm dev   <span class="c"># Fedora + firewalld + Rust, repo mounted</span>
 <span class="g">$</span> cargo run                     <span class="c"># inside: the TUI with real data</span>
 <span class="g">$</span> cargo test                    <span class="c"># fixtures + fake-runner suite</span>
-<span class="g">$</span> cargo test --test real_firewalld -- --ignored --test-threads=1</pre>
+<span class="g">$</span> make test-real                <span class="c"># serialized container-only suite</span>
+<span class="g">$</span> make coverage-dbus            <span class="c"># Fedora real-daemon D-Bus coverage</span></pre>
 <p>Quality gates enforced in CI: <code>cargo fmt --check</code>,
 <code>clippy -D warnings</code> (both feature sets), tests, MSRV 1.88,
-cargo-deny, CodeQL. Commits follow
+cargo-deny, CodeQL, and a 60% line-coverage floor for the D-Bus adapter.
+Compatibility behavior is tested separately on Fedora, Debian, and AlmaLinux.
+Commits follow
 <a href="https://www.conventionalcommits.org/">Conventional Commits</a> —
 release-please turns them into releases automatically. See
 <a href="https://github.com/madebydaniz/fwdeck/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>.</p>

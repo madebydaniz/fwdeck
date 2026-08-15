@@ -196,7 +196,7 @@ impl FromStr for PortSpec {
 }
 
 /// An `--add-forward-port` style rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ForwardPort {
     /// Matched destination port(s).
     pub port: PortSelector,

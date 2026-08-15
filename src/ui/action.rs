@@ -2,10 +2,15 @@
 //! effects a reducer step can request from the outer loop.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::application::ports::{FirewallError, OperationOutcome};
+use crate::application::ports::FirewallError;
+use crate::application::{
+    MutationPlan, MutationRequest, RefreshCancellationReason, RefreshId,
+    RefreshScheduleObservation, RefreshTrigger,
+};
 use crate::domain::LogEntry;
-use crate::domain::{FirewallOperation, FirewallSnapshot};
+use crate::domain::{FirewallOperation, FirewallSnapshot, RefreshObservation};
 
 use super::overlays::FormKind;
 use super::views::ViewId;
@@ -119,20 +124,18 @@ pub enum UiAction {
     RichBuilderCommit,
     /// Validates and opens the confirmation modal for an operation.
     RequestOperation(FirewallOperation),
-    /// Dispatched by the confirmation modal: hands the operation to the engine.
-    ApplyOperation(FirewallOperation),
+    /// Dispatched by the confirmation modal with the snapshot reviewed by the
+    /// operator; hands the mutation request to the engine.
+    ApplyOperation(MutationRequest),
     /// Dispatched by the plan confirmation modal: arms the dead-man's switch for
     /// the batch, then hands the whole staged plan to the engine.
-    ApplyPlanConfirmed(Vec<FirewallOperation>),
+    ApplyPlanConfirmed(MutationPlan),
     /// The engine finished an operation; toast, audit, and maybe arm rollback.
-    OperationFinished {
-        /// Correlation id shared with tracing and the audit line.
-        op_id: u64,
-        /// The honest outcome.
-        outcome: OperationOutcome,
-    },
+    OperationFinished(Box<crate::application::api::OperationResult>),
     /// A staged plan finished; `remaining` are unexecuted operations to re-stage.
     PlanFinished {
+        /// Identity of the reviewed plan that reached this terminal event.
+        id: crate::application::PlanId,
         /// How many operations applied fully before the plan ended.
         applied: usize,
         /// Operations never executed (plan halted on a failure).
@@ -148,6 +151,12 @@ pub enum UiAction {
     BrowseServices,
     /// Open the policy objects overlay.
     BrowsePolicies,
+    /// Open the derived predefined policy-set workspace.
+    BrowsePolicySets,
+    /// Open the scoped policy-to-zone/service dependency graph.
+    ShowPolicyDependencies,
+    /// Analyze direct rules and show conservative policy migration candidates.
+    ShowDirectMigration,
     /// Open the drift workspace: every runtime vs permanent difference
     /// across all zones.
     ShowDrift,
@@ -207,10 +216,52 @@ pub enum UiAction {
     ReloadRequested,
     /// `t`: flip the zone-attribute/binding perspective (runtime ⇄ permanent).
     ToggleConfigView,
-    /// The engine started a refresh; show the spinner.
-    RefreshStarted,
+    /// The engine started a refresh; show the spinner for this lifecycle.
+    RefreshStarted {
+        /// Monotonic process-local lifecycle identity.
+        id: RefreshId,
+        /// Demand that started this refresh.
+        trigger: RefreshTrigger,
+    },
+    /// The active refresh produced its low-latency overview while hydration continues.
+    RefreshOverviewReady {
+        /// Identity of the lifecycle that owns this overview.
+        id: RefreshId,
+        /// Overview data that is safe for preview-only rendering.
+        overview: Arc<crate::application::RefreshOverview>,
+    },
     /// The engine finished a refresh: a new snapshot or a backend error.
-    RefreshCompleted(Result<Arc<FirewallSnapshot>, FirewallError>),
+    RefreshCompleted {
+        /// Scheduler metadata for the completed lifecycle.
+        schedule: RefreshScheduleObservation,
+        /// Fresh snapshot, or the categorized backend failure.
+        result: Result<Arc<FirewallSnapshot>, FirewallError>,
+        /// Exact telemetry from the same refresh attempt.
+        observation: RefreshObservation,
+    },
+    /// An ordinary refresh was cancelled before a mutation.
+    RefreshCancelled {
+        /// Scheduler metadata accumulated before cancellation.
+        schedule: RefreshScheduleObservation,
+        /// Why the lifecycle was cancelled.
+        reason: RefreshCancellationReason,
+        /// Tokio-clock duration before cancellation.
+        elapsed: Duration,
+    },
+    /// The shell's bounded engine-outbox occupancy changed.
+    EngineOutboxChanged {
+        /// Whether the single normal-priority slot is occupied.
+        normal_pending: bool,
+        /// Rollback-priority requests waiting in the shell outbox.
+        rollback_pending: usize,
+    },
+    /// A manual refresh batch exceeded the exact lifecycle metadata limit.
+    ManualDemandRejected {
+        /// Exact rejected demand for the operator-facing notification.
+        count: std::num::NonZeroU64,
+    },
+    /// The engine event channel closed unexpectedly.
+    EngineStopped(FirewallError),
     /// New kernel/netfilter log entries from the log tailer.
     LogsReceived(Vec<LogEntry>),
     /// Exit the application. Asks first when quitting would fire an armed
@@ -227,8 +278,18 @@ pub enum Effect {
     Quit,
     /// Ask the engine for a fresh snapshot.
     Refresh,
-    /// Hand a single operation to the engine for execution.
-    Apply(FirewallOperation),
+    /// Hand one reviewed mutation to the engine for preflight and execution.
+    Apply(MutationRequest),
+    /// Execute an armed inverse. The engine applies first and only then
+    /// attempts the bounded watchdog disarm.
+    ApplyRollback {
+        /// Unique rollback lifecycle id.
+        id: crate::application::ports::RollbackGuardId,
+        /// Connectivity-restoring inverse operation.
+        operation: FirewallOperation,
+        /// External watchdog associated with this inverse.
+        watchdog_unit: Option<String>,
+    },
     /// Copy text to the terminal clipboard via OSC 52 (works over SSH).
     CopyToClipboard(String),
     /// Persist the snapshot to the snapshot store (result toasted by the shell).
@@ -246,8 +307,8 @@ pub enum Effect {
         crate::infrastructure::firewalld::command::ExportFormat,
         String,
     ),
-    /// Send a whole staged plan to the engine as one sequential transaction.
-    ApplyPlan(Vec<FirewallOperation>),
+    /// Send a reviewed staged plan to the engine as one sequential transaction.
+    ApplyPlan(MutationPlan),
     /// List the snapshot store (off the event-loop thread); result returns as
     /// `UiAction::SnapshotsListed`.
     ListSnapshots,
@@ -260,18 +321,7 @@ pub enum Effect {
     /// Read live nftables rule-hit counters (off the event-loop thread);
     /// result returns as `UiAction::CountersLoaded`.
     LoadCounters,
-    /// Pre-arm an out-of-process rollback: a systemd transient timer that runs
-    /// the inverse command even if this process dies (crash, SSH loss).
-    ArmWatchdog {
-        /// Transient unit name (`fwdeck-rollback-…`).
-        unit: String,
-        /// Seconds until the watchdog fires on its own.
-        delay_secs: u64,
-        /// `firewall-cmd` argv of the runtime inverse step.
-        args: Vec<String>,
-    },
-    /// Cancel a previously armed watchdog (kept changes, manual rollback, or
-    /// clean exit already handled the situation in-process).
+    /// Cancel a previously armed watchdog after the operator keeps changes.
     DisarmWatchdog {
         /// Transient unit name to stop.
         unit: String,

@@ -3,16 +3,17 @@
 
 use crate::domain::{
     ConfigurationTarget, FirewallOperation, ForwardPort, IcmpType, InterfaceName, IpProtocol,
-    IpSetEntry, IpSetName, PolicyName, PortSpec, RichRule, ServiceName, SourceAddress, ZoneName,
-    ZoneTarget,
+    IpSetEntry, IpSetName, PolicyName, PolicySetName, PortSpec, RichRule, ServiceName,
+    SourceAddress, ZoneName, ZoneTarget, translate_direct_rule,
 };
 use crate::ui::action::Effect;
 use crate::ui::overlays::{DetailsContent, FormKind, Overlay};
 use crate::ui::state::{ToastKind, UiState};
+use crate::ui::views::RowId;
 
 use super::plans::restore_snapshot;
-use super::request_operation;
 use super::rows::selected_ipset;
+use super::{request_operation, selected_row};
 
 #[allow(clippy::too_many_lines)] // one arm per builder step
 /// Advances the rich-rule builder; on the final step, validates the assembled
@@ -157,9 +158,10 @@ pub(super) fn form_submit(state: &mut UiState) -> Vec<Effect> {
         FormKind::CreateService => ServiceName::parse(&input)
             .map(|service| FirewallOperation::CreateService { service })
             .map_err(|e| err_string(&e)),
-        FormKind::CreatePolicy => PolicyName::parse(&input)
+        FormKind::CreatePolicy => PolicyName::parse_user_created(&input)
             .map(|policy| FirewallOperation::CreatePolicy { policy })
             .map_err(|e| err_string(&e)),
+        FormKind::MigrateDirectRule => parse_direct_migration_form(state, &input),
         FormKind::CreateIpSet => {
             let mut parts = input.split_whitespace();
             let raw_name = parts.next().unwrap_or_default();
@@ -169,6 +171,7 @@ pub(super) fn form_submit(state: &mut UiState) -> Vec<Effect> {
                 .map_err(|e| err_string(&e))
         }
         FormKind::AddPolicyService => parse_policy_service_form(&input, target),
+        FormKind::SetPolicySetState => parse_policy_set_state_form(&input, target),
         FormKind::AddServicePort | FormKind::RemoveServicePort => {
             parse_service_port_form(kind, &input)
         }
@@ -186,6 +189,46 @@ pub(super) fn form_submit(state: &mut UiState) -> Vec<Effect> {
     };
     state.overlays.pop(); // the confirmation replaces the form
     request_operation(state, operation)
+}
+
+fn parse_direct_migration_form(state: &UiState, input: &str) -> Result<FirewallOperation, String> {
+    let Some(row) = selected_row(state) else {
+        return Err("select a direct-rule row first".to_owned());
+    };
+    let RowId::Direct { rule, .. } = row.id else {
+        return Err("select a row in the Direct view first".to_owned());
+    };
+    let policy = PolicyName::parse_user_created(input).map_err(|err| err.to_string())?;
+    let migration = translate_direct_rule(&rule)
+        .map_err(|err| format!("direct rule needs manual migration: {err}"))?
+        .into_migration(policy);
+    Ok(FirewallOperation::MigrateDirectRule { migration })
+}
+
+/// Parses `<policy-set> <enable|disable>` into the documented administrative
+/// state mutation. Version and membership checks remain in domain validation.
+fn parse_policy_set_state_form(
+    input: &str,
+    target: ConfigurationTarget,
+) -> Result<FirewallOperation, String> {
+    let mut parts = input.split_whitespace();
+    let (Some(raw_set), Some(raw_state)) = (parts.next(), parts.next()) else {
+        return Err("expected: <policy-set> <enable|disable>".to_owned());
+    };
+    if parts.next().is_some() {
+        return Err("expected exactly: <policy-set> <enable|disable>".to_owned());
+    }
+    let policy_set = PolicySetName::parse(raw_set).map_err(|err| err.to_string())?;
+    let enabled = match raw_state.to_ascii_lowercase().as_str() {
+        "enable" | "enabled" | "on" => true,
+        "disable" | "disabled" | "off" => false,
+        _ => return Err("state must be `enable` or `disable`".to_owned()),
+    };
+    Ok(FirewallOperation::SetPolicySetEnabled {
+        policy_set,
+        enabled,
+        target,
+    })
 }
 
 /// Parses the ipset-entry form input against the selected ipset row.
@@ -306,4 +349,28 @@ fn explain_traffic(state: &mut UiState, input: &str) -> Vec<Effect> {
         lines,
     }));
     Vec::new()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_set_form_builds_a_scoped_typed_operation() {
+        let operation =
+            parse_policy_set_state_form("gateway enable", ConfigurationTarget::RuntimeAndPermanent)
+                .unwrap();
+        assert!(matches!(
+            operation,
+            FirewallOperation::SetPolicySetEnabled {
+                enabled: true,
+                target: ConfigurationTarget::RuntimeAndPermanent,
+                ..
+            }
+        ));
+        assert!(
+            parse_policy_set_state_form("gateway maybe", ConfigurationTarget::Runtime).is_err()
+        );
+    }
 }

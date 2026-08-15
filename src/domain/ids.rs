@@ -143,6 +143,7 @@ identifier!(
     17,
     &['_', '-']
 );
+
 identifier!(
     /// A firewalld service name, e.g. `dhcpv6-client`.
     ServiceName,
@@ -171,10 +172,45 @@ identifier!(
     32,
     &['_', '-']
 );
+
 identifier!(
-    /// A firewalld policy name.
+    /// A firewalld policy name. Shipped policy-set members exceed the zone
+    /// name limit (for example `gateway-lan-to-world`).
     PolicyName,
     "policy name",
+    64,
+    &['_', '-']
+);
+
+/// Maximum length firewalld accepts when creating a user policy. Shipped
+/// policies may be longer, so observation uses [`PolicyName::parse`] while
+/// creation paths use [`PolicyName::parse_user_created`].
+pub const USER_POLICY_NAME_MAX: usize = 17;
+
+impl PolicyName {
+    /// Parses a policy name that will be passed to `--new-policy`.
+    pub fn parse_user_created(raw: &str) -> Result<Self, ValidationError> {
+        let policy = Self::parse(raw)?;
+        if policy.as_str().len() > USER_POLICY_NAME_MAX {
+            return Err(ValidationError::TooLong {
+                kind: "policy name",
+                value: raw.to_owned(),
+                max: USER_POLICY_NAME_MAX,
+            });
+        }
+        Ok(policy)
+    }
+
+    /// Whether this observed name is valid for a new user-created policy.
+    #[must_use]
+    pub fn is_user_creatable(&self) -> bool {
+        self.as_str().len() <= USER_POLICY_NAME_MAX
+    }
+}
+identifier!(
+    /// A predefined firewalld policy-set name used by `--policy-set`.
+    PolicySetName,
+    "policy-set name",
     17,
     &['_', '-']
 );
@@ -204,6 +240,10 @@ mod tests {
             InterfaceName::parse("eth0.100").unwrap().as_str(),
             "eth0.100"
         );
+        assert_eq!(
+            PolicyName::parse("gateway-lan-to-world").unwrap().as_str(),
+            "gateway-lan-to-world"
+        );
     }
 
     #[test]
@@ -220,6 +260,16 @@ mod tests {
             ZoneName::parse("a-very-long-zone-name"),
             Err(ValidationError::TooLong { max: 17, .. })
         ));
+    }
+
+    #[test]
+    fn user_policy_creation_keeps_firewalld_seventeen_character_limit() {
+        assert!(PolicyName::parse_user_created("direct-web-input").is_ok());
+        assert!(PolicyName::parse_user_created("gateway-lan-to-world").is_err());
+        assert!(
+            PolicyName::parse("gateway-lan-to-world").is_ok(),
+            "shipped policies still need to be observable"
+        );
     }
 
     #[test]

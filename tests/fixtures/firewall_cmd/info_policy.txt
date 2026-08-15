@@ -1,0 +1,14 @@
+fwdeck-fixture (active)
+  disable: no
+  priority: -1
+  target: DROP
+  ingress-zones: public
+  egress-zones: ANY
+  services: http
+  ports: 8080/tcp
+  protocols: 
+  masquerade: no
+  forward-ports: 
+  source-ports: 
+  icmp-blocks: 
+  rich rules: 

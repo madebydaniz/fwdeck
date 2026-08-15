@@ -5,11 +5,13 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::address::SourceAddress;
-use super::ids::{InterfaceName, IpSetName, ServiceName, ValidationError, ZoneName};
+use super::ids::{InterfaceName, IpSetName, PolicyName, ServiceName, ValidationError, ZoneName};
+use super::policy::PolicyDetails;
 use super::port::{ForwardPort, Protocol};
 use super::rich_rule::RichRule;
 use super::snapshot::{
-    FirewallSnapshot, FirewallStatus, IpSetInfo, LogDenied, NetfilterBackend, ServiceDefinition,
+    FirewallSnapshot, FirewallStatus, IpSetInfo, LogDenied, NetfilterBackend, Scoped,
+    ServiceDefinition,
 };
 use super::zone::{ActiveZone, ZoneDetails, ZoneTarget};
 
@@ -158,7 +160,10 @@ pub fn sample() -> Result<FirewallSnapshot, ValidationError> {
         active,
         runtime,
         permanent,
-        ipsets,
+        ipsets: Scoped {
+            runtime: ipsets.clone(),
+            permanent: ipsets,
+        },
         service_definitions,
         available_services: vec![
             ServiceName::parse("ssh")?,
@@ -170,22 +175,100 @@ pub fn sample() -> Result<FirewallSnapshot, ValidationError> {
         policies: {
             let mut policies = BTreeMap::new();
             let name = crate::domain::PolicyName::parse("mypolicy")?;
-            policies.insert(
-                name.clone(),
-                crate::domain::PolicyDetails {
-                    name,
-                    target: crate::domain::PolicyTarget::Drop,
-                    ingress_zones: vec!["public".to_owned()],
-                    egress_zones: vec!["ANY".to_owned()],
-                    services: services(&["http"])?,
-                    ports: Vec::new(),
-                },
-            );
-            policies
+            let mut policy = crate::domain::PolicyDetails::empty(name.clone());
+            policy.active = true;
+            policy.target = crate::domain::PolicyTarget::Drop;
+            policy.ingress_zones = vec!["public".to_owned()];
+            policy.egress_zones = vec!["ANY".to_owned()];
+            policy.services = services(&["http"])?;
+            policies.insert(name, policy);
+            Scoped {
+                runtime: policies.clone(),
+                permanent: policies,
+            }
         },
         degraded: Vec::new(),
         direct_rules: vec!["ipv4 filter INPUT 9 -p tcp --dport 12345 -j ACCEPT".to_owned()],
     })
+}
+
+/// Zone count in the deterministic enterprise-scale fixture.
+pub(crate) const LARGE_ZONE_COUNT: usize = 100;
+/// Service-definition count in the deterministic enterprise-scale fixture.
+pub(crate) const LARGE_SERVICE_COUNT: usize = 500;
+/// Runtime and permanent IP-set count in the enterprise-scale fixture.
+pub(crate) const LARGE_IPSET_COUNT: usize = 100;
+/// Runtime and permanent policy count in the enterprise-scale fixture.
+pub(crate) const LARGE_POLICY_COUNT: usize = 100;
+
+/// Generated enterprise-scale snapshot used by deterministic performance
+/// tests. It exercises domain/UI structures without inventing firewalld text.
+pub fn large() -> Result<FirewallSnapshot, ValidationError> {
+    let mut snapshot = sample()?;
+    let service_names = (0..LARGE_SERVICE_COUNT)
+        .map(|index| ServiceName::parse(&format!("svc-{index:04}")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut zones = BTreeMap::new();
+    let mut active = BTreeMap::new();
+    for index in 0..LARGE_ZONE_COUNT {
+        let name = ZoneName::parse(&format!("zone-{index:03}"))?;
+        let mut details = ZoneDetails::empty(name.clone());
+        if index == 0 {
+            details.services.clone_from(&service_names);
+        } else {
+            let first = index * 5;
+            details.services = service_names[first..first + 5].to_vec();
+        }
+        zones.insert(name.clone(), details);
+        active.insert(name, ActiveZone::default());
+    }
+    let default_zone = ZoneName::parse("zone-000")?;
+    snapshot.default_zone = default_zone;
+    snapshot.active = active;
+    snapshot.runtime = zones.clone();
+    snapshot.permanent = zones;
+
+    snapshot.service_definitions = service_names
+        .iter()
+        .cloned()
+        .map(|name| (name, ServiceDefinition::default()))
+        .collect();
+    snapshot.available_services.clone_from(&service_names);
+
+    let ipsets = (0..LARGE_IPSET_COUNT)
+        .map(|index| {
+            Ok((
+                IpSetName::parse(&format!("set-{index:03}"))?,
+                IpSetInfo {
+                    kind: "hash:ip".to_owned(),
+                    entries: vec![format!("192.0.2.{index}")],
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ValidationError>>()?;
+    snapshot.ipsets = Scoped {
+        runtime: ipsets.clone(),
+        permanent: ipsets,
+    };
+
+    let policies = (0..LARGE_POLICY_COUNT)
+        .map(|index| {
+            let name = PolicyName::parse(&format!("policy-{index:03}"))?;
+            let mut details = PolicyDetails::empty(name.clone());
+            details.ingress_zones = vec![format!("zone-{:03}", index % LARGE_ZONE_COUNT)];
+            details.egress_zones = vec!["ANY".to_owned()];
+            details.services = vec![service_names[index % service_names.len()].clone()];
+            Ok((name, details))
+        })
+        .collect::<Result<BTreeMap<_, _>, ValidationError>>()?;
+    snapshot.policies = Scoped {
+        runtime: policies.clone(),
+        permanent: policies,
+    };
+    snapshot.direct_rules.clear();
+    snapshot.degraded.clear();
+    Ok(snapshot)
 }
 
 #[cfg(test)]
@@ -200,5 +283,19 @@ mod tests {
         assert!(snap.is_active(&snap.default_zone.clone()));
         assert!(!snap.all_synced());
         assert!(snap.zone_names().len() >= 9);
+    }
+
+    #[test]
+    fn large_snapshot_matches_the_performance_fixture_shape() {
+        let snap = large().unwrap();
+
+        assert_eq!(snap.zone_names().len(), LARGE_ZONE_COUNT);
+        assert_eq!(snap.service_definitions.len(), LARGE_SERVICE_COUNT);
+        assert_eq!(snap.ipsets.runtime.len(), LARGE_IPSET_COUNT);
+        assert_eq!(snap.policies.runtime.len(), LARGE_POLICY_COUNT);
+        assert_eq!(
+            snap.runtime[&snap.default_zone].services.len(),
+            LARGE_SERVICE_COUNT
+        );
     }
 }
