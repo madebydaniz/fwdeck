@@ -5,7 +5,7 @@
 # fetch crates. Bump Version and %changelog per release.
 Name:           fwdeck
 # x-release-please-start-version
-Version:        0.5.0
+Version:        0.5.1
 # x-release-please-end
 Release:        1%{?dist}
 Summary:        A safety-first terminal UI for firewalld
