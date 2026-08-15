@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 use super::action::UiAction;
 pub use super::details::DetailsContent;
 use super::keymap;
-use super::palette::{self, Availability, PaletteState};
+use super::palette::{self, Availability, PaletteCommand, PaletteState};
 use super::state::UiState;
 use super::theme::Theme;
 
@@ -235,10 +235,14 @@ fn modal(f: &mut Frame, theme: &Theme, area: Rect, title: &str) -> Block<'static
         .style(theme.panel())
 }
 
-const TEXT_MODAL_PERCENT: u16 = 70;
+const TEXT_MODAL_PERCENT: u16 = 60;
 const TEXT_MODAL_MIN_WIDTH: u16 = 60;
 const MODAL_MARGIN: u16 = 2;
 const HELP_KEY_WIDTH: usize = 22;
+const PALETTE_VISIBLE_ROWS: usize = 12;
+const PALETTE_MARKER_WIDTH: usize = 2;
+const PALETTE_MIN_TITLE_WIDTH: usize = 24;
+const PALETTE_MIN_STATUS_WIDTH: usize = 24;
 
 fn text_modal_width(screen: Rect) -> u16 {
     let available = screen.width.saturating_sub(MODAL_MARGIN).max(1);
@@ -293,6 +297,58 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         rows.push(current);
     }
     rows
+}
+
+fn truncate_display(text: &str, width: usize) -> String {
+    if display_width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    let content_width = width.saturating_sub(1);
+    let mut result = String::new();
+    for character in text.chars() {
+        let mut candidate = result.clone();
+        candidate.push(character);
+        if display_width(&candidate) > content_width {
+            break;
+        }
+        result.push(character);
+    }
+    result.push('…');
+    result
+}
+
+fn pad_display(text: &str, width: usize, align_right: bool) -> String {
+    let padding = " ".repeat(width.saturating_sub(display_width(text)));
+    if align_right {
+        format!("{padding}{text}")
+    } else {
+        format!("{text}{padding}")
+    }
+}
+
+fn palette_status(command: &PaletteCommand) -> &'static str {
+    match command.availability {
+        Availability::Enabled => command.category.label(),
+        Availability::Disabled(reason) => reason,
+    }
+}
+
+fn palette_column_widths(commands: &[&PaletteCommand], inner_width: usize) -> (usize, usize) {
+    let available = inner_width.saturating_sub(PALETTE_MARKER_WIDTH);
+    let status_limit = available.saturating_sub(PALETTE_MIN_TITLE_WIDTH);
+    let longest_status = commands
+        .iter()
+        .map(|command| display_width(palette_status(command)))
+        .max()
+        .unwrap_or(0);
+    let status_width = longest_status
+        .max(PALETTE_MIN_STATUS_WIDTH.min(status_limit))
+        .min(status_limit);
+    (available.saturating_sub(status_width), status_width)
 }
 
 fn prefixed_rows(prefix: &str, text: &str, inner_width: usize) -> Vec<(String, String)> {
@@ -533,10 +589,8 @@ fn render_palette(
     screen: Rect,
 ) {
     let commands = palette::filtered(state);
-    let visible_rows = 12usize;
     let width = text_modal_width(screen);
     let inner_width = usize::from(width.saturating_sub(2));
-    let title_width = inner_width.saturating_sub(18).max(8);
 
     let mut lines = vec![
         Line::from(vec![
@@ -548,26 +602,41 @@ fn render_palette(
     ];
 
     let selected = palette_state.selected.min(commands.len().saturating_sub(1));
-    // Keep the selection inside the visible window.
-    let offset = selected.saturating_sub(visible_rows.saturating_sub(1));
-    for (index, command) in commands.iter().enumerate().skip(offset).take(visible_rows) {
+    let offset = selected.saturating_sub(PALETTE_VISIBLE_ROWS.saturating_sub(1));
+    let visible_commands: Vec<_> = commands
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(PALETTE_VISIBLE_ROWS)
+        .collect();
+    let visible_command_refs: Vec<_> = visible_commands
+        .iter()
+        .map(|(_, command)| *command)
+        .collect();
+    let (title_width, status_width) = palette_column_widths(&visible_command_refs, inner_width);
+
+    for (index, command) in visible_commands {
         let is_selected = index == selected;
         let marker = if is_selected { "▸ " } else { "  " };
-        let mut spans = vec![Span::styled(marker.to_owned(), theme.accent())];
-        let title: String = command.title.chars().take(title_width).collect();
-        match command.availability {
-            Availability::Enabled => {
-                spans.push(Span::styled(format!("{title:<title_width$}"), theme.text()));
-                spans.push(Span::styled(command.category.label(), theme.muted()));
-            }
-            Availability::Disabled(reason) => {
-                spans.push(Span::styled(
-                    format!("{title:<title_width$}"),
-                    theme.muted(),
-                ));
-                spans.push(Span::styled(reason, theme.warn()));
-            }
-        }
+        let title = pad_display(
+            &truncate_display(&command.title, title_width),
+            title_width,
+            false,
+        );
+        let status = pad_display(
+            &truncate_display(palette_status(command), status_width),
+            status_width,
+            true,
+        );
+        let (title_style, status_style) = match command.availability {
+            Availability::Enabled => (theme.text(), theme.muted()),
+            Availability::Disabled(_) => (theme.muted(), theme.warn()),
+        };
+        let spans = vec![
+            Span::styled(marker, theme.accent()),
+            Span::styled(title, title_style),
+            Span::styled(status, status_style),
+        ];
         let line = Line::from(spans);
         lines.push(if is_selected {
             line.style(theme.selected())
@@ -601,7 +670,7 @@ fn render_palette(
     let block = modal(f, theme, area, "Commands");
     let inner = block.inner(area);
     f.render_widget(block, area);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_details(
@@ -815,9 +884,9 @@ mod tests {
     }
 
     #[test]
-    fn text_modal_width_is_seventy_percent_with_safe_bounds() {
-        assert_eq!(text_modal_width(Rect::new(0, 0, 100, 30)), 70);
-        assert_eq!(text_modal_width(Rect::new(0, 0, 200, 50)), 140);
+    fn text_modal_width_is_sixty_percent_with_safe_bounds() {
+        assert_eq!(text_modal_width(Rect::new(0, 0, 100, 30)), 60);
+        assert_eq!(text_modal_width(Rect::new(0, 0, 200, 50)), 120);
         assert_eq!(text_modal_width(Rect::new(0, 0, 40, 20)), 38);
     }
 
@@ -895,6 +964,62 @@ mod tests {
         let content = buffer_text(&terminal);
         assert!(
             content.contains("removed automatically after N seconds"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn palette_keeps_every_arrow_position_visible() {
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let mut state = UiState::new(&Config::default(), "testhost".to_owned(), false, None);
+        state.snapshot = Some(std::sync::Arc::new(mock::sample().unwrap()));
+        state
+            .overlays
+            .push(Overlay::Palette(PaletteState::default()));
+        let commands = palette::filtered(&state);
+        for (selected, command) in commands.iter().enumerate() {
+            let mut terminal = Terminal::new(TestBackend::new(190, 40)).unwrap();
+            let palette_state = PaletteState {
+                query: String::new(),
+                selected,
+            };
+
+            terminal
+                .draw(|frame| {
+                    render_palette(frame, &state, &palette_state, &theme, frame.area());
+                })
+                .unwrap();
+
+            let content = buffer_text(&terminal);
+            assert!(
+                content.contains(&format!("▸ {}", command.title)),
+                "selection {selected} ({}) was outside the rendered viewport: {content}",
+                command.title
+            );
+        }
+    }
+
+    #[test]
+    fn palette_keeps_the_full_long_disabled_reason_on_one_row() {
+        let mut terminal = Terminal::new(TestBackend::new(190, 40)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let mut state = UiState::new(&Config::default(), "testhost".to_owned(), false, None);
+        state.snapshot = Some(std::sync::Arc::new(mock::sample().unwrap()));
+        let palette_state = PaletteState {
+            query: "Migrate selected direct rule".to_owned(),
+            selected: 0,
+        };
+        state.overlays.push(Overlay::Palette(palette_state.clone()));
+
+        terminal
+            .draw(|frame| {
+                render_palette(frame, &state, &palette_state, &theme, frame.area());
+            })
+            .unwrap();
+
+        let content = buffer_text(&terminal);
+        assert!(
+            content.contains("select a supported migration candidate in the Direct view"),
             "{content}"
         );
     }
