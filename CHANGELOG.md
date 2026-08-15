@@ -3,6 +3,13 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.5.2](https://github.com/madebydaniz/fwdeck/compare/v0.5.1...v0.5.2) (2026-08-15)
+
+
+### Documentation
+
+* **main:** publish remote firewalld safety article ([#59](https://github.com/madebydaniz/fwdeck/issues/59)) ([196da09](https://github.com/madebydaniz/fwdeck/commit/196da0991dcfddc890baf7cc2063f1f97c5d0304))
+
 ## [0.5.1](https://github.com/madebydaniz/fwdeck/compare/v0.5.0...v0.5.1) (2026-08-15)
 
 

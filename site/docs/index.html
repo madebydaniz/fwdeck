@@ -145,7 +145,7 @@ read-only with a visible explanation, and it never re-executes itself with sudo.
 <p>Downloads the right binary, verifies the SHA-256 checksum, and verifies the
 Cosign release signature before anything is installed:</p>
 <pre><span class="g">$</span> curl -fsSL https://raw.githubusercontent.com/madebydaniz/fwdeck/main/scripts/install.sh | bash</pre>
-<p>Options: <code>--version v0.5.1</code><!-- x-release-please-version --> · <code>--install-dir ~/bin</code> ·
+<p>Options: <code>--version v0.5.2</code><!-- x-release-please-version --> · <code>--install-dir ~/bin</code> ·
 <code>--no-verify-signature</code> (not recommended).</p>
 <h3>Distribution packages (.deb / .rpm)</h3>
 <p>Every <a href="https://github.com/madebydaniz/fwdeck/releases">release</a> also
@@ -175,7 +175,7 @@ contains the binary, bash/zsh/fish completions, the man page, and the license.</
 <p>Releases are signed with <strong>Cosign keyless</strong> (Sigstore): the
 signature certificate is bound to this repository's release workflow identity —
 a signature from anywhere else fails verification.</p>
-<pre>VERSION=v0.5.1<!-- x-release-please-version -->
+<pre>VERSION=v0.5.2<!-- x-release-please-version -->
 curl -fsSLO "https://github.com/madebydaniz/fwdeck/releases/download/${VERSION}/checksums.txt"
 curl -fsSLO "https://github.com/madebydaniz/fwdeck/releases/download/${VERSION}/checksums.txt.bundle"
 
