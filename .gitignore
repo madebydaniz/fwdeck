@@ -123,15 +123,3 @@ _site/
 /fuzz/artifacts/
 /fuzz/Cargo.lock
 
-# demo recording intermediate (assets/demo.gif is the committed artifact)
-/fwdeck-demo.cast
-
-# Local AI-assistant tooling config (never commit)
-/.claude/
-/.superpowers/
-/docs/
-ROADMAP.md
-.agents
-.forge
-.idea
-skills-lock.json
