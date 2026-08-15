@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to change firewalld rules remotely without locking yourself out — FWDeck</title>
+<link rel="icon" type="image/svg+xml" href="../../assets/logo-dark.svg">
+<link rel="canonical" href="https://madebydaniz.github.io/fwdeck/articles/safe-remote-firewalld-changes/">
+<meta name="description" content="A practical workflow for testing firewalld runtime changes, controlling permanent configuration drift, and keeping an independent rollback path.">
+<meta name="author" content="Daniel Niazmand">
+<meta name="robots" content="index, follow">
+<meta name="theme-color" content="#0e0f16">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="FWDeck">
+<meta property="og:title" content="How to change firewalld rules remotely without locking yourself out">
+<meta property="og:description" content="Test in runtime, verify from a new connection, persist the exact intent, and keep rollback independent from the session at risk.">
+<meta property="og:url" content="https://madebydaniz.github.io/fwdeck/articles/safe-remote-firewalld-changes/">
+<meta property="og:image" content="https://madebydaniz.github.io/fwdeck/assets/social-preview.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="FWDeck terminal interface for managing firewalld">
+<meta property="article:published_time" content="2026-08-16">
+<meta property="article:modified_time" content="2026-08-16">
+<meta property="article:author" content="Daniel Niazmand">
+<meta property="article:tag" content="firewalld">
+<meta property="article:tag" content="Linux system administration">
+<meta property="article:tag" content="remote firewall safety">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="How to change firewalld rules remotely without locking yourself out">
+<meta name="twitter:description" content="A practical workflow for runtime testing, configuration drift, and independent rollback.">
+<meta name="twitter:image" content="https://madebydaniz.github.io/fwdeck/assets/social-preview.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "TechArticle",
+  "headline": "How to Change firewalld Rules Remotely Without Locking Yourself Out",
+  "description": "A practical workflow for testing firewalld runtime changes, controlling permanent configuration drift, and keeping an independent rollback path.",
+  "datePublished": "2026-08-16",
+  "dateModified": "2026-08-16",
+  "mainEntityOfPage": "https://madebydaniz.github.io/fwdeck/articles/safe-remote-firewalld-changes/",
+  "image": "https://madebydaniz.github.io/fwdeck/assets/social-preview.png",
+  "author": {
+    "@type": "Person",
+    "name": "Daniel Niazmand",
+    "url": "https://madebydaniz.com/"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "FWDeck",
+    "url": "https://madebydaniz.github.io/fwdeck/",
+    "logo": {
+      "@type": "ImageObject",
+      "url": "https://madebydaniz.github.io/fwdeck/assets/logo.svg"
+    }
+  },
+  "proficiencyLevel": "Intermediate",
+  "dependencies": "Linux with firewalld and remote administrative access"
+}
+</script>
+<style>
+:root{
+  --page:#0e0f16;--panel:#151622;--panel2:#1a1b29;--line:#262838;--line2:#34364c;
+  --fg:#eceef8;--muted:#a4a8c0;--dim:#6b708e;--purple:#bd93f9;--pink:#ff79c6;
+  --cyan:#8be9fd;--green:#50fa7b;--orange:#ffb86c;--red:#ff5555;--yellow:#f1fa8c;
+  --grad:linear-gradient(100deg,#bd93f9 0%,#ff79c6 55%,#8be9fd 110%);
+  --mono:ui-monospace,'SF Mono','JetBrains Mono',Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --serif:'Iowan Old Style','Palatino Linotype','Book Antiqua',Palatino,Georgia,serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth;scroll-padding-top:86px}
+body{background:var(--page);color:var(--fg);font-family:var(--serif);font-size:18px;line-height:1.78;
+  background-image:radial-gradient(900px 480px at 75% -8%,rgba(189,147,249,.13),transparent 67%)}
+a{color:var(--cyan);text-decoration-thickness:1px;text-underline-offset:3px}
+a:hover{color:var(--fg)}
+.progress{position:fixed;z-index:100;top:0;left:0;height:2px;width:0;background:var(--grad)}
+nav{position:sticky;top:0;z-index:20;background:rgba(14,15,22,.86);border-bottom:1px solid var(--line);backdrop-filter:blur(14px);font-family:var(--sans)}
+nav .in{width:min(1120px,calc(100% - 48px));height:60px;margin:0 auto;display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:9px;color:var(--fg);font-weight:800;text-decoration:none;font-size:.94rem}.brand b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.links{display:flex;align-items:center;gap:24px}.links a{color:var(--muted);font-size:.84rem;text-decoration:none}.links a:hover{color:var(--fg)}
+.hero{width:min(960px,calc(100% - 48px));margin:0 auto;padding:92px 0 72px}
+.kicker{font:700 .7rem/1 var(--mono);letter-spacing:.17em;text-transform:uppercase;color:var(--purple)}
+h1{max-width:900px;margin-top:22px;font:700 clamp(2.65rem,7vw,5.6rem)/.99 var(--serif);letter-spacing:-.05em;text-wrap:balance}
+.dek{max-width:720px;margin-top:28px;color:var(--muted);font-size:1.18rem;line-height:1.6}
+.byline{display:flex;align-items:center;gap:16px;margin-top:36px;font:500 .77rem/1.5 var(--mono);color:var(--dim)}
+.byline img{width:34px;height:34px}.byline strong{color:var(--fg)}
+.shell{width:min(1020px,calc(100% - 48px));margin:0 auto 110px;display:grid;grid-template-columns:190px minmax(0,740px);gap:64px;align-items:start}
+.rail{position:sticky;top:92px;border-top:1px solid var(--line2);padding-top:20px;font-family:var(--sans)}
+.rail p{font:700 .67rem/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin-bottom:14px}
+.rail a{display:block;color:var(--dim);font-size:.75rem;line-height:1.35;text-decoration:none;padding:7px 0}.rail a:hover{color:var(--cyan)}
+article{min-width:0}
+article>p{margin:0 0 1.3em;color:var(--muted)}
+article>p:first-child{font-size:1.24rem;color:var(--fg)}
+article h2{font:700 clamp(1.85rem,4vw,2.55rem)/1.14 var(--serif);letter-spacing:-.025em;margin:2.15em 0 .7em;color:var(--fg);text-wrap:balance}
+article h3{font:700 1.1rem/1.4 var(--sans);margin:2em 0 .7em;color:var(--fg)}
+article ul,article ol{margin:0 0 1.5em 1.35em;color:var(--muted)}
+article li{padding-left:.35em;margin:.32em 0}article li::marker{color:var(--purple)}
+article strong{color:var(--fg)}
+article code{font:500 .82em/1.4 var(--mono);color:var(--orange);background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+pre{position:relative;margin:1.7em 0;background:#11121a;border:1px solid var(--line2);border-radius:13px;padding:20px 22px;overflow-x:auto;box-shadow:0 16px 42px rgba(0,0,0,.22)}
+pre::before{content:'$';position:absolute;right:16px;top:11px;color:var(--dim);font:700 .72rem/1 var(--mono)}
+pre code{display:block;background:none;border:0;padding:0;color:var(--fg);font-size:.78rem;line-height:1.7;white-space:pre}
+.note{margin:1.7em 0;border:1px solid var(--line2);border-left:3px solid var(--purple);border-radius:0 12px 12px 0;background:var(--panel);padding:18px 22px;color:var(--muted);font-family:var(--sans);font-size:.88rem;line-height:1.65}
+.note strong{color:var(--fg)}.note.warn{border-left-color:var(--orange)}
+.pull{margin:2.1em -40px;padding:28px 40px;border-top:1px solid var(--line2);border-bottom:1px solid var(--line2);font:700 1.55rem/1.4 var(--serif);color:var(--fg)}
+.pull span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.checklist{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:1.5em 0 2.4em}
+.check{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:20px;font-family:var(--sans)}
+.check h3{margin:0 0 12px;color:var(--cyan);font:700 .82rem/1.2 var(--mono);text-transform:uppercase;letter-spacing:.05em}
+.check ul{margin:0 0 0 18px;font-size:.82rem;line-height:1.55}.check li{margin:6px 0}
+.demo{margin:2em 0;border:1px solid var(--line2);border-radius:14px;overflow:hidden;background:var(--panel);box-shadow:0 22px 58px rgba(0,0,0,.32)}
+.demo img{display:block;width:100%;height:auto}.demo figcaption{border-top:1px solid var(--line);padding:10px 15px;color:var(--dim);font:500 .67rem/1.4 var(--mono)}
+.disclosure{font-style:italic;color:var(--dim);font-size:.91rem}
+.sources{margin-top:4em;padding-top:2em;border-top:1px solid var(--line)}
+.sources h2{margin:0 0 1em;font:700 .77rem/1 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--dim)}
+.sources ul{font-family:var(--sans);font-size:.8rem;line-height:1.55}
+.next{width:min(960px,calc(100% - 48px));margin:0 auto 100px;border:1px solid var(--line2);border-radius:18px;padding:32px;background:linear-gradient(120deg,var(--panel),var(--panel2));font-family:var(--sans);display:flex;align-items:center;justify-content:space-between;gap:24px}
+.next p{color:var(--muted);font-size:.87rem}.next strong{display:block;color:var(--fg);font:700 1.25rem/1.25 var(--serif);margin-bottom:6px}.next a{white-space:nowrap;font:700 .77rem/1 var(--mono);text-decoration:none;color:var(--green)}
+footer{border-top:1px solid var(--line);padding:36px 0;color:var(--dim);font:500 .75rem/1.6 var(--sans)}
+footer .in{width:min(1120px,calc(100% - 48px));margin:0 auto;display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}
+@media(max-width:880px){.shell{grid-template-columns:1fr}.rail{display:none}.pull{margin:2em 0;padding:24px 0}.checklist{grid-template-columns:1fr}}
+@media(max-width:620px){body{font-size:17px}.hero,.shell,.next,nav .in,footer .in{width:min(100% - 32px,1020px)}.hero{padding:64px 0 48px}.links a:not(:last-child){display:none}.next{align-items:flex-start;flex-direction:column}pre{margin-left:-8px;margin-right:-8px;padding:18px 14px}pre code{font-size:.72rem}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.progress{display:none}}
+</style>
+</head>
+<body>
+<div class="progress" aria-hidden="true"></div>
+<nav><div class="in">
+  <a class="brand" href="../../"><img src="../../assets/logo-dark.svg" alt="" width="24" height="24"><span>FW<b>Deck</b> / field notes</span></a>
+  <div class="links"><a href="../">All articles</a><a href="../../docs/">Docs</a><a href="https://github.com/madebydaniz/fwdeck">GitHub ↗</a></div>
+</div></nav>
+
+<header class="hero">
+  <p class="kicker">Field note 01 · Remote operations</p>
+  <h1>How to change firewalld rules remotely without locking yourself out</h1>
+  <p class="dek">A practical workflow for testing runtime changes, controlling permanent configuration drift, and keeping an independent path back into the server.</p>
+  <div class="byline">
+    <img src="../../assets/logo-dark.svg" alt="">
+    <span><strong>Daniel Niazmand</strong><br><time datetime="2026-08-16">August 16, 2026</time> · 8 min read</span>
+  </div>
+</header>
+
+<div class="shell">
+<aside class="rail" aria-label="Article sections">
+  <p>On this page</p>
+  <a href="#two-configurations">Two configurations</a>
+  <a href="#inspect-path">Inspect the path</a>
+  <a href="#temporary-rules">Temporary rules</a>
+  <a href="#independent-rollback">Independent rollback</a>
+  <a href="#runtime-state">Runtime state</a>
+  <a href="#zones-policies">Zones and policies</a>
+  <a href="#checklist">Operator checklist</a>
+  <a href="#fwdeck">Why I built FWDeck</a>
+</aside>
+
+<article>
+  <p>The most dangerous firewall command is often a valid one. It succeeds, returns exit code 0, and then your SSH session disappears.</p>
+  <p>The rule may be syntactically correct. The operational workflow was not safe.</p>
+  <p>If you administer Linux servers remotely, the important question is not only, “Will this firewalld command work?” It is also, “What restores access if my assumptions are wrong?” This is the workflow I use to reason about remote firewall changes: inspect the real path, test in runtime, verify from a new connection, persist the exact intent, and keep rollback independent from the session at risk.</p>
+
+  <h2 id="two-configurations">Start with the two configurations firewalld actually maintains</h2>
+  <p>firewalld has a runtime configuration and a permanent configuration. Treating them as one state is the source of many surprises.</p>
+  <ul>
+    <li><strong>Runtime</strong> is the effective firewall configuration in the kernel now. A runtime-only change disappears after a reload, restart, or reboot.</li>
+    <li><strong>Permanent</strong> is the configuration stored on disk. It becomes runtime configuration after firewalld starts or reloads.</li>
+  </ul>
+  <p>This separation is useful. It lets you test a change without immediately making it survive a reboot. It also creates drift: the server can behave one way now and another way after the next reload.</p>
+  <p>The <a href="https://firewalld.org/documentation/configuration/runtime-versus-permanent.html">official firewalld documentation</a> is explicit: a reload replaces runtime configuration with permanent configuration, and runtime-only changes are lost. The same reload normally keeps connection-tracking state, so an existing SSH connection may survive even when a new one would fail.</p>
+  <div class="pull">That last detail changes <span>how we must test.</span></div>
+
+  <h2 id="inspect-path">Inspect the traffic path before changing it</h2>
+  <p>Do not assume that the <code>public</code> zone protects your SSH connection. Determine which interface or source is active and which zone owns it.</p>
+  <pre><code>sudo firewall-cmd --state
+sudo firewall-cmd --get-active-zones
+sudo firewall-cmd --get-zone-of-interface=eth0</code></pre>
+  <p>Replace <code>eth0</code> with the interface that carries your management connection. If firewalld binds the zone by source address rather than interface, inspect the source bindings reported by <code>--get-active-zones</code>.</p>
+  <p>Then compare the relevant zone in both configurations:</p>
+  <pre><code>sudo firewall-cmd --zone=public --list-all
+sudo firewall-cmd --permanent --zone=public --list-all</code></pre>
+  <p>Replace <code>public</code> with the active zone you identified. For SSH, make the check explicit:</p>
+  <pre><code>sudo firewall-cmd --zone=public --query-service=ssh
+sudo firewall-cmd --permanent --zone=public --query-service=ssh</code></pre>
+  <p>These commands answer different questions. The first tells you whether new SSH connections are allowed now. The second tells you whether they should remain allowed after a reload or reboot.</p>
+  <aside class="note"><strong>Keep out-of-band access available when the system matters.</strong> A provider console, hypervisor console, serial console, or separate management network can recover the host. A second terminal on the same path helps with verification, but it is not out-of-band recovery.</aside>
+
+  <h2 id="temporary-rules">Use temporary runtime rules for additive experiments</h2>
+  <p>Suppose an application needs TCP port 8443 in the active zone. firewalld can add the runtime rule with a timeout:</p>
+  <pre><code>sudo firewall-cmd --zone=public --add-port=8443/tcp --timeout=10m
+sudo firewall-cmd --zone=public --query-port=8443/tcp</code></pre>
+  <p>The rule expires automatically after ten minutes. The <code>--timeout</code> option works with runtime additions such as services, ports, protocols, forward ports, masquerading, and rich rules. It cannot be combined with <code>--permanent</code>.</p>
+  <p>Now test the application from another machine or a fresh connection. Confirm more than reachability:</p>
+  <ul>
+    <li>The service listens on the expected address and port.</li>
+    <li>The source network reaches the intended zone.</li>
+    <li>No broader network gained access by accident.</li>
+    <li>A new SSH connection still succeeds.</li>
+  </ul>
+  <p>If the test fails, allow the temporary rule to expire or remove it explicitly. If it succeeds, add the permanent rule, validate the stored configuration, and replace the timed runtime rule with a non-expiring runtime rule:</p>
+  <pre><code>sudo firewall-cmd --permanent --zone=public --add-port=8443/tcp
+sudo firewall-cmd --check-config
+sudo firewall-cmd --zone=public --remove-port=8443/tcp
+sudo firewall-cmd --zone=public --add-port=8443/tcp</code></pre>
+  <aside class="note warn"><strong>Account for the transition.</strong> The remove-and-add pair briefly affects new connections to that application port. It is not an acceptable conversion pattern for the SSH rule carrying your current session.</aside>
+  <p>Query both configurations after every step:</p>
+  <pre><code>sudo firewall-cmd --zone=public --query-port=8443/tcp
+sudo firewall-cmd --permanent --zone=public --query-port=8443/tcp</code></pre>
+  <p>Both states now contain the reviewed rule, so no reload is required to activate it. If you plan to reload for another reason, compare runtime and permanent state first. A reload does not promote only the port you changed; it makes the complete permanent configuration the new runtime configuration. Any unrelated runtime-only rule will disappear.</p>
+  <p>When that full transition is intentional:</p>
+  <pre><code>sudo firewall-cmd --reload
+sudo firewall-cmd --zone=public --query-port=8443/tcp
+sudo firewall-cmd --permanent --zone=public --query-port=8443/tcp</code></pre>
+  <p>Open a new SSH connection after the reload. Do not use the survival of the original session as your health check.</p>
+
+  <h2 id="independent-rollback">Destructive remote changes need an independent rollback</h2>
+  <p>Temporary additions are the friendliest case. The dangerous operations are removals and routing changes:</p>
+  <ul>
+    <li>removing the <code>ssh</code> service or its port;</li>
+    <li>moving the management interface or source to another zone;</li>
+    <li>changing a zone or policy target to <code>DROP</code> or <code>REJECT</code>;</li>
+    <li>modifying a rich rule that controls the management path;</li>
+    <li>changing a policy between ingress and egress zones;</li>
+    <li>reloading permanent state that has drifted from runtime.</li>
+  </ul>
+  <p>firewalld does not provide <code>--timeout</code> for removal commands. A command such as the following has no timed safety net:</p>
+  <pre><code>sudo firewall-cmd --zone=public --remove-service=ssh</code></pre>
+  <aside class="note warn"><strong>Do not run that example on a remote server without a tested recovery path.</strong></aside>
+  <p>For a risky change, the rollback mechanism must meet three conditions:</p>
+  <ol>
+    <li><strong>Arm it before the mutation.</strong> Scheduling recovery after the change is too late if the connection drops immediately.</li>
+    <li><strong>Run it outside the SSH session.</strong> A shell process tied to the endangered connection is not a dead-man's switch.</li>
+    <li><strong>Cancel it only after independent verification.</strong> Test a new connection through the path that future operators will use.</li>
+  </ol>
+  <p>Depending on the environment, the independent mechanism may be a pre-scheduled systemd unit, an orchestration control plane, a provider recovery console, or a second management network. The specific tool matters less than the ownership boundary: the process responsible for recovery must survive the connection and application you are changing.</p>
+
+  <h2 id="runtime-state">Avoid promoting unrelated runtime state</h2>
+  <p><code>firewall-cmd --runtime-to-permanent</code> can save the entire active runtime configuration as permanent configuration. That is useful when you intentionally constructed and reviewed the whole runtime state.</p>
+  <p>It is too broad for many one-rule maintenance tasks.</p>
+  <p>Runtime may contain temporary diagnostics, rules installed by another administrator, or changes made by software. Promoting all of it because one port passed a test can preserve state you never meant to keep.</p>
+  <p>Prefer an explicit permanent command for the object you reviewed. Use <code>--runtime-to-permanent</code> only when the complete runtime configuration is the intended permanent result.</p>
+
+  <h2 id="zones-policies">Zones and policies protect different paths</h2>
+  <p>Zones usually describe traffic arriving at the host through interfaces or sources. <a href="https://firewalld.org/documentation/man-pages/firewalld.policies">Policies</a> describe traffic moving between ingress and egress zones, including symbolic zones such as <code>HOST</code> and <code>ANY</code>.</p>
+  <p>That distinction matters on routers, gateways, container hosts, and homelab machines that forward traffic. A server can keep accepting SSH while a policy change breaks forwarding for every client behind it. Conversely, a forwarding test says nothing about access to the host itself.</p>
+  <p>Before editing a policy, identify:</p>
+  <ul>
+    <li>its ingress and egress zones;</li>
+    <li>whether those zones are active;</li>
+    <li>its target and priority;</li>
+    <li>the services, ports, and rich rules attached to it;</li>
+    <li>the runtime and permanent version of each property.</li>
+  </ul>
+  <p>The safe workflow stays the same: model the path, isolate the change, preserve a rollback, and verify the path from outside.</p>
+
+  <h2 id="checklist">A remote-change checklist I can use under pressure</h2>
+  <div class="checklist">
+    <section class="check"><h3>Before the change</h3><ul>
+      <li>Identify the active interface or source and its zone.</li>
+      <li>Capture runtime and permanent state.</li>
+      <li>Confirm how SSH reaches the host.</li>
+      <li>Keep out-of-band recovery available.</li>
+      <li>Arm rollback before destructive mutation.</li>
+    </ul></section>
+    <section class="check"><h3>During the change</h3><ul>
+      <li>Test additive changes in runtime first.</li>
+      <li>Use a timeout when supported.</li>
+      <li>Change one logical unit at a time.</li>
+      <li>Query the resulting state.</li>
+      <li>Treat partial success as failure.</li>
+    </ul></section>
+    <section class="check"><h3>Before persistence</h3><ul>
+      <li>Establish a new SSH connection.</li>
+      <li>Test from an external client.</li>
+      <li>Review runtime/permanent drift.</li>
+      <li>Persist only the intended object.</li>
+      <li>Run <code>--check-config</code>.</li>
+    </ul></section>
+    <section class="check"><h3>After persistence</h3><ul>
+      <li>Query both configurations.</li>
+      <li>Establish another new SSH connection.</li>
+      <li>Verify forwarding separately.</li>
+      <li>Cancel rollback after verification.</li>
+      <li>Record what changed and why.</li>
+    </ul></section>
+  </div>
+
+  <h2 id="fwdeck">Why I built a TUI for this workflow</h2>
+  <p>The hard part of firewalld is not command syntax. The hard part is keeping scope, state, identity, risk, and recovery visible at the same time.</p>
+  <p>That is why I built <a href="https://github.com/madebydaniz/fwdeck">FWDeck</a>, an open-source terminal UI for firewalld. It shows runtime and permanent scope on every row, puts a confirmation in front of mutations, warns when a change intersects the current SSH path, and rejects a mutation if firewalld changed after the confirmation screen was reviewed.</p>
+  <p class="disclosure">Disclosure: I am the author and maintainer of FWDeck. The command-line workflow above does not require it.</p>
+  <p>For risky operations, FWDeck uses a dead-man's switch. On systems with systemd and sufficient privileges, it pre-arms an out-of-process rollback watchdog before applying the mutation. If the UI crashes, receives <code>SIGKILL</code>, or loses the SSH session, the watchdog can still revert the change. When that stronger watchdog is unavailable, FWDeck reports the limitation and falls back to in-process rollback rather than pretending the guarantees are identical.</p>
+  <figure class="demo">
+    <img src="../../assets/demo.gif" alt="FWDeck showing a risky firewall change with a rollback countdown">
+    <figcaption>FWDeck keeps the reviewed mutation and its rollback countdown in the same operator workflow.</figcaption>
+  </figure>
+  <p>FWDeck does not replace understanding firewalld. It makes the operational model harder to lose during a maintenance window.</p>
+  <p>You can inspect your system without enabling mutations:</p>
+  <pre><code>cargo install fwdeck --locked
+fwdeck doctor
+fwdeck --read-only</code></pre>
+  <p>Full control requires root or suitable polkit authorization. FWDeck runs on Linux with firewalld; the crash-resistant watchdog additionally requires systemd and root. The default backend uses <code>firewall-cmd</code>, and an optional native D-Bus backend supports reads and the runtime mutations it can represent honestly.</p>
+
+  <h2>A successful command is not the definition of safety</h2>
+  <p>I no longer think of a firewall change as one command followed by a connectivity check. It is a small transaction with a precondition, a mutation, an independent rollback, and a verification step from outside the system being changed.</p>
+  <p>The CLI can support that discipline. A TUI can make the state and guardrails more visible. Neither can recover from a workflow that has no path back.</p>
+  <div class="pull"><span>Design the rollback</span> before the rule.</div>
+
+  <section class="sources" aria-labelledby="sources-title">
+    <h2 id="sources-title">Primary references</h2>
+    <ul>
+      <li><a href="https://firewalld.org/documentation/configuration/runtime-versus-permanent.html">firewalld: Runtime versus Permanent</a></li>
+      <li><a href="https://firewalld.org/documentation/man-pages/firewall-cmd.html">firewall-cmd manual</a></li>
+      <li><a href="https://firewalld.org/documentation/concepts.html">firewalld concepts: zones, policies, and state</a></li>
+      <li><a href="https://firewalld.org/documentation/man-pages/firewalld.policies">firewalld policies manual</a></li>
+      <li><a href="../../docs/">FWDeck documentation</a></li>
+    </ul>
+  </section>
+</article>
+</div>
+
+<aside class="next">
+  <p><strong>Make the state visible before changing it.</strong>FWDeck is open source, keyboard-first, and available for Linux systems running firewalld.</p>
+  <a href="https://github.com/madebydaniz/fwdeck">View FWDeck on GitHub →</a>
+</aside>
+
+<footer><div class="in"><p>FWDeck Field Notes · Daniel Niazmand</p><p><a href="../">All articles</a> · <a href="../../docs/">Documentation</a> · <a href="https://github.com/madebydaniz/fwdeck">Source</a></p></div></footer>
+<script>
+  (function () {
+    var bar = document.querySelector('.progress');
+    function updateProgress() {
+      var height = document.documentElement.scrollHeight - window.innerHeight;
+      bar.style.width = (height > 0 ? (window.scrollY / height) * 100 : 0) + '%';
+    }
+    window.addEventListener('scroll', updateProgress, { passive: true });
+    updateProgress();
+  }());
+</script>
+</body>
+</html>

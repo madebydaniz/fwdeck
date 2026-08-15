@@ -2,10 +2,18 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://madebydaniz.github.io/fwdeck/</loc>
-    <lastmod>2026-08-15</lastmod>
+    <lastmod>2026-08-16</lastmod>
   </url>
   <url>
     <loc>https://madebydaniz.github.io/fwdeck/docs/</loc>
-    <lastmod>2026-08-15</lastmod>
+    <lastmod>2026-08-16</lastmod>
+  </url>
+  <url>
+    <loc>https://madebydaniz.github.io/fwdeck/articles/</loc>
+    <lastmod>2026-08-16</lastmod>
+  </url>
+  <url>
+    <loc>https://madebydaniz.github.io/fwdeck/articles/safe-remote-firewalld-changes/</loc>
+    <lastmod>2026-08-16</lastmod>
   </url>
 </urlset>

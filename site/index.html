@@ -134,6 +134,17 @@ section .sub{color:var(--muted);margin-top:12px;margin-bottom:40px;max-width:620
 .keys .txt{color:var(--orange)}
 .keys .arr{color:var(--dim)}
 .step p{margin-top:12px;color:var(--muted);font-size:.87rem}
+.fieldnote{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(240px,.65fr);overflow:hidden;
+  background:var(--panel);border:1px solid var(--line2);border-radius:18px}
+.fieldnote .copy{padding:clamp(26px,5vw,46px)}
+.fieldnote h3{font-family:'Iowan Old Style','Palatino Linotype','Book Antiqua',Palatino,Georgia,serif;
+  font-size:clamp(1.7rem,3vw,2.45rem);line-height:1.13;letter-spacing:-.025em;margin:14px 0}
+.fieldnote h3 a{color:var(--fg)}.fieldnote h3 a:hover{color:var(--cyan);text-decoration:none}
+.fieldnote p{color:var(--muted);max-width:650px}
+.fieldnote .read{display:inline-block;margin-top:22px;color:var(--green);font-family:var(--mono);font-size:.78rem;font-weight:700}
+.fieldnote .aside{display:flex;align-items:center;padding:32px;background:var(--panel2);border-left:1px solid var(--line);
+  color:var(--muted);font-family:var(--mono);font-size:.78rem;line-height:1.7}
+.fieldnote .aside strong{color:var(--fg)}
 .safety{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line2);
   border-radius:20px;padding:44px}
 .safety ul{list-style:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px;margin-top:30px}
@@ -148,7 +159,7 @@ pre.code .g{color:var(--green)}
 footer{border-top:1px solid var(--line);padding:40px 0;color:var(--dim);font-size:.88rem;text-align:center}
 footer a{color:var(--muted)}
 footer a:hover{color:var(--fg)}
-@media(max-width:760px){.term pre{font-size:.55rem}nav .links a:not(.gh){display:none}}
+@media(max-width:760px){.term pre{font-size:.55rem}nav .links a:not(.gh){display:none}.fieldnote{grid-template-columns:1fr}.fieldnote .aside{border-left:0;border-top:1px solid var(--line)}}
 </style>
 </head>
 <body>
@@ -158,6 +169,7 @@ footer a:hover{color:var(--fg)}
   <div class="links">
     <a href="#features">Features</a>
     <a href="#workflows">Workflows</a>
+    <a href="articles/">Articles</a>
     <a href="#install">Install</a>
     <a href="docs/">Docs</a>
     <a class="gh" href="https://github.com/madebydaniz/fwdeck">GitHub ↗</a>
@@ -265,6 +277,21 @@ footer a:hover{color:var(--fg)}
   </div>
 </section>
 
+<section id="articles">
+  <span class="sec-eyebrow">Field notes</span>
+  <h2>Operational reasoning, not only commands</h2>
+  <p class="sub">Practical firewalld workflows for operators who need to understand the failure path before they touch the rule.</p>
+  <article class="fieldnote">
+    <div class="copy">
+      <span class="sec-eyebrow">Remote operations · 8 min</span>
+      <h3><a href="articles/safe-remote-firewalld-changes/">How to change firewalld rules remotely without locking yourself out</a></h3>
+      <p>Test in runtime, verify from a new connection, persist the exact intent, and keep rollback independent from the session at risk.</p>
+      <a class="read" href="articles/safe-remote-firewalld-changes/">Read the field note →</a>
+    </div>
+    <div class="aside"><div><span class="g">$</span> firewall-cmd --reload<br><strong>success is not a safety guarantee</strong></div></div>
+  </article>
+</section>
+
 <section style="padding-top:0;text-align:center">
   <a href="docs/#workflows" style="display:inline-block;border:1px solid var(--line2);border-radius:10px;
      padding:12px 26px;color:var(--fg);font-weight:600">Full documentation →</a>
@@ -291,6 +318,7 @@ footer a:hover{color:var(--fg)}
 <footer><div class="wrap">
   <p><strong>FWDeck</strong> · MIT License ·
   <a href="https://github.com/madebydaniz/fwdeck">GitHub</a> ·
+  <a href="articles/">Articles</a> ·
   <a href="https://github.com/madebydaniz/fwdeck/issues">Issues</a> ·
   <a href="https://github.com/madebydaniz/fwdeck/releases">Releases</a></p>
   <p style="margin-top:8px">Developed and maintained by
