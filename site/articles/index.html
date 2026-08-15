@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FWDeck Field Notes — practical firewalld operations</title>
+<link rel="icon" type="image/svg+xml" href="../assets/logo-dark.svg">
+<link rel="canonical" href="https://madebydaniz.github.io/fwdeck/articles/">
+<meta name="description" content="Practical field notes on firewalld, remote firewall safety, Linux operations, and the engineering behind FWDeck.">
+<meta name="robots" content="index, follow">
+<meta name="theme-color" content="#0e0f16">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="FWDeck">
+<meta property="og:title" content="FWDeck Field Notes">
+<meta property="og:description" content="Practical firewalld operations, remote-change safety, and engineering notes from FWDeck.">
+<meta property="og:url" content="https://madebydaniz.github.io/fwdeck/articles/">
+<meta property="og:image" content="https://madebydaniz.github.io/fwdeck/assets/social-preview.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="FWDeck terminal interface for managing firewalld">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="FWDeck Field Notes">
+<meta name="twitter:description" content="Practical firewalld operations, remote-change safety, and engineering notes from FWDeck.">
+<meta name="twitter:image" content="https://madebydaniz.github.io/fwdeck/assets/social-preview.png">
+<style>
+:root{
+  --page:#0e0f16;--panel:#151622;--panel2:#1a1b29;--line:#262838;--line2:#34364c;
+  --fg:#eceef8;--muted:#9da2bd;--dim:#646987;--purple:#bd93f9;--pink:#ff79c6;
+  --cyan:#8be9fd;--green:#50fa7b;--orange:#ffb86c;
+  --grad:linear-gradient(100deg,#bd93f9 0%,#ff79c6 55%,#8be9fd 110%);
+  --mono:ui-monospace,'SF Mono','JetBrains Mono',Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --serif:'Iowan Old Style','Palatino Linotype','Book Antiqua',Palatino,Georgia,serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{min-height:100vh;background:var(--page);color:var(--fg);font-family:var(--sans);line-height:1.65;
+  background-image:radial-gradient(850px 420px at 15% -5%,rgba(189,147,249,.14),transparent 65%),
+  linear-gradient(rgba(255,255,255,.012) 1px,transparent 1px);
+  background-size:auto,100% 34px}
+a{color:var(--cyan);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{width:min(1120px,calc(100% - 48px));margin:0 auto}
+nav{position:sticky;top:0;z-index:10;background:rgba(14,15,22,.82);border-bottom:1px solid var(--line);backdrop-filter:blur(14px)}
+nav .in{height:60px;display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:9px;color:var(--fg);font-weight:800}.brand:hover{text-decoration:none}
+.brand b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.links{display:flex;align-items:center;gap:24px}.links a{color:var(--muted);font-size:.9rem}.links a:hover{color:var(--fg);text-decoration:none}
+header{padding:100px 0 56px;position:relative}
+.kicker{font:700 .75rem/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;color:var(--purple)}
+h1{max-width:780px;margin-top:18px;font:700 clamp(2.7rem,7vw,5.5rem)/.98 var(--serif);letter-spacing:-.045em}
+.lead{max-width:660px;margin-top:24px;color:var(--muted);font-size:1.08rem}
+.rule{margin-top:48px;border:0;border-top:1px solid var(--line2)}
+main{padding-bottom:110px}
+.feature{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(260px,.7fr);gap:0;background:var(--panel);
+  border:1px solid var(--line2);border-radius:20px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.28)}
+.feature-copy{padding:clamp(28px,5vw,56px)}
+.meta{font:600 .76rem/1.4 var(--mono);color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+.feature h2{max-width:620px;margin:18px 0;font:700 clamp(2rem,4vw,3.35rem)/1.05 var(--serif);letter-spacing:-.03em}
+.feature h2 a{color:var(--fg)}.feature h2 a:hover{color:var(--cyan);text-decoration:none}
+.feature p{max-width:620px;color:var(--muted)}
+.read{display:inline-flex;margin-top:30px;align-items:center;gap:10px;font:700 .82rem/1 var(--mono);color:var(--green)}
+.read span{transition:transform .18s}.read:hover{text-decoration:none}.read:hover span{transform:translateX(5px)}
+.feature-aside{padding:40px;background:var(--panel2);border-left:1px solid var(--line);display:flex;flex-direction:column;justify-content:space-between}
+.prompt{font:600 .8rem/1.7 var(--mono);color:var(--muted)}.prompt .dollar{color:var(--green)}.prompt strong{color:var(--fg)}
+.topics{display:flex;flex-wrap:wrap;gap:8px;margin-top:28px}.topics span{border:1px solid var(--line2);border-radius:999px;padding:5px 10px;color:var(--dim);font:600 .7rem/1 var(--mono)}
+footer{border-top:1px solid var(--line);padding:38px 0;color:var(--dim);font-size:.85rem}
+footer .wrap{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap}
+@media(max-width:760px){.links a:not(:last-child){display:none}.feature{grid-template-columns:1fr}.feature-aside{border-left:0;border-top:1px solid var(--line)}header{padding-top:72px}.wrap{width:min(100% - 32px,1120px)}}
+</style>
+</head>
+<body>
+<nav><div class="wrap in">
+  <a class="brand" href="../"><img src="../assets/logo-dark.svg" alt="" width="24" height="24"><span>FW<b>Deck</b> / field notes</span></a>
+  <div class="links"><a href="../">Home</a><a href="../docs/">Docs</a><a href="https://github.com/madebydaniz/fwdeck">GitHub ↗</a></div>
+</div></nav>
+
+<div class="wrap">
+<header>
+  <p class="kicker">Operator field notes</p>
+  <h1>Firewalls deserve a path back.</h1>
+  <p class="lead">Practical writing on firewalld, remote-change safety, and the engineering decisions behind FWDeck. Written for operators who want the reasoning, not only the command.</p>
+  <hr class="rule">
+</header>
+
+<main>
+  <article class="feature">
+    <div class="feature-copy">
+      <p class="meta"><time datetime="2026-08-16">August 16, 2026</time> · 8 min read</p>
+      <h2><a href="safe-remote-firewalld-changes/">How to change firewalld rules remotely without locking yourself out</a></h2>
+      <p>A field-tested workflow for separating runtime from permanent state, validating from a new connection, and arming rollback before a destructive change.</p>
+      <a class="read" href="safe-remote-firewalld-changes/">Read the field note <span aria-hidden="true">→</span></a>
+    </div>
+    <aside class="feature-aside" aria-label="Article themes">
+      <div class="prompt"><span class="dollar">$</span> firewall-cmd --reload<br><strong>success is not a safety guarantee</strong></div>
+      <div class="topics"><span>firewalld</span><span>SSH</span><span>rollback</span><span>Linux</span></div>
+    </aside>
+  </article>
+</main>
+</div>
+
+<footer><div class="wrap"><p>FWDeck Field Notes · Daniel Niazmand</p><p><a href="../">FWDeck</a> · <a href="../docs/">Documentation</a> · <a href="https://github.com/madebydaniz/fwdeck">Source</a></p></div></footer>
+</body>
+</html>
