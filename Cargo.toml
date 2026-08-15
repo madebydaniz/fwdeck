@@ -46,9 +46,6 @@ exclude = [
     "rustfmt.toml",
     "_typos.toml",
     "Makefile",
-    "CLAUDE.md",
-    "AGENTS.md",
-    "GEMINI.md",
     "flake.nix",
     "flake.lock",
 ]

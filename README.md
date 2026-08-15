@@ -213,6 +213,12 @@ If FWDeck saves you from one locked-out SSH session, drop a ⭐️ on the repo!
 - Bugs & feature requests: [GitHub Issues](https://github.com/madebydaniz/fwdeck/issues)
 - Security reports: see [SECURITY.md](SECURITY.md) — please use private reporting
 
+## Development
+
+- [Architecture and safety invariants](ARCHITECTURE.md)
+- [Local workflow and verification gates](DEVELOPMENT.md)
+- [Contribution guide](CONTRIBUTING.md)
+
 ## License
 
 FWDeck is licensed under the [MIT License](LICENSE) and maintained by

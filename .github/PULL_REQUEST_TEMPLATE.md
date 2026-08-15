@@ -8,4 +8,4 @@
 - [ ] `cargo fmt --all -- --check` passes
 - [ ] `cargo clippy --all-targets -- -D warnings` passes (and with `--features dbus`)
 - [ ] `cargo test` passes
-- [ ] Mutation-path changes keep the safety invariants: validation → confirmation → honest result (see AGENTS.md)
+- [ ] Mutation-path changes keep the safety invariants: validation → confirmation → honest result (see [ARCHITECTURE.md](../ARCHITECTURE.md))

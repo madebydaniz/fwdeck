@@ -5,8 +5,9 @@ Thanks for considering a contribution. Ground rules:
 ## Before you start
 
 Open an issue for anything larger than a bugfix — architecture discussions
-happen before code. Read the architecture section in [AGENTS.md](AGENTS.md) first; the layer
-boundaries are enforced deliberately.
+happen before code. Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing
+layer boundaries or safety sequencing, and use [DEVELOPMENT.md](DEVELOPMENT.md)
+for the supported local workflow and verification gates.
 
 ## Non-negotiables
 
