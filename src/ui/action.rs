@@ -134,6 +134,8 @@ pub enum UiAction {
     OperationFinished(Box<crate::application::api::OperationResult>),
     /// A staged plan finished; `remaining` are unexecuted operations to re-stage.
     PlanFinished {
+        /// Identity of the reviewed plan that reached this terminal event.
+        id: crate::application::PlanId,
         /// How many operations applied fully before the plan ended.
         applied: usize,
         /// Operations never executed (plan halted on a failure).

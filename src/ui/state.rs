@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ratatui::widgets::TableState;
 
 use crate::application::ports::FirewallError;
-use crate::application::{RefreshId, RefreshOverview, RefreshPriority};
+use crate::application::{PlanId, RefreshId, RefreshOverview, RefreshPriority};
 use crate::config::Config;
 use crate::domain::LogEntry;
 use crate::domain::{
@@ -102,6 +102,8 @@ pub struct PendingRollback {
 /// submitted to the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlanRollbackReservations {
+    /// Identity of the only plan allowed to consume this reservation set.
+    pub(crate) id: PlanId,
     /// Risky operations reserved before the plan was submitted.
     pub(crate) total: usize,
     /// Risky forward outcomes already received for this plan.
@@ -201,6 +203,8 @@ pub struct UiState {
     pub(crate) single_rollback_reservations: usize,
     /// Exact reservation progress for the active sequential plan.
     pub(crate) in_flight_plan_rollback: Option<PlanRollbackReservations>,
+    /// Next process-local staged-plan identity; IDs are never reused.
+    next_plan_id: u64,
     /// Dead-man's switch window in ticks; 0 = disabled.
     pub rollback_ticks: u64,
     /// Monotonic UI clock, incremented every 250 ms tick.
@@ -275,6 +279,7 @@ impl UiState {
             rollback_reservations: 0,
             single_rollback_reservations: 0,
             in_flight_plan_rollback: None,
+            next_plan_id: 1,
             rollback_ticks: config.rollback_timeout.as_secs() * 4, // 250 ms ticks
             tick: 0,
             read_only: config.read_only,
@@ -289,6 +294,14 @@ impl UiState {
             hostname,
             size: (0, 0),
         }
+    }
+
+    /// Allocates the next plan identity, failing closed before numeric reuse.
+    pub(crate) fn allocate_plan_id(&mut self) -> Option<PlanId> {
+        let next = self.next_plan_id.checked_add(1)?;
+        let id = PlanId::new(self.next_plan_id);
+        self.next_plan_id = next;
+        Some(id)
     }
 
     /// The current view's state.
@@ -539,5 +552,22 @@ impl UiState {
             Some(Overlay::Palette(palette)) => Some(palette),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod plan_identity_tests {
+    use super::*;
+
+    #[test]
+    fn plan_ids_are_monotonic_and_fail_before_reuse() {
+        let mut state = UiState::new(&Config::default(), "test".to_owned(), false, None);
+        assert_eq!(state.allocate_plan_id().unwrap(), PlanId::new(1));
+        assert_eq!(state.allocate_plan_id().unwrap(), PlanId::new(2));
+
+        state.next_plan_id = u64::MAX;
+        assert_eq!(state.allocate_plan_id(), None);
+        assert_eq!(state.next_plan_id, u64::MAX);
     }
 }

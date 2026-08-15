@@ -45,10 +45,30 @@ impl MutationRequest {
     }
 }
 
+/// Monotonic process-local identity of one reviewed staged plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlanId(u64);
+
+impl PlanId {
+    /// Creates an identity from the UI-owned monotonic sequence.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the numeric identity for diagnostics and structured tracing.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// A reviewed staged plan with one start-of-batch observed-state precondition.
 /// The engine owns the backend serially after the precondition succeeds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MutationPlan {
+    /// Correlation identity retained through confirmation, dispatch, and completion.
+    pub id: PlanId,
     /// Operations to execute sequentially and fail-fast.
     pub operations: Vec<FirewallOperation>,
     /// Snapshot visible when the batch was validated and confirmed.
@@ -58,8 +78,13 @@ pub struct MutationPlan {
 impl MutationPlan {
     /// Couples a staged plan to the snapshot it was reviewed against.
     #[must_use]
-    pub fn new(operations: Vec<FirewallOperation>, expected: Arc<FirewallSnapshot>) -> Self {
+    pub fn new(
+        id: PlanId,
+        operations: Vec<FirewallOperation>,
+        expected: Arc<FirewallSnapshot>,
+    ) -> Self {
         Self {
+            id,
             operations,
             expected,
         }
@@ -299,6 +324,8 @@ pub enum EngineEvent {
     /// holds the operations that were never executed so the UI can re-stage
     /// them instead of losing them.
     PlanFinished {
+        /// Identity of the reviewed plan that reached this terminal event.
+        id: PlanId,
         /// Number of operations that were fully applied before the plan
         /// ended or halted.
         applied: usize,

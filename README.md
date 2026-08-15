@@ -105,6 +105,11 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
   a reload.
 - 📋 **Staged plans** — batch changes, review once, apply once; or export as a
   `firewall-cmd` script, JSON, or Ansible playbook.
+- 🧩 **First-class policies** — inspect runtime/permanent policy objects,
+  dependency health, policy sets, and reviewed policy mutations.
+- ⚡ **Responsive refresh** — status and zones appear before bounded,
+  selection-prioritized service and policy hydration completes; only the final
+  snapshot is authoritative for mutations and exports.
 - 🧷 **Stale-state guard** — every mutation carries the exact snapshot reviewed
   at confirmation. The engine bypasses refresh caches, revalidates, and fails
   closed if firewalld changed before execution.

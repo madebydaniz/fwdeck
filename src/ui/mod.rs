@@ -235,9 +235,15 @@ fn engine_event_action(event: EngineEvent) -> UiAction {
         },
         EngineEvent::ManualDemandRejected { count } => UiAction::ManualDemandRejected { count },
         EngineEvent::OperationFinished(result) => UiAction::OperationFinished(result),
-        EngineEvent::PlanFinished { applied, remaining } => {
-            UiAction::PlanFinished { applied, remaining }
-        }
+        EngineEvent::PlanFinished {
+            id,
+            applied,
+            remaining,
+        } => UiAction::PlanFinished {
+            id,
+            applied,
+            remaining,
+        },
     }
 }
 
@@ -590,6 +596,7 @@ fn release_abandoned_request_reservations(
             let effects = update::update(
                 state,
                 UiAction::PlanFinished {
+                    id: plan.id,
                     applied: 0,
                     remaining: plan.operations,
                 },
@@ -948,6 +955,24 @@ mod tests {
             engine_event_action(EngineEvent::ManualDemandRejected { count }),
             UiAction::ManualDemandRejected { count }
         );
+    }
+
+    #[test]
+    fn plan_finished_preserves_identity() {
+        let id = crate::application::PlanId::new(23);
+
+        assert!(matches!(
+            engine_event_action(EngineEvent::PlanFinished {
+                id,
+                applied: 2,
+                remaining: Vec::new(),
+            }),
+            UiAction::PlanFinished {
+                id: mapped,
+                applied: 2,
+                remaining,
+            } if mapped == id && remaining.is_empty()
+        ));
     }
 
     #[test]
