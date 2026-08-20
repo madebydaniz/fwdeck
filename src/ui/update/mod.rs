@@ -305,10 +305,12 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             match (state.session_baseline.clone(), state.snapshot.clone()) {
                 (Some(baseline), Some(current)) => {
                     // Ops that transform the baseline into now = what changed.
-                    let ops = crate::domain::restore::plan(&baseline, &current);
+                    let analysis = crate::domain::restore::analyze(&baseline, &current);
+                    let differences = analysis.operations.len() + analysis.limitations.len();
                     let content = details::diff(
-                        format!("Session diff — changes since startup ({})", ops.len()),
-                        &ops,
+                        format!("Session diff — changes since startup ({differences})"),
+                        &analysis.operations,
+                        &analysis.limitations,
                     );
                     state.overlays.push(Overlay::Details(content));
                 }
@@ -3416,6 +3418,64 @@ mod tests {
     }
 
     #[test]
+    fn priority_only_session_diff_is_visible_as_unapplied() {
+        let mut s = state();
+        let baseline = s.snapshot.clone().unwrap();
+        let mut current = (*baseline).clone();
+        let public = ZoneName::parse("public").unwrap();
+        current.runtime.get_mut(&public).unwrap().egress_priority =
+            crate::domain::RulePriority::new(99).unwrap();
+        s.session_baseline = Some(baseline);
+        s.snapshot = Some(std::sync::Arc::new(current));
+
+        update(&mut s, UiAction::ShowSessionDiff);
+
+        let Some(Overlay::Details(content)) = s.overlays.last() else {
+            panic!("priority drift must open the session diff");
+        };
+        assert!(content.title.ends_with("(1)"));
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| { key == "unapplied" && value.contains("cannot be restored") })
+        );
+    }
+
+    #[test]
+    fn priority_only_runtime_permanent_drift_is_not_claimed_as_synced() {
+        let mut s = state();
+        let mut snapshot = (*s.snapshot.clone().unwrap()).clone();
+        let public = ZoneName::parse("public").unwrap();
+        snapshot.permanent = snapshot.runtime.clone();
+        snapshot.runtime.get_mut(&public).unwrap().ingress_priority =
+            crate::domain::RulePriority::new(-25).unwrap();
+        s.snapshot = Some(std::sync::Arc::new(snapshot));
+
+        update(&mut s, UiAction::StageDriftSync);
+
+        assert!(s.staged.is_empty());
+        assert_eq!(
+            s.toasts.back().map(|toast| toast.kind),
+            Some(ToastKind::Warning)
+        );
+        assert!(
+            s.toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("cannot be restored"))
+        );
+        let Some(Overlay::Details(content)) = s.overlays.last() else {
+            panic!("priority-only drift must remain visible");
+        };
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(_, value)| value.contains("cannot be restored"))
+        );
+    }
+
+    #[test]
     fn snapshot_diff_loaded_opens_read_only_overlay_without_staging() {
         let mut s = state();
         let snap = Box::new(mock::sample().unwrap());
@@ -4770,6 +4830,44 @@ mod tests {
             },
         );
         assert_eq!(s.toasts.back().map(|t| t.kind), Some(ToastKind::Error));
+    }
+
+    #[test]
+    fn priority_only_snapshot_restore_is_never_claimed_as_restored() {
+        let mut s = state();
+        let current = s.snapshot.clone().unwrap();
+        let mut target = (*current).clone();
+        let public = ZoneName::parse("public").unwrap();
+        target.permanent.get_mut(&public).unwrap().ingress_priority =
+            crate::domain::RulePriority::new(-99).unwrap();
+
+        update(
+            &mut s,
+            UiAction::SnapshotLoaded {
+                name: "priority.json".to_owned(),
+                result: Ok(Box::new(target)),
+            },
+        );
+
+        assert!(s.staged.is_empty());
+        assert_eq!(
+            s.toasts.back().map(|toast| toast.kind),
+            Some(ToastKind::Warning)
+        );
+        assert!(
+            s.toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("cannot be restored"))
+        );
+        let Some(Overlay::Details(content)) = s.overlays.last() else {
+            panic!("unsupported priority restore must show exact evidence");
+        };
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(_, value)| value.contains("cannot be restored"))
+        );
     }
 
     #[test]

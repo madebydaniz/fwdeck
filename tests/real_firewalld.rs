@@ -380,6 +380,8 @@ fn sorted<T: Clone + Ord>(items: &[T]) -> Vec<T> {
 #[cfg(feature = "dbus")]
 fn assert_zone_parity(cli: &fwdeck::domain::ZoneDetails, dbus: &fwdeck::domain::ZoneDetails) {
     assert_eq!(dbus.target, cli.target, "zone targets must match");
+    assert_eq!(dbus.ingress_priority, cli.ingress_priority);
+    assert_eq!(dbus.egress_priority, cli.egress_priority);
     assert_eq!(sorted(&dbus.services), sorted(&cli.services));
     assert_eq!(sorted(&dbus.ports), sorted(&cli.ports));
     assert_eq!(sorted(&dbus.forward_ports), sorted(&cli.forward_ports));
@@ -427,7 +429,7 @@ fn assert_cleanup_applied(
 async fn dbus_backend_agrees_with_cli_on_read_path() {
     let _serial = FIREWALL_LOCK.lock().await;
 
-    use fwdeck::domain::SnapshotSection;
+    use fwdeck::domain::{FeatureSupport, FirewalldFeature, SnapshotSection};
     use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
 
     let cli = CliBackend::new(TokioRunner);
@@ -448,6 +450,17 @@ async fn dbus_backend_agrees_with_cli_on_read_path() {
     let zone = &cli_snap.default_zone;
     assert_zone_parity(&cli_snap.runtime[zone], &dbus_snap.runtime[zone]);
     assert_zone_parity(&cli_snap.permanent[zone], &dbus_snap.permanent[zone]);
+    if FirewalldFeature::ZonePriorities.support_for(cli_status.version.as_deref())
+        == FeatureSupport::Supported
+    {
+        assert!(
+            !dbus_snap.degraded.iter().any(|degraded| {
+                degraded.section == SnapshotSection::Zones
+                    && degraded.object.as_deref() == Some(zone.as_str())
+            }),
+            "supported zone priorities must have complete D-Bus evidence"
+        );
+    }
     // The D-Bus adapter intentionally omits these resource families. Its
     // aggregate drift value is therefore not comparable to the full CLI
     // snapshot, but the missing capabilities must be reported honestly.

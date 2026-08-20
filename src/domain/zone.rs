@@ -4,6 +4,7 @@ use super::address::SourceAddress;
 use super::ids::{IcmpType, InterfaceName, IpProtocol, ServiceName, ZoneName};
 use super::port::{ForwardPort, PortSpec};
 use super::rich_rule::RichRule;
+use super::traffic_test::RulePriority;
 
 /// The zone target, i.e. what happens to packets not matched by any rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -63,6 +64,12 @@ pub struct ZoneDetails {
     pub name: ZoneName,
     /// Fate of packets no rule matches.
     pub target: ZoneTarget,
+    /// Classification order before other matching zones; lower runs first.
+    #[serde(default)]
+    pub ingress_priority: RulePriority,
+    /// Filtering order after policy processing; lower runs first.
+    #[serde(default)]
+    pub egress_priority: RulePriority,
     /// Bound network interfaces.
     pub interfaces: Vec<InterfaceName>,
     /// Bound source addresses.
@@ -99,6 +106,8 @@ impl ZoneDetails {
         Self {
             name,
             target: ZoneTarget::Default,
+            ingress_priority: RulePriority::default(),
+            egress_priority: RulePriority::default(),
             interfaces: Vec::new(),
             sources: Vec::new(),
             services: Vec::new(),
@@ -112,5 +121,36 @@ impl ZoneDetails {
             forward: false,
             icmp_block_inversion: false,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_zone_json_defaults_new_priorities_to_zero() {
+        let json = r#"{
+            "name":"public",
+            "target":"Default",
+            "interfaces":[],
+            "sources":[],
+            "services":[],
+            "ports":[],
+            "forward_ports":[],
+            "rich_rules":[],
+            "icmp_blocks":[],
+            "masquerade":false,
+            "source_ports":[],
+            "protocols":[],
+            "forward":false,
+            "icmp_block_inversion":false
+        }"#;
+
+        let details: ZoneDetails = serde_json::from_str(json).unwrap();
+
+        assert_eq!(details.ingress_priority.get(), 0);
+        assert_eq!(details.egress_priority.get(), 0);
     }
 }

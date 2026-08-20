@@ -1,6 +1,6 @@
-//! Fixture-driven parser tests. Every fixture in `fixtures/firewall_cmd/` was
-//! captured from a real firewalld (Fedora 42, firewalld 2.3.2) inside the dev
-//! container — no hand-written approximations of output formats.
+//! Fixture-driven parser tests. Fixture structure was captured from a real
+//! firewalld (Fedora 42, firewalld 2.3.2) inside the dev container. Selected
+//! priority values are deliberately varied to pin signed parsing and drift.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic, clippy::expect_used)]
@@ -65,7 +65,35 @@ fn public_zone_details_are_fully_typed() {
     assert!(services.contains(&"ssh"));
     assert_eq!(public.ports.len(), 1);
     assert_eq!(public.ports[0].to_string(), "8080/tcp");
+    assert_eq!(public.ingress_priority.get(), -120);
+    assert_eq!(public.egress_priority.get(), 240);
     assert!(!public.masquerade);
+}
+
+#[test]
+fn runtime_and_permanent_zone_priorities_remain_distinct() {
+    let runtime = parse::parse_list_all_zones(LIST_ALL_RUNTIME).0;
+    let permanent = parse::parse_list_all_zones(LIST_ALL_PERMANENT).0;
+    let public = zone("public");
+
+    assert_eq!(runtime[&public].ingress_priority.get(), -120);
+    assert_eq!(runtime[&public].egress_priority.get(), 240);
+    assert_eq!(permanent[&public].ingress_priority.get(), -100);
+    assert_eq!(permanent[&public].egress_priority.get(), 200);
+    assert_ne!(runtime[&public], permanent[&public]);
+}
+
+#[test]
+fn malformed_priority_degrades_only_its_zone() {
+    let raw = "broken\n  target: default\n  ingress-priority: not-a-number\n  egress-priority: 0\n\ntrusted\n  target: ACCEPT\n  ingress-priority: -32768\n  egress-priority: 32767\n";
+    let (zones, degraded) = parse::parse_list_all_zones(raw);
+
+    assert!(!zones.contains_key(&zone("broken")));
+    assert_eq!(zones[&zone("trusted")].ingress_priority.get(), -32_768);
+    assert_eq!(zones[&zone("trusted")].egress_priority.get(), 32_767);
+    assert_eq!(degraded.len(), 1);
+    assert!(degraded[0].contains("broken"));
+    assert!(degraded[0].contains("not-a-number"));
 }
 
 #[test]

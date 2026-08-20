@@ -18,9 +18,9 @@ use zbus::{Connection, proxy};
 
 use crate::application::ports::{FirewallBackend, FirewallError, OperationOutcome, StepReport};
 use crate::domain::{
-    ConfigurationTarget, FirewallOperation, FirewallSnapshot, FirewallStatus, ForwardPort,
-    IcmpType, InterfaceName, LogDenied, PortSpec, RichRule, ServiceName, SourceAddress,
-    ZoneDetails, ZoneName, ZoneTarget,
+    ConfigurationTarget, FeatureSupport, FirewallOperation, FirewallSnapshot, FirewallStatus,
+    FirewalldFeature, ForwardPort, IcmpType, InterfaceName, LogDenied, PortSpec, RichRule,
+    RulePriority, ServiceName, SourceAddress, ZoneDetails, ZoneName, ZoneTarget,
 };
 
 /// firewalld's main interface.
@@ -139,6 +139,8 @@ trait Config {
     default_service = "org.fedoraproject.FirewallD1"
 )]
 trait ConfigZone {
+    #[zbus(name = "getSettings2")]
+    fn get_settings2(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
     #[zbus(name = "getTarget")]
     fn get_target(&self) -> zbus::Result<String>;
     #[zbus(name = "getServices")]
@@ -167,6 +169,90 @@ pub struct DbusBackend {
     connection: Connection,
 }
 
+#[derive(Debug, Default)]
+struct ObservedZoneSettings {
+    target: ZoneTarget,
+    ingress_priority: RulePriority,
+    egress_priority: RulePriority,
+    incomplete: Vec<String>,
+}
+
+fn observe_zone_settings(
+    settings: &HashMap<String, OwnedValue>,
+    priority_support: FeatureSupport,
+) -> ObservedZoneSettings {
+    let target = settings
+        .get("target")
+        .and_then(|value| String::try_from(value.clone()).ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(ZoneTarget::Default);
+    let (ingress_priority, ingress_incomplete) = observe_priority(
+        settings,
+        "ingress_priority",
+        "ingress-priority",
+        priority_support,
+    );
+    let (egress_priority, egress_incomplete) = observe_priority(
+        settings,
+        "egress_priority",
+        "egress-priority",
+        priority_support,
+    );
+    let incomplete = ingress_incomplete
+        .into_iter()
+        .chain(egress_incomplete)
+        .collect();
+    ObservedZoneSettings {
+        target,
+        ingress_priority,
+        egress_priority,
+        incomplete,
+    }
+}
+
+fn observe_priority(
+    settings: &HashMap<String, OwnedValue>,
+    key: &'static str,
+    legacy_key: &'static str,
+    support: FeatureSupport,
+) -> (RulePriority, Option<String>) {
+    let Some(value) = settings.get(key).or_else(|| settings.get(legacy_key)) else {
+        return if support == FeatureSupport::Supported {
+            (
+                RulePriority::default(),
+                Some(format!("D-Bus settings omitted `{key}`")),
+            )
+        } else {
+            (RulePriority::default(), None)
+        };
+    };
+    match i32::try_from(value.clone())
+        .map_err(|_| format!("D-Bus `{key}` is not a signed integer"))
+        .and_then(|raw| RulePriority::new(raw).map_err(|err| err.to_string()))
+    {
+        Ok(priority) => (priority, None),
+        Err(reason) => (RulePriority::default(), Some(reason)),
+    }
+}
+
+fn zone_priority_degradations(
+    zone: &ZoneName,
+    target: ConfigurationTarget,
+    reasons: Vec<String>,
+) -> Vec<crate::domain::DegradedSection> {
+    reasons
+        .into_iter()
+        .map(|reason| {
+            crate::domain::DegradedSection::new(
+                crate::domain::SnapshotSection::Zones,
+                Some(target),
+                reason,
+            )
+            .with_object(zone.to_string())
+        })
+        .collect()
+}
+
 impl DbusBackend {
     /// Connects to the system bus. Fails cleanly if D-Bus or firewalld is absent.
     pub async fn connect() -> Result<Self, FirewallError> {
@@ -193,7 +279,8 @@ impl DbusBackend {
         &self,
         zone: &ZoneProxy<'_>,
         name: &ZoneName,
-    ) -> Result<ZoneDetails, FirewallError> {
+        priority_support: FeatureSupport,
+    ) -> Result<(ZoneDetails, Vec<String>), FirewallError> {
         let n = name.as_str();
         let (settings, services, ports, forwards, rich, interfaces, sources, icmp, masquerade) = tokio::join!(
             zone.get_zone_settings2(n),
@@ -206,13 +293,12 @@ impl DbusBackend {
             zone.get_icmp_blocks(n),
             zone.query_masquerade(n),
         );
+        let settings = settings.map_err(dbus_err)?;
+        let observed = observe_zone_settings(&settings, priority_support);
         let mut details = ZoneDetails::empty(name.clone());
-        details.target = settings
-            .map_err(dbus_err)?
-            .get("target")
-            .and_then(|v| String::try_from(v.clone()).ok())
-            .and_then(|t| t.parse().ok())
-            .unwrap_or(ZoneTarget::Default);
+        details.target = observed.target;
+        details.ingress_priority = observed.ingress_priority;
+        details.egress_priority = observed.egress_priority;
         details.services = parsed(&services.map_err(dbus_err)?, ServiceName::parse);
         details.ports = ports
             .map_err(dbus_err)?
@@ -229,7 +315,7 @@ impl DbusBackend {
         details.sources = parsed(&sources.map_err(dbus_err)?, SourceAddress::parse);
         details.icmp_blocks = parsed(&icmp.map_err(dbus_err)?, IcmpType::parse);
         details.masquerade = masquerade.map_err(dbus_err)?;
-        Ok(details)
+        Ok((details, observed.incomplete))
     }
 
     /// One zone's permanent config object. Errors propagate (e.g. a polkit
@@ -238,7 +324,8 @@ impl DbusBackend {
         &self,
         config: &ConfigProxy<'_>,
         raw: &str,
-    ) -> Result<Option<(ZoneName, ZoneDetails)>, FirewallError> {
+        priority_support: FeatureSupport,
+    ) -> Result<Option<(ZoneName, ZoneDetails, Vec<String>)>, FirewallError> {
         // Unparseable zone names are skipped, not fatal (forward compatibility).
         let Ok(name) = ZoneName::parse(raw) else {
             return Ok(None);
@@ -250,7 +337,19 @@ impl DbusBackend {
             .build()
             .await
             .map_err(dbus_err)?;
-        let (target, services, ports, forwards, rich, interfaces, sources, icmp, masquerade) = tokio::join!(
+        let (
+            settings,
+            target,
+            services,
+            ports,
+            forwards,
+            rich,
+            interfaces,
+            sources,
+            icmp,
+            masquerade,
+        ) = tokio::join!(
+            proxy.get_settings2(),
             proxy.get_target(),
             proxy.get_services(),
             proxy.get_ports(),
@@ -282,23 +381,53 @@ impl DbusBackend {
         details.sources = parsed(&sources.map_err(dbus_err)?, SourceAddress::parse);
         details.icmp_blocks = parsed(&icmp.map_err(dbus_err)?, IcmpType::parse);
         details.masquerade = masquerade.map_err(dbus_err)?;
-        Ok(Some((name, details)))
+        let incomplete = match settings {
+            Ok(settings) => {
+                let observed = observe_zone_settings(&settings, priority_support);
+                details.ingress_priority = observed.ingress_priority;
+                details.egress_priority = observed.egress_priority;
+                observed.incomplete
+            }
+            Err(err) if priority_support == FeatureSupport::Supported => vec![format!(
+                "D-Bus getSettings2 failed while reading zone priorities: {}",
+                dbus_err(err)
+            )],
+            Err(_) => Vec::new(),
+        };
+        Ok(Some((name, details, incomplete)))
     }
 
-    async fn permanent_zones(&self) -> Result<BTreeMap<ZoneName, ZoneDetails>, FirewallError> {
+    async fn permanent_zones(
+        &self,
+        priority_support: FeatureSupport,
+    ) -> Result<
+        (
+            BTreeMap<ZoneName, ZoneDetails>,
+            Vec<crate::domain::DegradedSection>,
+        ),
+        FirewallError,
+    > {
         let config = ConfigProxy::new(&self.connection).await.map_err(dbus_err)?;
         let names = config.get_zone_names().await.map_err(dbus_err)?;
         let fetched = futures_util::future::join_all(
-            names.iter().map(|raw| self.permanent_zone(&config, raw)),
+            names
+                .iter()
+                .map(|raw| self.permanent_zone(&config, raw, priority_support)),
         )
         .await;
         let mut zones = BTreeMap::new();
+        let mut degraded = Vec::new();
         for result in fetched {
-            if let Some((name, details)) = result? {
+            if let Some((name, details, incomplete)) = result? {
+                degraded.extend(zone_priority_degradations(
+                    &name,
+                    ConfigurationTarget::Permanent,
+                    incomplete,
+                ));
                 zones.insert(name, details);
             }
         }
-        Ok(zones)
+        Ok((zones, degraded))
     }
 }
 
@@ -340,6 +469,8 @@ impl FirewallBackend for DbusBackend {
         }
         let main = self.main().await?;
         let zone = self.zone().await?;
+        let priority_support =
+            FirewalldFeature::ZonePriorities.support_for(status.version.as_deref());
 
         let default_zone = ZoneName::parse(&main.get_default_zone().await.map_err(dbus_err)?)
             .map_err(|e| FirewallError::Parse(e.to_string()))?;
@@ -373,17 +504,25 @@ impl FirewallBackend for DbusBackend {
         let fetched = futures_util::future::join_all(names.into_iter().map(|name| {
             let zone = &zone;
             async move {
-                let details = self.runtime_zone(zone, &name).await?;
-                Ok::<_, FirewallError>((name, details))
+                let (details, incomplete) =
+                    self.runtime_zone(zone, &name, priority_support).await?;
+                Ok::<_, FirewallError>((name, details, incomplete))
             }
         }))
         .await;
         let mut runtime = BTreeMap::new();
+        let mut degraded = Vec::new();
         for result in fetched {
-            let (name, details) = result?;
+            let (name, details, incomplete) = result?;
+            degraded.extend(zone_priority_degradations(
+                &name,
+                ConfigurationTarget::Runtime,
+                incomplete,
+            ));
             runtime.insert(name, details);
         }
-        let permanent = self.permanent_zones().await?;
+        let (permanent, permanent_degraded) = self.permanent_zones(priority_support).await?;
+        degraded.extend(permanent_degraded);
         let available_services = parsed(
             &main.list_services().await.map_err(dbus_err)?,
             ServiceName::parse,
@@ -402,28 +541,31 @@ impl FirewallBackend for DbusBackend {
             available_services,
             policies: crate::domain::Scoped::default(),
             direct_rules: Vec::new(),
-            degraded: vec![
-                crate::domain::DegradedSection::new(
-                    crate::domain::SnapshotSection::IpSets,
-                    None,
-                    "not fetched by the D-Bus backend yet",
-                ),
-                crate::domain::DegradedSection::new(
-                    crate::domain::SnapshotSection::Policies,
-                    None,
-                    "not fetched by the D-Bus backend yet",
-                ),
-                crate::domain::DegradedSection::new(
-                    crate::domain::SnapshotSection::DirectRules,
-                    Some(crate::domain::ConfigurationTarget::Runtime),
-                    "not fetched by the D-Bus backend yet",
-                ),
-                crate::domain::DegradedSection::new(
-                    crate::domain::SnapshotSection::ServiceDefinitions,
-                    None,
-                    "not fetched by the D-Bus backend yet",
-                ),
-            ],
+            degraded: {
+                degraded.extend([
+                    crate::domain::DegradedSection::new(
+                        crate::domain::SnapshotSection::IpSets,
+                        None,
+                        "not fetched by the D-Bus backend yet",
+                    ),
+                    crate::domain::DegradedSection::new(
+                        crate::domain::SnapshotSection::Policies,
+                        None,
+                        "not fetched by the D-Bus backend yet",
+                    ),
+                    crate::domain::DegradedSection::new(
+                        crate::domain::SnapshotSection::DirectRules,
+                        Some(crate::domain::ConfigurationTarget::Runtime),
+                        "not fetched by the D-Bus backend yet",
+                    ),
+                    crate::domain::DegradedSection::new(
+                        crate::domain::SnapshotSection::ServiceDefinitions,
+                        None,
+                        "not fetched by the D-Bus backend yet",
+                    ),
+                ]);
+                degraded
+            },
         })
     }
 
@@ -666,6 +808,94 @@ fn pair_to_port(port: &str, protocol: &str) -> Option<PortSpec> {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zone_settings_observe_validated_priorities() {
+        let settings = HashMap::from([
+            ("ingress_priority".to_owned(), OwnedValue::from(-120_i32)),
+            ("egress_priority".to_owned(), OwnedValue::from(240_i32)),
+        ]);
+
+        let observed = observe_zone_settings(&settings, FeatureSupport::Supported);
+
+        assert_eq!(observed.target, ZoneTarget::Default);
+        assert_eq!(observed.ingress_priority.get(), -120);
+        assert_eq!(observed.egress_priority.get(), 240);
+        assert!(observed.incomplete.is_empty());
+    }
+
+    #[test]
+    fn supported_zone_priorities_require_complete_dbus_evidence() {
+        let settings = HashMap::new();
+
+        let observed = observe_zone_settings(&settings, FeatureSupport::Supported);
+
+        assert_eq!(observed.ingress_priority.get(), 0);
+        assert_eq!(observed.egress_priority.get(), 0);
+        assert_eq!(observed.incomplete.len(), 2);
+        assert!(
+            observed
+                .incomplete
+                .iter()
+                .any(|reason| reason.contains("ingress"))
+        );
+        assert!(
+            observed
+                .incomplete
+                .iter()
+                .any(|reason| reason.contains("egress"))
+        );
+    }
+
+    #[test]
+    fn unsupported_zone_priorities_do_not_fabricate_degradation() {
+        let observed = observe_zone_settings(&HashMap::new(), FeatureSupport::Unsupported);
+
+        assert_eq!(observed.ingress_priority.get(), 0);
+        assert_eq!(observed.egress_priority.get(), 0);
+        assert!(observed.incomplete.is_empty());
+    }
+
+    #[test]
+    fn invalid_dbus_priorities_remain_explicitly_incomplete() {
+        let settings = HashMap::from([
+            ("ingress_priority".to_owned(), OwnedValue::from(true)),
+            ("egress_priority".to_owned(), OwnedValue::from(40_000_i32)),
+        ]);
+
+        let observed = observe_zone_settings(&settings, FeatureSupport::Supported);
+
+        assert_eq!(observed.ingress_priority.get(), 0);
+        assert_eq!(observed.egress_priority.get(), 0);
+        assert!(
+            observed
+                .incomplete
+                .iter()
+                .any(|reason| reason.contains("signed integer"))
+        );
+        assert!(
+            observed
+                .incomplete
+                .iter()
+                .any(|reason| reason.contains("outside"))
+        );
+    }
+
+    #[test]
+    fn priority_degradation_keeps_zone_and_scope_identity() {
+        let zone = ZoneName::parse("public").expect("valid zone fixture");
+
+        let degraded = zone_priority_degradations(
+            &zone,
+            ConfigurationTarget::Permanent,
+            vec!["missing ingress priority".to_owned()],
+        );
+
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(degraded[0].section, crate::domain::SnapshotSection::Zones);
+        assert_eq!(degraded[0].target, Some(ConfigurationTarget::Permanent));
+        assert_eq!(degraded[0].object.as_deref(), Some("public"));
+    }
 
     #[test]
     fn method_error_maps_access_denied_to_permission_denied() {

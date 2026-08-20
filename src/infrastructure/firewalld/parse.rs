@@ -10,8 +10,8 @@ use std::str::FromStr;
 use crate::application::ports::FirewallError;
 use crate::domain::{
     ActiveZone, ForwardPort, IcmpType, InterfaceName, IpProtocol, IpSetInfo, IpSetName,
-    NetfilterBackend, PolicyDetails, PolicyName, PolicyTarget, RichRule, ServiceDefinition,
-    ServiceName, SourceAddress, ValidationError, ZoneDetails, ZoneName,
+    NetfilterBackend, PolicyDetails, PolicyName, PolicyTarget, RichRule, RulePriority,
+    ServiceDefinition, ServiceName, SourceAddress, ValidationError, ZoneDetails, ZoneName,
 };
 
 /// A parser rejection with a message naming the offending line/value.
@@ -178,6 +178,16 @@ fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseErro
                     .parse()
                     .map_err(|err: ValidationError| ParseError::new(err.to_string()))?;
             }
+            "ingress-priority" => {
+                details.ingress_priority = value.parse::<RulePriority>().map_err(|err| {
+                    ParseError::new(format!("invalid ingress priority `{value}`: {err}"))
+                })?;
+            }
+            "egress-priority" => {
+                details.egress_priority = value.parse::<RulePriority>().map_err(|err| {
+                    ParseError::new(format!("invalid egress priority `{value}`: {err}"))
+                })?;
+            }
             "interfaces" => {
                 details.interfaces = parse_items(value, InterfaceName::parse, "interface")?;
             }
@@ -217,8 +227,6 @@ fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseErro
                     );
                 }
             }
-            // ingress-priority / egress-priority are intentionally ignored
-            // (policy-only ordering that has no zone view yet).
             _ => {}
         }
     }

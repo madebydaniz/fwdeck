@@ -136,8 +136,8 @@ internal
 
 public (default, active)
   target: default
-  ingress-priority: 0
-  egress-priority: 0
+  ingress-priority: -120
+  egress-priority: 240
   icmp-block-inversion: no
   interfaces: eth0
   sources: 
@@ -186,4 +186,3 @@ work
   source-ports: 
   icmp-blocks: 
   rich rules: 
-
