@@ -17,6 +17,7 @@ pub mod proposal;
 pub mod restore;
 pub mod rich_rule;
 pub mod snapshot;
+pub mod traffic_test;
 pub mod zone;
 
 pub use address::{AddressFamily, IpSetEntry, SourceAddress};
@@ -43,5 +44,10 @@ pub use rich_rule::RichRule;
 pub use snapshot::{
     ConfigurationTarget, DegradedSection, FirewallSnapshot, FirewallStatus, IpSetInfo, LogDenied,
     NetfilterBackend, Scoped, ServiceDefinition, SnapshotSection,
+};
+pub use traffic_test::{
+    FirewallDecision, MAX_TRACE_STEPS, RulePriority, RulePriorityError, TraceObjectRef,
+    TrafficExpectation, TrafficTestStatus, TrafficTraceOutcome, TrafficTraceStage,
+    TrafficTraceStep, UnknownReason,
 };
 pub use zone::{ActiveZone, ZoneDetails, ZoneTarget};
