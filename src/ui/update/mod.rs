@@ -685,12 +685,20 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             if state.active_refresh != Some(schedule.id) {
                 return Vec::new();
             }
+            if matches!(
+                &result,
+                Ok(snapshot) if snapshot.identity().refresh_id() != schedule.id
+            ) {
+                return Vec::new();
+            }
             let selected = selected_row_id(state);
             state.active_refresh = None;
             state.refresh_overview = None;
             state.last_refresh = Some(observation);
             match result {
                 Ok(snapshot) => {
+                    let snapshot_identity = snapshot.identity();
+                    let snapshot = snapshot.into_snapshot();
                     state.backend_error = None;
                     // Postcondition check: EVERY operation applied since the
                     // last refresh must actually be visible in this fresh
@@ -726,6 +734,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                         state.session_baseline = Some(std::sync::Arc::clone(&snapshot));
                     }
                     state.snapshot = Some(snapshot);
+                    state.snapshot_identity = Some(snapshot_identity);
                 }
                 // Keep the stale snapshot: outdated data plus a visible error
                 // beats an empty screen.
@@ -1423,6 +1432,19 @@ mod tests {
         state
     }
 
+    fn observed(
+        id: crate::application::RefreshId,
+        snapshot: std::sync::Arc<crate::domain::FirewallSnapshot>,
+    ) -> crate::application::ObservedSnapshot {
+        crate::application::ObservedSnapshot::new(
+            crate::application::SnapshotIdentity::new(
+                id,
+                crate::application::SnapshotGeneration::new(std::num::NonZeroU64::MIN),
+            ),
+            snapshot,
+        )
+    }
+
     fn active_plan_id(state: &UiState) -> crate::application::PlanId {
         state.in_flight_plan_rollback.unwrap().id
     }
@@ -2005,7 +2027,7 @@ mod tests {
             &mut state,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule_for(id, crate::application::RefreshTrigger::Periodic),
-                result: Ok(std::sync::Arc::new(mock::sample().unwrap())),
+                result: Ok(observed(id, std::sync::Arc::new(mock::sample().unwrap()))),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::from_millis(20),
                 ),
@@ -2042,7 +2064,10 @@ mod tests {
                     stale_id,
                     crate::application::RefreshTrigger::Manual,
                 ),
-                result: Ok(std::sync::Arc::new(mock::sample().unwrap())),
+                result: Ok(observed(
+                    stale_id,
+                    std::sync::Arc::new(mock::sample().unwrap()),
+                )),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::from_millis(20),
                 ),
@@ -2053,6 +2078,46 @@ mod tests {
             state.refresh_overview.as_ref().map(|preview| preview.id),
             Some(current)
         );
+    }
+
+    #[test]
+    fn mismatched_snapshot_identity_cannot_complete_the_active_refresh() {
+        let mut state = state();
+        let active_id = crate::application::RefreshId::new(12);
+        let wrong_id = crate::application::RefreshId::new(11);
+        let original = std::sync::Arc::clone(state.snapshot.as_ref().unwrap());
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: active_id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(
+                    active_id,
+                    crate::application::RefreshTrigger::Periodic,
+                ),
+                result: Ok(observed(
+                    wrong_id,
+                    std::sync::Arc::new(mock::sample().unwrap()),
+                )),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::from_millis(20),
+                ),
+            },
+        );
+
+        assert_eq!(state.active_refresh, Some(active_id));
+        assert!(std::sync::Arc::ptr_eq(
+            state.snapshot.as_ref().unwrap(),
+            &original
+        ));
+        assert!(state.snapshot_identity.is_none());
+        assert!(state.last_refresh.is_none());
     }
 
     #[test]
@@ -2265,7 +2330,10 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule_for(RefreshId::new(1), RefreshTrigger::Manual),
-                result: Ok(Arc::new(mock::sample().unwrap())),
+                result: Ok(observed(
+                    RefreshId::new(1),
+                    Arc::new(mock::sample().unwrap()),
+                )),
                 observation: RefreshObservation::total_only(Duration::from_secs(9)),
             },
         );
@@ -2476,7 +2544,7 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule_for(refresh_id, RefreshTrigger::Manual),
-                result: Ok(Arc::clone(&completed_snapshot)),
+                result: Ok(observed(refresh_id, Arc::clone(&completed_snapshot))),
                 observation: completed_refresh.clone(),
             },
         );
@@ -2549,7 +2617,7 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule(),
-                result: Ok(snapshot),
+                result: Ok(observed(refresh_schedule().id, snapshot)),
                 observation: observation.clone(),
             },
         );
@@ -2767,7 +2835,10 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule(),
-                result: Ok(std::sync::Arc::new(refreshed)),
+                result: Ok(observed(
+                    refresh_schedule().id,
+                    std::sync::Arc::new(refreshed),
+                )),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::ZERO,
                 ),
@@ -3249,7 +3320,7 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule(),
-                result: Ok(snap),
+                result: Ok(observed(refresh_schedule().id, snap)),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::ZERO,
                 ),

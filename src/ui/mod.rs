@@ -1219,6 +1219,17 @@ mod tests {
                 },
                 result: mock::sample()
                     .map(Arc::new)
+                    .map(|snapshot| {
+                        crate::application::ObservedSnapshot::new(
+                            crate::application::SnapshotIdentity::new(
+                                refresh_id,
+                                crate::application::SnapshotGeneration::new(
+                                    std::num::NonZeroU64::MIN,
+                                ),
+                            ),
+                            snapshot,
+                        )
+                    })
                     .map_err(|error| FirewallError::Parse(error.to_string())),
                 observation: RefreshObservation::total_only(Duration::ZERO),
             })

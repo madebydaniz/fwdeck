@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ratatui::widgets::TableState;
 
 use crate::application::ports::FirewallError;
-use crate::application::{PlanId, RefreshId, RefreshOverview, RefreshPriority};
+use crate::application::{PlanId, RefreshId, RefreshOverview, RefreshPriority, SnapshotIdentity};
 use crate::config::Config;
 use crate::domain::LogEntry;
 use crate::domain::{
@@ -152,6 +152,8 @@ pub struct UiState {
     pub overlay_scroll: u16,
     /// Latest firewall snapshot, if a refresh has succeeded yet.
     pub snapshot: Option<Arc<FirewallSnapshot>>,
+    /// Identity of the exact authoritative snapshot currently displayed.
+    pub snapshot_identity: Option<SnapshotIdentity>,
     /// The first successful snapshot of the session — the baseline the
     /// "session diff" compares the current state against.
     pub session_baseline: Option<Arc<FirewallSnapshot>>,
@@ -257,6 +259,7 @@ impl UiState {
             overlays: Vec::new(),
             overlay_scroll: 0,
             snapshot: None,
+            snapshot_identity: None,
             session_baseline: None,
             active_refresh: None,
             refresh_overview: None,

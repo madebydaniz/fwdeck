@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod engine;
+mod observation;
 pub mod ports;
 mod refresh_scheduler;
 
@@ -12,6 +13,7 @@ pub use api::{
     RefreshPriority, RefreshPriorityPublisher, RefreshPrioritySource, RefreshScheduleObservation,
     RefreshTrigger, RollbackRegistration, RollbackRequest, refresh_priority_channel,
 };
+pub use observation::{ObservedSnapshot, SnapshotGeneration, SnapshotIdentity};
 pub use ports::{
     FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardError,
     RollbackGuardId, StepReport,

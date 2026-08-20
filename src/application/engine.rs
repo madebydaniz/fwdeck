@@ -20,6 +20,7 @@ use super::api::{
     RefreshPrioritySource, RefreshScheduleObservation, RefreshTrigger, RollbackRegistration,
     RollbackRequest,
 };
+use super::observation::SnapshotPublisher;
 use super::ports::{
     FirewallBackend, FirewallError, OperationOutcome, OverviewRead, RollbackGuard, RollbackGuardId,
     SnapshotRead, StepReport,
@@ -81,6 +82,11 @@ enum ReconciliationOutcome {
 enum EngineWork {
     Normal(EngineRequest),
     Rollback(RollbackRequest),
+}
+
+struct RefreshLifecycleOutput<'a> {
+    events: &'a mpsc::Sender<EngineEvent>,
+    snapshot_publisher: &'a mut SnapshotPublisher,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +271,7 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
     rollback_timeout: Duration,
 ) {
     let mut scheduler = RefreshScheduler::new();
+    let mut snapshot_publisher = SnapshotPublisher::new();
     let timer = tokio::time::sleep(refresh_interval);
     tokio::pin!(timer);
     let mut periodic_deadline = PeriodicDeadline::new(timer.as_mut());
@@ -300,6 +307,7 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
                 &mut inputs,
                 &mut pending_requests,
                 &mut scheduler,
+                &mut snapshot_publisher,
                 &mut periodic_deadline,
                 read_only,
                 rollback_timeout,
@@ -369,7 +377,10 @@ pub(crate) async fn run<B: FirewallBackend, G: RollbackGuard>(
         match drive_ordinary_lifecycle(
             &backend,
             &mut inputs,
-            &events,
+            RefreshLifecycleOutput {
+                events: &events,
+                snapshot_publisher: &mut snapshot_publisher,
+            },
             &refresh_priority,
             &mut scheduler,
             &mut periodic_deadline,
@@ -442,19 +453,19 @@ async fn absorb_observed_requests(
 async fn drive_ordinary_lifecycle<B: FirewallBackend>(
     backend: &B,
     inputs: &mut EngineReceivers,
-    events: &mpsc::Sender<EngineEvent>,
+    output: RefreshLifecycleOutput<'_>,
     refresh_priority: &RefreshPrioritySource,
     scheduler: &mut RefreshScheduler,
     periodic_deadline: &mut PeriodicDeadline<'_>,
     start: RefreshStart,
 ) -> OrdinaryLifecycleOutcome {
-    if send_refresh_started(events, start).await.is_err() {
+    if send_refresh_started(output.events, start).await.is_err() {
         return OrdinaryLifecycleOutcome::Shutdown;
     }
     match drive_ordinary_refresh(
         backend,
         inputs,
-        events,
+        output.events,
         refresh_priority,
         scheduler,
         periodic_deadline,
@@ -463,7 +474,15 @@ async fn drive_ordinary_lifecycle<B: FirewallBackend>(
     .await
     {
         OrdinaryRefreshOutcome::Completed(read) => {
-            match finish_ordinary_refresh(events, scheduler, start, *read).await {
+            match finish_ordinary_refresh(
+                output.events,
+                scheduler,
+                output.snapshot_publisher,
+                start,
+                *read,
+            )
+            .await
+            {
                 Ok(trailing_manual) => OrdinaryLifecycleOutcome::Completed { trailing_manual },
                 Err(()) => OrdinaryLifecycleOutcome::Shutdown,
             }
@@ -475,7 +494,7 @@ async fn drive_ordinary_lifecycle<B: FirewallBackend>(
             stage,
             elapsed,
         } => {
-            if send_refresh_cancelled(events, schedule, reason, stage, elapsed)
+            if send_refresh_cancelled(output.events, schedule, reason, stage, elapsed)
                 .await
                 .is_err()
             {
@@ -790,6 +809,7 @@ async fn reconcile_after_request<B: FirewallBackend, G: RollbackGuard>(
     inputs: &mut EngineReceivers,
     pending_requests: &mut VecDeque<EngineRequest>,
     scheduler: &mut RefreshScheduler,
+    snapshot_publisher: &mut SnapshotPublisher,
     periodic_deadline: &mut PeriodicDeadline<'_>,
     read_only: bool,
     rollback_timeout: Duration,
@@ -817,7 +837,7 @@ async fn reconcile_after_request<B: FirewallBackend, G: RollbackGuard>(
                 priority_rollback,
             } => {
                 trailing_manual |= completion.trailing_manual;
-                send_refresh_finished(events, completion, *read).await?;
+                send_refresh_finished(events, snapshot_publisher, completion, *read).await?;
                 let Some(rollback) = priority_rollback else {
                     return Ok(ReconciliationOutcome::Completed { trailing_manual });
                 };
@@ -868,6 +888,7 @@ async fn reconcile_after_request<B: FirewallBackend, G: RollbackGuard>(
 async fn finish_ordinary_refresh(
     events: &mpsc::Sender<EngineEvent>,
     scheduler: &mut RefreshScheduler,
+    snapshot_publisher: &mut SnapshotPublisher,
     start: RefreshStart,
     read: StagedSnapshotRead,
 ) -> Result<bool, ()> {
@@ -876,7 +897,7 @@ async fn finish_ordinary_refresh(
         return Err(());
     };
     let trailing_manual = completion.trailing_manual;
-    send_refresh_finished(events, completion, read).await?;
+    send_refresh_finished(events, snapshot_publisher, completion, read).await?;
     Ok(trailing_manual)
 }
 
@@ -1359,6 +1380,7 @@ fn append_warning(current: &mut Option<String>, warning: String) {
 /// Returns `Err(())` when the event channel is closed (UI is gone).
 async fn send_refresh_finished(
     events: &mpsc::Sender<EngineEvent>,
+    snapshot_publisher: &mut SnapshotPublisher,
     completion: RefreshCompletion,
     staged: StagedSnapshotRead,
 ) -> Result<(), ()> {
@@ -1367,7 +1389,20 @@ async fn send_refresh_finished(
         overview_elapsed,
         hydration_elapsed,
     } = staged;
-    let result = read.result.map(Arc::new);
+    let result = match read.result {
+        Ok(snapshot) => {
+            let snapshot = Arc::new(snapshot);
+            let Ok(observed) = snapshot_publisher.publish(completion.schedule.id, snapshot) else {
+                tracing::error!(
+                    refresh_id = completion.schedule.id.get(),
+                    "snapshot publication identity exhausted"
+                );
+                return Err(());
+            };
+            Ok(observed)
+        }
+        Err(error) => Err(error),
+    };
     let observation = read.observation;
     match &result {
         Ok(snapshot) => tracing::debug!(
@@ -2436,7 +2471,7 @@ mod tests {
             EngineEvent::RefreshFinished {
                 result: Ok(snapshot),
                 ..
-            } => snapshot,
+            } => snapshot.into_snapshot(),
             other => panic!("expected initial snapshot, got {other:?}"),
         };
         let operation = FirewallOperation::RemovePort {
@@ -2490,7 +2525,7 @@ mod tests {
             EngineEvent::RefreshFinished {
                 result: Ok(snapshot),
                 ..
-            } => snapshot,
+            } => snapshot.into_snapshot(),
             other => panic!("expected initial snapshot, got {other:?}"),
         };
         let operations = vec![FirewallOperation::Reload, FirewallOperation::Reload];
@@ -2870,6 +2905,83 @@ mod tests {
         assert_eq!(staged.read.observation.process_count, Some(8));
         assert_eq!(staged.read.observation.sections.len(), 2);
         assert_eq!(backend.hydration_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_does_not_consume_a_snapshot_generation() {
+        let (event_tx, mut event_rx) = mpsc::channel(3);
+        let mut publisher = SnapshotPublisher::new();
+        let completion = |id| RefreshCompletion {
+            schedule: RefreshScheduleObservation {
+                id: RefreshId::new(id),
+                trigger: RefreshTrigger::Manual,
+                merged_manual_requests: 0,
+                coalesced_periodic_ticks: 0,
+            },
+            trailing_manual: false,
+        };
+        let staged = |result| StagedSnapshotRead {
+            read: SnapshotRead {
+                result,
+                observation: RefreshObservation::total_only(Duration::ZERO),
+            },
+            overview_elapsed: Duration::ZERO,
+            hydration_elapsed: Duration::ZERO,
+        };
+
+        send_refresh_finished(
+            &event_tx,
+            &mut publisher,
+            completion(21),
+            staged(mock::sample().map_err(|error| FirewallError::Parse(error.to_string()))),
+        )
+        .await
+        .unwrap();
+        send_refresh_finished(
+            &event_tx,
+            &mut publisher,
+            completion(22),
+            staged(Err(FirewallError::DaemonNotRunning)),
+        )
+        .await
+        .unwrap();
+        send_refresh_finished(
+            &event_tx,
+            &mut publisher,
+            completion(23),
+            staged(mock::sample().map_err(|error| FirewallError::Parse(error.to_string()))),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(snapshot),
+                ..
+            } if schedule.id == RefreshId::new(21)
+                && snapshot.identity().refresh_id() == RefreshId::new(21)
+                && snapshot.identity().generation().get() == 1
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Err(FirewallError::DaemonNotRunning),
+                ..
+            } if schedule.id == RefreshId::new(22)
+        ));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::RefreshFinished {
+                schedule,
+                result: Ok(snapshot),
+                ..
+            } if schedule.id == RefreshId::new(23)
+                && snapshot.identity().refresh_id() == RefreshId::new(23)
+                && snapshot.identity().generation().get() == 2
+        ));
     }
 
     #[tokio::test]
