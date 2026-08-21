@@ -11,7 +11,8 @@ use crate::application::ports::FirewallError;
 use crate::domain::{
     ActiveZone, ForwardPort, IcmpType, InterfaceName, IpProtocol, IpSetInfo, IpSetName,
     NetfilterBackend, PolicyDetails, PolicyName, PolicyTarget, RichRule, RulePriority,
-    ServiceDefinition, ServiceName, SourceAddress, ValidationError, ZoneDetails, ZoneName,
+    ServiceDefinition, ServiceDestination, ServiceModuleName, ServiceName, SourceAddress,
+    ValidationError, ZoneDetails, ZoneName,
 };
 
 /// A parser rejection with a message naming the offending line/value.
@@ -411,28 +412,71 @@ pub fn parse_ipset_info(raw: &str) -> IpSetInfo {
     info
 }
 
-/// `--info-service=<name>` block: `ports:` and `protocols:` lines. Unknown
-/// or malformed port entries are skipped — definitions are display-only.
-#[must_use]
-pub fn parse_service_info(raw: &str) -> ServiceDefinition {
+/// `--info-service=<name>` block. Unknown attributes are ignored for forward
+/// compatibility, while every consumed value is validated strictly.
+pub fn parse_service_info(raw: &str) -> Result<ServiceDefinition, ParseError> {
     let mut definition = ServiceDefinition::default();
     for line in raw.lines() {
         if let Some((key, value)) = line.trim_start().split_once(':') {
             match key.trim() {
                 "ports" => {
-                    definition.ports = value
-                        .split_whitespace()
-                        .filter_map(|spec| spec.parse().ok())
-                        .collect();
+                    definition.ports = parse_items(value, str::parse, "service port")?;
                 }
                 "protocols" => {
-                    definition.protocols = value.split_whitespace().map(str::to_owned).collect();
+                    definition.protocols =
+                        parse_items(value, IpProtocol::parse, "service protocol")?;
+                }
+                "source-ports" => {
+                    definition.source_ports =
+                        parse_items(value, str::parse, "service source port")?;
+                }
+                "destination" => {
+                    definition.destinations = value
+                        .split_whitespace()
+                        .map(parse_service_destination)
+                        .collect::<Result<_, _>>()?;
+                }
+                "includes" => {
+                    definition.includes =
+                        parse_items(value, ServiceName::parse, "included service")?;
+                }
+                "helpers" => {
+                    definition.helpers = parse_items(value, ServiceName::parse, "service helper")?;
+                }
+                "modules" => {
+                    definition.modules =
+                        parse_items(value, ServiceModuleName::parse, "service module")?;
                 }
                 _ => {}
             }
         }
     }
-    definition
+    Ok(definition)
+}
+
+fn parse_service_destination(raw: &str) -> Result<ServiceDestination, ParseError> {
+    let (family, address) = raw.split_once(':').ok_or_else(|| {
+        ParseError::new(format!(
+            "invalid service destination `{raw}`: expected ipv4:<address> or ipv6:<address>"
+        ))
+    })?;
+    let family = match family {
+        "ipv4" => crate::domain::AddressFamily::Ipv4,
+        "ipv6" => crate::domain::AddressFamily::Ipv6,
+        _ => {
+            return Err(ParseError::new(format!(
+                "invalid service destination family `{family}`"
+            )));
+        }
+    };
+    let address = SourceAddress::parse(address)
+        .map_err(|err| ParseError::new(format!("invalid service destination `{raw}`: {err}")))?;
+    if address.family() != Some(family) {
+        return Err(ParseError::new(format!(
+            "service destination `{raw}` does not match its family"
+        )));
+    }
+    Ok(ServiceDestination { family, address })
 }
 
 /// `--direct --get-all-rules`: raw lines, kept verbatim (deprecated feature,

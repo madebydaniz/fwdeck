@@ -15,7 +15,8 @@ use super::address::{AddressFamily, SourceAddress};
 use super::ids::{IpSetName, ServiceName, ZoneName};
 use super::port::{PortSelector, PortSpec};
 use super::rich_rule::RichRule;
-use super::snapshot::{FirewallSnapshot, IpSetInfo, ServiceDefinition};
+use super::service::ServiceDefinition;
+use super::snapshot::{FirewallSnapshot, IpSetInfo};
 use super::zone::{ZoneDetails, ZoneTarget};
 
 /// Explains how firewalld would treat ingress traffic from `source` to

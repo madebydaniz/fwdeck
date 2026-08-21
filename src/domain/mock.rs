@@ -9,9 +9,9 @@ use super::ids::{InterfaceName, IpSetName, PolicyName, ServiceName, ValidationEr
 use super::policy::PolicyDetails;
 use super::port::{ForwardPort, Protocol};
 use super::rich_rule::RichRule;
+use super::service::ServiceDefinition;
 use super::snapshot::{
     FirewallSnapshot, FirewallStatus, IpSetInfo, LogDenied, NetfilterBackend, Scoped,
-    ServiceDefinition,
 };
 use super::zone::{ActiveZone, ZoneDetails, ZoneTarget};
 
@@ -134,7 +134,7 @@ pub fn sample() -> Result<FirewallSnapshot, ValidationError> {
             ServiceName::parse(name)?,
             ServiceDefinition {
                 ports: vec![ports.parse()?],
-                protocols: Vec::new(),
+                ..ServiceDefinition::default()
             },
         );
     }

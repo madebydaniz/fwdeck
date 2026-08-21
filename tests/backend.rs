@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -88,6 +88,7 @@ struct StagedFixtureControl {
     release_background_detail: Semaphore,
     failed_service: Mutex<Option<String>>,
     failed_runtime_policy: Mutex<Option<String>>,
+    service_info: Mutex<BTreeMap<String, String>>,
     seen: Mutex<Vec<Vec<String>>>,
 }
 
@@ -116,6 +117,13 @@ impl StagedFixtureControl {
 
     fn fail_runtime_policy(&self, name: &str) {
         *self.failed_runtime_policy.lock().unwrap() = Some(name.to_owned());
+    }
+
+    fn set_service_info(&self, name: &str, raw: &str) {
+        self.service_info
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), raw.to_owned());
     }
 
     fn service_should_fail(&self, argument: &str) -> bool {
@@ -156,6 +164,7 @@ fn staged_backend_fixture() -> (CliBackend<StagedFixtureRunner>, Arc<StagedFixtu
         release_background_detail: Semaphore::new(0),
         failed_service: Mutex::new(None),
         failed_runtime_policy: Mutex::new(None),
+        service_info: Mutex::new(BTreeMap::new()),
         seen: Mutex::new(Vec::new()),
     });
     (
@@ -236,7 +245,14 @@ impl CommandRunner for StagedFixtureRunner {
             [service] if self.control.service_should_fail(service) => {
                 return Ok(output(Some(13), "", "selected service detail failed"));
             }
-            [service] if service.starts_with("--info-service=") => INFO_SERVICE.to_owned(),
+            [service] if service.starts_with("--info-service=") => self
+                .control
+                .service_info
+                .lock()
+                .unwrap()
+                .get(service.trim_start_matches("--info-service="))
+                .cloned()
+                .unwrap_or_else(|| INFO_SERVICE.to_owned()),
             unexpected => panic!("unexpected fixture command: {unexpected:?}"),
         };
         Ok(output(Some(0), &stdout, ""))
@@ -361,6 +377,155 @@ async fn staged_service_failure_is_exactly_degraded() {
     assert_eq!(failure.target, None);
     assert_eq!(failure.object.as_deref(), Some("ssh"));
     assert!(failure.reason.contains("selected service detail failed"));
+}
+
+#[tokio::test]
+async fn staged_service_parse_failure_is_exactly_degraded() {
+    let (backend, control) = staged_backend_fixture();
+    let (_publisher, priority) = refresh_priority_channel();
+    control.set_service_info("ssh", "ssh\n  ports: invalid\n");
+
+    let overview = backend
+        .snapshot_overview(&priority)
+        .await
+        .result
+        .unwrap()
+        .unwrap();
+    let hydration = backend.snapshot_hydrated(Some(overview), &priority);
+    tokio::pin!(hydration);
+    assert!(futures_util::poll!(&mut hydration).is_pending());
+    control.wait_for_background_detail().await;
+    control.release_background_detail();
+    let snapshot = hydration.await.result.unwrap();
+
+    let ssh = ServiceName::parse("ssh").unwrap();
+    assert!(!snapshot.service_definitions.contains_key(&ssh));
+    let failure = snapshot
+        .degraded
+        .iter()
+        .find(|failure| failure.object.as_deref() == Some("ssh"))
+        .unwrap();
+    assert_eq!(failure.section, SnapshotSection::ServiceDefinitions);
+    assert!(failure.reason.contains("invalid"));
+}
+
+#[tokio::test]
+async fn staged_hydration_fetches_transitive_service_includes() {
+    let (backend, control) = staged_backend_fixture();
+    let (_publisher, priority) = refresh_priority_channel();
+    control.set_service_info("ssh", "ssh\n  ports: 22/tcp\n  includes: shared-base\n");
+    control.set_service_info("shared-base", "shared-base\n  protocols: gre\n");
+
+    let overview = backend
+        .snapshot_overview(&priority)
+        .await
+        .result
+        .unwrap()
+        .unwrap();
+    let hydration = backend.snapshot_hydrated(Some(overview), &priority);
+    tokio::pin!(hydration);
+    assert!(futures_util::poll!(&mut hydration).is_pending());
+    control.wait_for_background_detail().await;
+    control.release_background_detail();
+    let snapshot = hydration.await.result.unwrap();
+
+    let included = ServiceName::parse("shared-base").unwrap();
+    assert!(snapshot.service_definitions.contains_key(&included));
+    assert!(
+        control
+            .detail_commands()
+            .contains(&vec!["--info-service=shared-base".to_owned()])
+    );
+    assert!(!snapshot.degraded.iter().any(|failure| {
+        failure.section == SnapshotSection::ServiceDefinitions
+            && failure.object.as_deref() == Some("ssh")
+    }));
+}
+
+#[tokio::test]
+async fn cached_parent_retries_an_unresolved_service_include() {
+    let (backend, control) = staged_backend_fixture();
+    let (_publisher, priority) = refresh_priority_channel();
+    control.set_service_info("ssh", "ssh\n  ports: 22/tcp\n  includes: shared-base\n");
+    control.set_service_info("shared-base", "shared-base\n  ports: invalid\n");
+    let overview = backend
+        .snapshot_overview(&priority)
+        .await
+        .result
+        .unwrap()
+        .unwrap();
+
+    control.release_background_detail();
+    let first = backend
+        .snapshot_hydrated(Some(overview.clone()), &priority)
+        .await
+        .result
+        .unwrap();
+    assert!(
+        !first
+            .service_definitions
+            .contains_key(&ServiceName::parse("shared-base").unwrap())
+    );
+
+    control.set_service_info("shared-base", "shared-base\n  protocols: gre\n");
+    let second = backend
+        .snapshot_hydrated(Some(overview), &priority)
+        .await
+        .result
+        .unwrap();
+
+    assert!(
+        second
+            .service_definitions
+            .contains_key(&ServiceName::parse("shared-base").unwrap())
+    );
+    let include_fetches = control
+        .detail_commands()
+        .iter()
+        .filter(|args| args.as_slice() == ["--info-service=shared-base"])
+        .count();
+    assert_eq!(include_fetches, 2);
+}
+
+#[tokio::test]
+async fn cancelled_staged_hydration_publishes_no_partial_service_cache() {
+    let (backend, control) = staged_backend_fixture();
+    let (_publisher, priority) = refresh_priority_channel();
+    let overview = backend
+        .snapshot_overview(&priority)
+        .await
+        .result
+        .unwrap()
+        .unwrap();
+
+    let completed_service = {
+        let hydration = backend.snapshot_hydrated(Some(overview.clone()), &priority);
+        tokio::pin!(hydration);
+        assert!(futures_util::poll!(&mut hydration).is_pending());
+        control.wait_for_background_detail().await;
+        control
+            .detail_commands()
+            .into_iter()
+            .find(|args| {
+                args.first().is_some_and(|arg| {
+                    arg.starts_with("--info-service=") && !arg.ends_with("background")
+                })
+            })
+            .unwrap()
+    };
+
+    control.release_background_detail();
+    let second = backend.snapshot_hydrated(Some(overview), &priority).await;
+    assert!(second.result.is_ok());
+    let repeated = control
+        .detail_commands()
+        .iter()
+        .filter(|args| **args == completed_service)
+        .count();
+    assert_eq!(
+        repeated, 2,
+        "a cancelled hydration must not publish completed sibling definitions"
+    );
 }
 
 #[tokio::test]

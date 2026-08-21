@@ -94,6 +94,13 @@ impl DetailQueue {
         }
     }
 
+    pub(super) fn extend(&mut self, work: impl IntoIterator<Item = DetailWork>) {
+        self.pending.extend(work);
+        self.pending
+            .sort_by(|left, right| left.stable_key().cmp(&right.stable_key()));
+        self.pending.dedup();
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }

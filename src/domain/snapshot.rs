@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use super::ids::{IpSetName, PolicyName, ServiceName, ZoneName};
 use super::policy::PolicyDetails;
-use super::port::PortSpec;
+use super::service::ServiceDefinition;
 use super::zone::{ActiveZone, ZoneDetails};
 
 /// Which configuration a query or mutation applies to.
@@ -319,15 +319,6 @@ pub struct FirewallStatus {
     pub panic_mode: bool,
 }
 
-/// Static definition of a firewalld service (from `--info-service`).
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-pub struct ServiceDefinition {
-    /// Ports the service opens.
-    pub ports: Vec<PortSpec>,
-    /// Raw IP protocols (e.g. `igmp`) beyond port-based rules.
-    pub protocols: Vec<String>,
-}
-
 /// One scope's info for an ipset (from `--info-ipset`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct IpSetInfo {
@@ -352,7 +343,8 @@ pub struct FirewallSnapshot {
     pub permanent: BTreeMap<ZoneName, ZoneDetails>,
     /// Known ipsets and their entries, separated by configuration scope.
     pub ipsets: Scoped<BTreeMap<IpSetName, IpSetInfo>>,
-    /// Definitions for services referenced by any zone (ports/protocols).
+    /// Complete definitions for services referenced by any zone and their
+    /// transitively included services.
     pub service_definitions: BTreeMap<ServiceName, ServiceDefinition>,
     /// Every service firewalld knows about (`--get-services`), for browsing.
     pub available_services: Vec<ServiceName>,

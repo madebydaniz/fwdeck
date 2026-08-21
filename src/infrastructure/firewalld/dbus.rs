@@ -18,10 +18,19 @@ use zbus::{Connection, proxy};
 
 use crate::application::ports::{FirewallBackend, FirewallError, OperationOutcome, StepReport};
 use crate::domain::{
-    ConfigurationTarget, FeatureSupport, FirewallOperation, FirewallSnapshot, FirewallStatus,
-    FirewalldFeature, ForwardPort, IcmpType, InterfaceName, LogDenied, PortSpec, RichRule,
-    RulePriority, ServiceName, SourceAddress, ZoneDetails, ZoneName, ZoneTarget,
+    ConfigurationTarget, DegradedSection, FeatureSupport, FirewallOperation, FirewallSnapshot,
+    FirewallStatus, FirewalldFeature, ForwardPort, IcmpType, InterfaceName, LogDenied, PortSpec,
+    RichRule, RulePriority, ServiceName, SnapshotSection, SourceAddress, ZoneDetails, ZoneName,
+    ZoneTarget,
 };
+
+fn incomplete_service_definitions() -> DegradedSection {
+    DegradedSection::new(
+        SnapshotSection::ServiceDefinitions,
+        None,
+        "not fetched by the D-Bus backend yet",
+    )
+}
 
 /// firewalld's main interface.
 #[proxy(
@@ -558,11 +567,7 @@ impl FirewallBackend for DbusBackend {
                         Some(crate::domain::ConfigurationTarget::Runtime),
                         "not fetched by the D-Bus backend yet",
                     ),
-                    crate::domain::DegradedSection::new(
-                        crate::domain::SnapshotSection::ServiceDefinitions,
-                        None,
-                        "not fetched by the D-Bus backend yet",
-                    ),
+                    incomplete_service_definitions(),
                 ]);
                 degraded
             },
@@ -822,6 +827,16 @@ mod tests {
         assert_eq!(observed.ingress_priority.get(), -120);
         assert_eq!(observed.egress_priority.get(), 240);
         assert!(observed.incomplete.is_empty());
+    }
+
+    #[test]
+    fn dbus_never_presents_empty_service_definitions_as_complete() {
+        let degraded = incomplete_service_definitions();
+
+        assert_eq!(degraded.section, SnapshotSection::ServiceDefinitions);
+        assert_eq!(degraded.target, None);
+        assert_eq!(degraded.object, None);
+        assert!(degraded.reason.contains("not fetched"));
     }
 
     #[test]

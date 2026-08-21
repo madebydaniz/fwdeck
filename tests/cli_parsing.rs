@@ -14,6 +14,7 @@ const ACTIVE_ZONES: &str = include_str!("fixtures/firewall_cmd/active_zones.txt"
 const DEFAULT_ZONE: &str = include_str!("fixtures/firewall_cmd/default_zone.txt");
 const MALFORMED: &str = include_str!("fixtures/firewall_cmd/malformed.txt");
 const CONF_BACKEND: &str = include_str!("fixtures/firewall_cmd/firewalld_conf_backend.txt");
+const INFO_SERVICE: &str = include_str!("fixtures/firewall_cmd/info_service.txt");
 
 fn zone(name: &str) -> ZoneName {
     ZoneName::parse(name).unwrap()
@@ -192,6 +193,44 @@ fn conf_backend_fixture_detects_nftables() {
         parse::parse_conf_backend(CONF_BACKEND),
         NetfilterBackend::Nftables
     );
+}
+
+#[test]
+fn service_definition_fixture_preserves_every_relevant_field() {
+    let definition = parse::parse_service_info(INFO_SERVICE).unwrap();
+
+    assert_eq!(definition.ports.len(), 2);
+    assert_eq!(definition.protocols[0].as_str(), "gre");
+    assert_eq!(definition.source_ports[0].to_string(), "1024-65535/tcp");
+    assert_eq!(definition.destinations.len(), 2);
+    assert_eq!(definition.modules[0].as_str(), "nf_conntrack_ftp");
+    assert_eq!(definition.helpers[0].as_str(), "ftp");
+}
+
+#[test]
+fn service_definition_includes_are_typed_and_ordered() {
+    let raw = "root\n  ports: 443/tcp\n  includes: alpha bravo\n";
+    let definition = parse::parse_service_info(raw).unwrap();
+
+    assert_eq!(
+        definition
+            .includes
+            .iter()
+            .map(fwdeck::domain::ServiceName::as_str)
+            .collect::<Vec<_>>(),
+        vec!["alpha", "bravo"]
+    );
+}
+
+#[test]
+fn malformed_service_evidence_is_rejected_instead_of_skipped() {
+    for raw in [
+        "broken\n  ports: not-a-port\n",
+        "broken\n  destination: ipv4:not-an-address\n",
+        "broken\n  includes: bad/include\n",
+    ] {
+        assert!(parse::parse_service_info(raw).is_err(), "accepted `{raw}`");
+    }
 }
 
 const GET_IPSETS: &str = include_str!("fixtures/firewall_cmd/get_ipsets.txt");
