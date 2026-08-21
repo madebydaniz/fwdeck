@@ -9,8 +9,8 @@ use std::str::FromStr;
 
 use crate::application::ports::FirewallError;
 use crate::domain::{
-    ActiveZone, ForwardPort, IcmpType, InterfaceName, IpProtocol, IpSetInfo, IpSetName,
-    NetfilterBackend, PolicyDetails, PolicyName, PolicyTarget, RichRule, RulePriority,
+    ActiveZone, FeatureSupport, ForwardPort, IcmpType, InterfaceName, IpProtocol, IpSetInfo,
+    IpSetName, NetfilterBackend, PolicyDetails, PolicyName, PolicyTarget, RichRule, RulePriority,
     ServiceDefinition, ServiceDestination, ServiceModuleName, ServiceName, SourceAddress,
     ValidationError, ZoneDetails, ZoneName,
 };
@@ -86,6 +86,17 @@ pub fn parse_active_zones(raw: &str) -> Result<BTreeMap<ZoneName, ActiveZone>, P
 /// multi-value sections (forward-ports, rich rules).
 #[must_use]
 pub fn parse_list_all_zones(raw: &str) -> (BTreeMap<ZoneName, ZoneDetails>, Vec<String>) {
+    parse_list_all_zones_with_priority_support(raw, FeatureSupport::Unsupported)
+}
+
+/// Parses zone listings while enforcing priority-field completeness unless the
+/// daemon is known to predate zone priorities. Older daemons legitimately omit
+/// these fields and keep the domain defaults without degradation.
+#[must_use]
+pub fn parse_list_all_zones_with_priority_support(
+    raw: &str,
+    priority_support: FeatureSupport,
+) -> (BTreeMap<ZoneName, ZoneDetails>, Vec<String>) {
     let mut zones: BTreeMap<ZoneName, ZoneDetails> = BTreeMap::new();
     let mut degraded: Vec<String> = Vec::new();
 
@@ -99,12 +110,12 @@ pub fn parse_list_all_zones(raw: &str) -> (BTreeMap<ZoneName, ZoneDetails>, Vec<
             continue;
         }
         if !line.starts_with([' ', '\t']) && !block.is_empty() {
-            flush_zone_block(&block, &mut zones, &mut degraded);
+            flush_zone_block(&block, priority_support, &mut zones, &mut degraded);
             block.clear();
         }
         block.push(line);
     }
-    flush_zone_block(&block, &mut zones, &mut degraded);
+    flush_zone_block(&block, priority_support, &mut zones, &mut degraded);
     (zones, degraded)
 }
 
@@ -112,14 +123,16 @@ pub fn parse_list_all_zones(raw: &str) -> (BTreeMap<ZoneName, ZoneDetails>, Vec<
 /// instead of failing the whole listing when a single zone is malformed.
 fn flush_zone_block(
     block: &[&str],
+    priority_support: FeatureSupport,
     zones: &mut BTreeMap<ZoneName, ZoneDetails>,
     degraded: &mut Vec<String>,
 ) {
     if block.is_empty() {
         return;
     }
-    match parse_zone_block(block) {
-        Ok((zone, details)) => {
+    match parse_zone_block(block, priority_support) {
+        Ok((zone, details, warnings)) => {
+            degraded.extend(warnings);
             zones.insert(zone, details);
         }
         Err(err) => {
@@ -129,7 +142,11 @@ fn flush_zone_block(
     }
 }
 
-fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseError> {
+#[allow(clippy::too_many_lines)] // one strict branch per observed zone attribute
+fn parse_zone_block(
+    block: &[&str],
+    priority_support: FeatureSupport,
+) -> Result<(ZoneName, ZoneDetails, Vec<String>), ParseError> {
     #[derive(Clone, Copy, PartialEq)]
     enum Section {
         None,
@@ -148,6 +165,8 @@ fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseErro
     let zone = parse_zone_header(header)?;
     let mut details = ZoneDetails::empty(zone.clone());
     let mut section = Section::None;
+    let mut ingress_priority_seen = false;
+    let mut egress_priority_seen = false;
 
     for line in rest {
         if line.trim().is_empty() {
@@ -173,21 +192,20 @@ fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseErro
 
         let (key, value) = split_attribute(line)?;
         section = Section::None;
+        if parse_zone_priority(
+            key,
+            value,
+            &mut details,
+            &mut ingress_priority_seen,
+            &mut egress_priority_seen,
+        )? {
+            continue;
+        }
         match key {
             "target" => {
                 details.target = value
                     .parse()
                     .map_err(|err: ValidationError| ParseError::new(err.to_string()))?;
-            }
-            "ingress-priority" => {
-                details.ingress_priority = value.parse::<RulePriority>().map_err(|err| {
-                    ParseError::new(format!("invalid ingress priority `{value}`: {err}"))
-                })?;
-            }
-            "egress-priority" => {
-                details.egress_priority = value.parse::<RulePriority>().map_err(|err| {
-                    ParseError::new(format!("invalid egress priority `{value}`: {err}"))
-                })?;
             }
             "interfaces" => {
                 details.interfaces = parse_items(value, InterfaceName::parse, "interface")?;
@@ -231,7 +249,51 @@ fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseErro
             _ => {}
         }
     }
-    Ok((zone, details))
+    let warnings = missing_priority_evidence(
+        &zone,
+        priority_support,
+        ingress_priority_seen,
+        egress_priority_seen,
+    );
+    Ok((zone, details, warnings))
+}
+
+fn parse_zone_priority(
+    key: &str,
+    value: &str,
+    details: &mut ZoneDetails,
+    ingress_seen: &mut bool,
+    egress_seen: &mut bool,
+) -> Result<bool, ParseError> {
+    let (slot, seen, label) = match key {
+        "ingress-priority" => (&mut details.ingress_priority, ingress_seen, "ingress"),
+        "egress-priority" => (&mut details.egress_priority, egress_seen, "egress"),
+        _ => return Ok(false),
+    };
+    *seen = true;
+    *slot = value
+        .parse::<RulePriority>()
+        .map_err(|err| ParseError::new(format!("invalid {label} priority `{value}`: {err}")))?;
+    Ok(true)
+}
+
+fn missing_priority_evidence(
+    zone: &ZoneName,
+    priority_support: FeatureSupport,
+    ingress_seen: bool,
+    egress_seen: bool,
+) -> Vec<String> {
+    if priority_support == FeatureSupport::Unsupported {
+        return Vec::new();
+    }
+    [
+        ("ingress-priority", ingress_seen),
+        ("egress-priority", egress_seen),
+    ]
+    .into_iter()
+    .filter(|(_, seen)| !seen)
+    .map(|(field, _)| format!("zone `{zone}` omitted required `{field}` evidence"))
+    .collect()
 }
 
 /// `FirewallBackend=` from `/etc/firewalld/firewalld.conf`.

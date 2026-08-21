@@ -226,13 +226,13 @@ fn observe_priority(
     support: FeatureSupport,
 ) -> (RulePriority, Option<String>) {
     let Some(value) = settings.get(key).or_else(|| settings.get(legacy_key)) else {
-        return if support == FeatureSupport::Supported {
+        return if support == FeatureSupport::Unsupported {
+            (RulePriority::default(), None)
+        } else {
             (
                 RulePriority::default(),
                 Some(format!("D-Bus settings omitted `{key}`")),
             )
-        } else {
-            (RulePriority::default(), None)
         };
     };
     match i32::try_from(value.clone())
@@ -397,11 +397,11 @@ impl DbusBackend {
                 details.egress_priority = observed.egress_priority;
                 observed.incomplete
             }
-            Err(err) if priority_support == FeatureSupport::Supported => vec![format!(
+            Err(_) if priority_support == FeatureSupport::Unsupported => Vec::new(),
+            Err(err) => vec![format!(
                 "D-Bus getSettings2 failed while reading zone priorities: {}",
                 dbus_err(err)
             )],
-            Err(_) => Vec::new(),
         };
         Ok(Some((name, details, incomplete)))
     }
@@ -860,6 +860,15 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("egress"))
         );
+    }
+
+    #[test]
+    fn unknown_zone_priority_support_requires_complete_dbus_evidence() {
+        let observed = observe_zone_settings(&HashMap::new(), FeatureSupport::Unknown);
+
+        assert_eq!(observed.ingress_priority.get(), 0);
+        assert_eq!(observed.egress_priority.get(), 0);
+        assert_eq!(observed.incomplete.len(), 2);
     }
 
     #[test]

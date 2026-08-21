@@ -22,11 +22,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::domain::{
-    ActiveZone, ConfigurationTarget, DegradedSection, FirewallOperation, FirewallSnapshot,
-    FirewallStatus, IpSetInfo, IpSetName, LogDenied, NetfilterBackend, PolicyDetails, PolicyName,
-    RefreshObservation, RefreshSection, RefreshSectionObservation, Scoped, ServiceDefinition,
-    ServiceName, ServiceResolutionFailure, SnapshotSection, ZoneDetails, ZoneName,
-    resolve_service_includes,
+    ActiveZone, ConfigurationTarget, DegradedSection, FeatureSupport, FirewallOperation,
+    FirewallSnapshot, FirewallStatus, FirewalldFeature, IpSetInfo, IpSetName, LogDenied,
+    NetfilterBackend, PolicyDetails, PolicyName, RefreshObservation, RefreshSection,
+    RefreshSectionObservation, Scoped, ServiceDefinition, ServiceName, ServiceResolutionFailure,
+    SnapshotSection, ZoneDetails, ZoneName, resolve_service_includes,
 };
 use detail_priority::{DetailBatch, DetailBatchObservation, DetailQueue, DetailWork};
 
@@ -741,8 +741,10 @@ impl<R: CommandRunner> CliBackend<R> {
         if !status.daemon_running && !self.is_offline() {
             return Err(FirewallError::DaemonNotRunning);
         }
+        let priority_support =
+            FirewalldFeature::ZonePriorities.support_for(status.version.as_deref());
         let (default_zone, active, runtime, permanent, mut degraded) =
-            self.fetch_zone_overview().await?;
+            self.fetch_zone_overview(priority_support).await?;
         let (available_services, service_error) =
             observe_section(RefreshSection::Services, self.available_services()).await;
         if let Some(service_error) = service_error {
@@ -1081,6 +1083,7 @@ impl<R: CommandRunner> CliBackend<R> {
 
     async fn fetch_zone_overview(
         &self,
+        priority_support: FeatureSupport,
     ) -> Result<
         (
             ZoneName,
@@ -1094,7 +1097,8 @@ impl<R: CommandRunner> CliBackend<R> {
         observe_section(RefreshSection::Zones, async {
             let default_zone = self.run_ok(self.request(&["--get-default-zone"])).await?;
             let default_zone = parse::parse_default_zone(&default_zone)?;
-            let (active, runtime, permanent, degraded) = self.zone_sections().await?;
+            let (active, runtime, permanent, degraded) =
+                self.zone_sections(priority_support).await?;
             Ok((default_zone, active, runtime, permanent, degraded))
         })
         .await
@@ -1102,10 +1106,14 @@ impl<R: CommandRunner> CliBackend<R> {
 
     /// Fetches runtime/permanent zones and records malformed individual zone
     /// blocks without making the entire snapshot unavailable.
-    async fn zone_sections(&self) -> Result<ZoneSections, FirewallError> {
+    async fn zone_sections(
+        &self,
+        priority_support: FeatureSupport,
+    ) -> Result<ZoneSections, FirewallError> {
         if self.is_offline() {
             let config = self.run_ok(self.request(&["--list-all-zones"])).await?;
-            let (config, degraded) = parse::parse_list_all_zones(&config);
+            let (config, degraded) =
+                parse::parse_list_all_zones_with_priority_support(&config, priority_support);
             let mut degraded: Vec<_> = degraded
                 .into_iter()
                 .map(|message| {
@@ -1127,7 +1135,8 @@ impl<R: CommandRunner> CliBackend<R> {
         let active = self.run_ok(self.request(&["--get-active-zones"])).await?;
         let active = parse::parse_active_zones(&active)?;
         let runtime = self.run_ok(self.request(&["--list-all-zones"])).await?;
-        let (runtime, runtime_degraded) = parse::parse_list_all_zones(&runtime);
+        let (runtime, runtime_degraded) =
+            parse::parse_list_all_zones_with_priority_support(&runtime, priority_support);
         let mut degraded: Vec<DegradedSection> = runtime_degraded
             .into_iter()
             .map(|message| {
@@ -1141,7 +1150,8 @@ impl<R: CommandRunner> CliBackend<R> {
         let permanent = self
             .run_ok(self.request(&["--permanent", "--list-all-zones"]))
             .await?;
-        let (permanent, permanent_degraded) = parse::parse_list_all_zones(&permanent);
+        let (permanent, permanent_degraded) =
+            parse::parse_list_all_zones_with_priority_support(&permanent, priority_support);
         degraded.extend(permanent_degraded.into_iter().map(|message| {
             DegradedSection::new(
                 SnapshotSection::Zones,
@@ -1230,8 +1240,10 @@ impl<R: CommandRunner> FirewallBackend for CliBackend<R> {
             return Err(FirewallError::DaemonNotRunning);
         }
 
+        let priority_support =
+            FirewalldFeature::ZonePriorities.support_for(status.version.as_deref());
         let (default_zone, active, runtime, permanent, zone_degraded) =
-            self.fetch_zone_overview().await?;
+            self.fetch_zone_overview(priority_support).await?;
         // Tiered refresh: the per-object sections (one subprocess each) are
         // reused for a few refreshes; mutations invalidate the cache.
         let cached = {

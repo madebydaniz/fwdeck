@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic, clippy::expect_used)]
 
-use fwdeck::domain::{NetfilterBackend, ZoneName, ZoneTarget};
+use fwdeck::domain::{FeatureSupport, NetfilterBackend, ZoneName, ZoneTarget};
 use fwdeck::infrastructure::firewalld::parse;
 
 const LIST_ALL_RUNTIME: &str = include_str!("fixtures/firewall_cmd/list_all_zones_runtime.txt");
@@ -95,6 +95,47 @@ fn malformed_priority_degrades_only_its_zone() {
     assert_eq!(degraded.len(), 1);
     assert!(degraded[0].contains("broken"));
     assert!(degraded[0].contains("not-a-number"));
+}
+
+#[test]
+fn supported_zone_priorities_require_both_cli_fields_without_dropping_the_zone() {
+    let raw = "public\n  target: default\n  services: ssh\n";
+
+    let (zones, degraded) =
+        parse::parse_list_all_zones_with_priority_support(raw, FeatureSupport::Supported);
+
+    assert!(zones.contains_key(&zone("public")));
+    assert_eq!(zones[&zone("public")].ingress_priority.get(), 0);
+    assert_eq!(zones[&zone("public")].egress_priority.get(), 0);
+    assert_eq!(degraded.len(), 2);
+    assert!(
+        degraded
+            .iter()
+            .any(|item| item.contains("ingress-priority"))
+    );
+    assert!(degraded.iter().any(|item| item.contains("egress-priority")));
+}
+
+#[test]
+fn unknown_zone_priority_support_requires_complete_cli_evidence() {
+    let raw = "public\n  target: default\n  services: ssh\n";
+
+    let (zones, degraded) =
+        parse::parse_list_all_zones_with_priority_support(raw, FeatureSupport::Unknown);
+
+    assert!(zones.contains_key(&zone("public")));
+    assert_eq!(degraded.len(), 2);
+}
+
+#[test]
+fn pre_priority_firewalld_may_omit_cli_fields_without_false_degradation() {
+    let raw = "public\n  target: default\n  services: ssh\n";
+
+    let (zones, degraded) =
+        parse::parse_list_all_zones_with_priority_support(raw, FeatureSupport::Unsupported);
+
+    assert!(zones.contains_key(&zone("public")));
+    assert!(degraded.is_empty());
 }
 
 #[test]
