@@ -171,6 +171,17 @@ pub enum OperationOutcome {
     },
 }
 
+/// Whether a completed backend outcome can be represented as one full projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationProjectionStatus {
+    /// Every mutation step applied and the operation may be projected as a whole.
+    FullyApplied,
+    /// The first mutation step failed, so no operation effect was applied.
+    NotApplied,
+    /// Observed steps must be reconciled against a fresh authoritative snapshot.
+    RequiresAuthoritativeReconciliation,
+}
+
 impl OperationOutcome {
     /// The operation this outcome belongs to, whatever the result.
     #[must_use]
@@ -200,6 +211,18 @@ impl OperationOutcome {
         self.steps()
             .iter()
             .find_map(|step| step.result.as_ref().err())
+    }
+
+    /// Honest projection disposition for this backend outcome.
+    #[must_use]
+    pub const fn projection_status(&self) -> OperationProjectionStatus {
+        match self {
+            Self::Applied { .. } => OperationProjectionStatus::FullyApplied,
+            Self::Failed { .. } => OperationProjectionStatus::NotApplied,
+            Self::PartiallyApplied { .. } | Self::Indeterminate { .. } => {
+                OperationProjectionStatus::RequiresAuthoritativeReconciliation
+            }
+        }
     }
 }
 

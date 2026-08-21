@@ -10,6 +10,7 @@ pub mod ids;
 pub mod mock;
 pub mod observation;
 pub mod operation;
+pub mod operation_effect;
 pub mod policy;
 pub mod policy_set;
 pub mod port;
@@ -39,6 +40,11 @@ pub use observation::{
     RefreshSectionObservation,
 };
 pub use operation::{FirewallOperation, OperationError};
+pub use operation_effect::{
+    AffectedObject, OperationEffect, OperationEffectSupport, OperationTargetSequence,
+    PartialApplicationPolicy, PolicyZoneDirection, TemporalBehavior, TrafficDimension,
+    TrafficIrrelevanceProof, UnsupportedOperationReason,
+};
 pub use policy::{PolicyDetails, PolicyTarget};
 pub use policy_set::{PolicySetDetails, PolicySetScope, PolicySetState};
 pub use port::{ForwardPort, PortNumber, PortRange, PortSelector, PortSpec, Protocol};

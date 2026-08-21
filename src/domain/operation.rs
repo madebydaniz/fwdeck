@@ -439,6 +439,12 @@ impl PostconditionProbe {
 }
 
 impl FirewallOperation {
+    /// Exhaustive traffic-testing effect metadata for this mutation.
+    #[must_use]
+    pub fn effect(&self) -> super::operation_effect::OperationEffect {
+        super::operation_effect::OperationEffect::classify(self)
+    }
+
     /// Short imperative summary for the confirmation modal.
     #[must_use]
     #[allow(clippy::too_many_lines)] // one arm per operation
