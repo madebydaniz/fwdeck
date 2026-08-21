@@ -20,7 +20,7 @@
         ],
         "includes": ["metrics"],
         "helpers": ["ftp"],
-        "modules": ["nf_conntrack_ftp"]
+        "modules": ["ftp"]
       },
       {
         "name": "metrics",
@@ -38,7 +38,7 @@
     "expected_protocols": ["gre"],
     "expected_source_ports": ["1024-65535/tcp"],
     "expected_helpers": ["ftp"],
-    "expected_modules": ["nf_conntrack_ftp"],
+    "expected_modules": ["ftp"],
     "expected_failure": null
   },
   "missing_include_case": {

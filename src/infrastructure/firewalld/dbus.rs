@@ -418,12 +418,12 @@ impl DbusBackend {
     > {
         let config = ConfigProxy::new(&self.connection).await.map_err(dbus_err)?;
         let names = config.get_zone_names().await.map_err(dbus_err)?;
-        let fetched = futures_util::future::join_all(
-            names
-                .iter()
-                .map(|raw| self.permanent_zone(&config, raw, priority_support)),
-        )
-        .await;
+        let config = &config;
+        let fetched =
+            super::bounded_fan_out(names.into_iter().map(|raw| async move {
+                self.permanent_zone(config, &raw, priority_support).await
+            }))
+            .await;
         let mut zones = BTreeMap::new();
         let mut degraded = Vec::new();
         for result in fetched {
@@ -510,7 +510,7 @@ impl FirewallBackend for DbusBackend {
             .iter()
             .filter_map(|raw| ZoneName::parse(raw).ok())
             .collect();
-        let fetched = futures_util::future::join_all(names.into_iter().map(|name| {
+        let fetched = super::bounded_fan_out(names.into_iter().map(|name| {
             let zone = &zone;
             async move {
                 let (details, incomplete) =
