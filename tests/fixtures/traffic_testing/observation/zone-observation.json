@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "fixture_version": "phase0-v1",
+  "reviewed_on": "2026-08-21",
+  "sources": [
+    "https://firewalld.org/documentation/man-pages/firewall-cmd",
+    "https://firewalld.org/documentation/man-pages/firewalld.zone.html"
+  ],
+  "firewalld_version": "2.4.0",
+  "zones": [
+    {
+      "name": "public",
+      "runtime": {
+        "ingress_priority": -20,
+        "egress_priority": 10,
+        "services": ["ssh", "https"]
+      },
+      "permanent": {
+        "ingress_priority": -10,
+        "egress_priority": 10,
+        "services": ["ssh"]
+      },
+      "expected_drift": ["ingress_priority", "services"]
+    },
+    {
+      "name": "trusted",
+      "runtime": {
+        "ingress_priority": -100,
+        "egress_priority": -100,
+        "services": []
+      },
+      "permanent": {
+        "ingress_priority": -100,
+        "egress_priority": -100,
+        "services": []
+      },
+      "expected_drift": []
+    }
+  ],
+  "degraded_evidence": [
+    {
+      "section": "service_definitions",
+      "target": null,
+      "object": "ftp",
+      "reason": "service definition detail was unavailable"
+    },
+    {
+      "section": "policies",
+      "target": "runtime",
+      "object": "allow-monitoring",
+      "reason": "runtime policy detail was unavailable"
+    }
+  ]
+}

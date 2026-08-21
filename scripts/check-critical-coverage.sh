@@ -40,6 +40,9 @@ check_file() {
 
 check_file "/src/application/engine.rs" 90 "engine"
 check_file "/src/application/refresh_scheduler.rs" 95 "refresh scheduler"
+check_file "/src/domain/capability.rs" 95 "traffic capability matrix"
+check_file "/src/domain/operation_effect.rs" 95 "operation effect classifier"
+check_file "/src/domain/traffic_test.rs" 95 "traffic truth contracts"
 check_file "src/infrastructure/firewalld/detail_priority.rs" 95 "detail priority policy"
 check_file "/src/infrastructure/rollback.rs" 85 "systemd rollback guard"
 check_file "/src/infrastructure/snapshot_store.rs" 80 "snapshot store"

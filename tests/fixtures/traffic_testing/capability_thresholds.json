@@ -1,4 +1,6 @@
 {
+  "schema_version": 1,
+  "fixture_version": "phase0-v1",
   "reviewed_on": "2026-08-21",
   "features": [
     {
