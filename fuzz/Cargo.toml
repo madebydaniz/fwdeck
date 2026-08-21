@@ -34,5 +34,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "analyze_rich_rule"
+path = "fuzz_targets/analyze_rich_rule.rs"
+test = false
+doc = false
+bench = false
+
 # Detach from the parent package so cargo-fuzz builds this crate standalone.
 [workspace]

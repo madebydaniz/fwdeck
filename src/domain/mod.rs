@@ -43,7 +43,10 @@ pub use policy::{PolicyDetails, PolicyTarget};
 pub use policy_set::{PolicySetDetails, PolicySetScope, PolicySetState};
 pub use port::{ForwardPort, PortNumber, PortRange, PortSelector, PortSpec, Protocol};
 pub use proposal::{DeniedFlow, ProposalError};
-pub use rich_rule::RichRule;
+pub use rich_rule::{
+    RichRule, RichRuleAction, RichRuleAddressMatch, RichRuleAnalysis, RichRuleExpression,
+    RichRuleMalformed, RichRuleUnsupported,
+};
 pub use service::{
     MAX_SERVICE_INCLUDE_DEPTH, ServiceDefinition, ServiceDestination, ServiceModuleName,
     ServiceResolution, ServiceResolutionFailure, resolve_service_includes,
