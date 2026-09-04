@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "fixture_version": "phase0-v1",
+  "reviewed_on": "2026-08-21",
+  "sources": [
+    "https://firewalld.org/documentation/man-pages/firewalld.service.html",
+    "https://firewalld.org/documentation/man-pages/firewalld.dbus.html"
+  ],
+  "complete_case": {
+    "root": "admin-stack",
+    "definitions": [
+      {
+        "name": "admin-stack",
+        "ports": ["8443/tcp"],
+        "protocols": ["gre"],
+        "source_ports": ["1024-65535/tcp"],
+        "destinations": [
+          {"family": "ipv4", "address": "239.1.1.0/24"},
+          {"family": "ipv6", "address": "ff02::fb"}
+        ],
+        "includes": ["metrics"],
+        "helpers": ["ftp"],
+        "modules": ["ftp"]
+      },
+      {
+        "name": "metrics",
+        "ports": ["9100/tcp"],
+        "protocols": [],
+        "source_ports": [],
+        "destinations": [],
+        "includes": [],
+        "helpers": [],
+        "modules": []
+      }
+    ],
+    "expected_services": ["admin-stack", "metrics"],
+    "expected_ports": ["8443/tcp", "9100/tcp"],
+    "expected_protocols": ["gre"],
+    "expected_source_ports": ["1024-65535/tcp"],
+    "expected_helpers": ["ftp"],
+    "expected_modules": ["ftp"],
+    "expected_failure": null
+  },
+  "missing_include_case": {
+    "root": "broken-stack",
+    "definitions": [
+      {
+        "name": "broken-stack",
+        "ports": ["443/tcp"],
+        "protocols": [],
+        "source_ports": [],
+        "destinations": [],
+        "includes": ["missing-child"],
+        "helpers": [],
+        "modules": []
+      }
+    ],
+    "expected_services": ["broken-stack"],
+    "expected_ports": ["443/tcp"],
+    "expected_protocols": [],
+    "expected_source_ports": [],
+    "expected_helpers": [],
+    "expected_modules": [],
+    "expected_failure": {
+      "kind": "missing_include",
+      "referenced_by": "broken-stack",
+      "service": "missing-child"
+    }
+  },
+  "cycle_case": {
+    "root": "alpha",
+    "definitions": [
+      {
+        "name": "alpha",
+        "ports": [],
+        "protocols": [],
+        "source_ports": [],
+        "destinations": [],
+        "includes": ["beta"],
+        "helpers": [],
+        "modules": []
+      },
+      {
+        "name": "beta",
+        "ports": [],
+        "protocols": [],
+        "source_ports": [],
+        "destinations": [],
+        "includes": ["alpha"],
+        "helpers": [],
+        "modules": []
+      }
+    ],
+    "expected_services": ["alpha", "beta"],
+    "expected_ports": [],
+    "expected_protocols": [],
+    "expected_source_ports": [],
+    "expected_helpers": [],
+    "expected_modules": [],
+    "expected_failure": {
+      "kind": "cycle",
+      "path": ["alpha", "beta", "alpha"]
+    }
+  }
+}

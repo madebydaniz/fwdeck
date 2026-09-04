@@ -9,9 +9,10 @@ use std::str::FromStr;
 
 use crate::application::ports::FirewallError;
 use crate::domain::{
-    ActiveZone, ForwardPort, IcmpType, InterfaceName, IpProtocol, IpSetInfo, IpSetName,
-    NetfilterBackend, PolicyDetails, PolicyName, PolicyTarget, RichRule, ServiceDefinition,
-    ServiceName, SourceAddress, ValidationError, ZoneDetails, ZoneName,
+    ActiveZone, FeatureSupport, ForwardPort, IcmpType, InterfaceName, IpProtocol, IpSetInfo,
+    IpSetName, NetfilterBackend, PolicyDetails, PolicyName, PolicyTarget, RichRule, RulePriority,
+    ServiceDefinition, ServiceDestination, ServiceModuleName, ServiceName, SourceAddress,
+    ValidationError, ZoneDetails, ZoneName,
 };
 
 /// A parser rejection with a message naming the offending line/value.
@@ -85,6 +86,17 @@ pub fn parse_active_zones(raw: &str) -> Result<BTreeMap<ZoneName, ActiveZone>, P
 /// multi-value sections (forward-ports, rich rules).
 #[must_use]
 pub fn parse_list_all_zones(raw: &str) -> (BTreeMap<ZoneName, ZoneDetails>, Vec<String>) {
+    parse_list_all_zones_with_priority_support(raw, FeatureSupport::Unsupported)
+}
+
+/// Parses zone listings while enforcing priority-field completeness unless the
+/// daemon is known to predate zone priorities. Older daemons legitimately omit
+/// these fields and keep the domain defaults without degradation.
+#[must_use]
+pub fn parse_list_all_zones_with_priority_support(
+    raw: &str,
+    priority_support: FeatureSupport,
+) -> (BTreeMap<ZoneName, ZoneDetails>, Vec<String>) {
     let mut zones: BTreeMap<ZoneName, ZoneDetails> = BTreeMap::new();
     let mut degraded: Vec<String> = Vec::new();
 
@@ -98,12 +110,12 @@ pub fn parse_list_all_zones(raw: &str) -> (BTreeMap<ZoneName, ZoneDetails>, Vec<
             continue;
         }
         if !line.starts_with([' ', '\t']) && !block.is_empty() {
-            flush_zone_block(&block, &mut zones, &mut degraded);
+            flush_zone_block(&block, priority_support, &mut zones, &mut degraded);
             block.clear();
         }
         block.push(line);
     }
-    flush_zone_block(&block, &mut zones, &mut degraded);
+    flush_zone_block(&block, priority_support, &mut zones, &mut degraded);
     (zones, degraded)
 }
 
@@ -111,14 +123,16 @@ pub fn parse_list_all_zones(raw: &str) -> (BTreeMap<ZoneName, ZoneDetails>, Vec<
 /// instead of failing the whole listing when a single zone is malformed.
 fn flush_zone_block(
     block: &[&str],
+    priority_support: FeatureSupport,
     zones: &mut BTreeMap<ZoneName, ZoneDetails>,
     degraded: &mut Vec<String>,
 ) {
     if block.is_empty() {
         return;
     }
-    match parse_zone_block(block) {
-        Ok((zone, details)) => {
+    match parse_zone_block(block, priority_support) {
+        Ok((zone, details, warnings)) => {
+            degraded.extend(warnings);
             zones.insert(zone, details);
         }
         Err(err) => {
@@ -128,7 +142,11 @@ fn flush_zone_block(
     }
 }
 
-fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseError> {
+#[allow(clippy::too_many_lines)] // one strict branch per observed zone attribute
+fn parse_zone_block(
+    block: &[&str],
+    priority_support: FeatureSupport,
+) -> Result<(ZoneName, ZoneDetails, Vec<String>), ParseError> {
     #[derive(Clone, Copy, PartialEq)]
     enum Section {
         None,
@@ -147,6 +165,8 @@ fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseErro
     let zone = parse_zone_header(header)?;
     let mut details = ZoneDetails::empty(zone.clone());
     let mut section = Section::None;
+    let mut ingress_priority_seen = false;
+    let mut egress_priority_seen = false;
 
     for line in rest {
         if line.trim().is_empty() {
@@ -172,6 +192,15 @@ fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseErro
 
         let (key, value) = split_attribute(line)?;
         section = Section::None;
+        if parse_zone_priority(
+            key,
+            value,
+            &mut details,
+            &mut ingress_priority_seen,
+            &mut egress_priority_seen,
+        )? {
+            continue;
+        }
         match key {
             "target" => {
                 details.target = value
@@ -217,12 +246,54 @@ fn parse_zone_block(block: &[&str]) -> Result<(ZoneName, ZoneDetails), ParseErro
                     );
                 }
             }
-            // ingress-priority / egress-priority are intentionally ignored
-            // (policy-only ordering that has no zone view yet).
             _ => {}
         }
     }
-    Ok((zone, details))
+    let warnings = missing_priority_evidence(
+        &zone,
+        priority_support,
+        ingress_priority_seen,
+        egress_priority_seen,
+    );
+    Ok((zone, details, warnings))
+}
+
+fn parse_zone_priority(
+    key: &str,
+    value: &str,
+    details: &mut ZoneDetails,
+    ingress_seen: &mut bool,
+    egress_seen: &mut bool,
+) -> Result<bool, ParseError> {
+    let (slot, seen, label) = match key {
+        "ingress-priority" => (&mut details.ingress_priority, ingress_seen, "ingress"),
+        "egress-priority" => (&mut details.egress_priority, egress_seen, "egress"),
+        _ => return Ok(false),
+    };
+    *seen = true;
+    *slot = value
+        .parse::<RulePriority>()
+        .map_err(|err| ParseError::new(format!("invalid {label} priority `{value}`: {err}")))?;
+    Ok(true)
+}
+
+fn missing_priority_evidence(
+    zone: &ZoneName,
+    priority_support: FeatureSupport,
+    ingress_seen: bool,
+    egress_seen: bool,
+) -> Vec<String> {
+    if priority_support == FeatureSupport::Unsupported {
+        return Vec::new();
+    }
+    [
+        ("ingress-priority", ingress_seen),
+        ("egress-priority", egress_seen),
+    ]
+    .into_iter()
+    .filter(|(_, seen)| !seen)
+    .map(|(field, _)| format!("zone `{zone}` omitted required `{field}` evidence"))
+    .collect()
 }
 
 /// `FirewallBackend=` from `/etc/firewalld/firewalld.conf`.
@@ -403,28 +474,71 @@ pub fn parse_ipset_info(raw: &str) -> IpSetInfo {
     info
 }
 
-/// `--info-service=<name>` block: `ports:` and `protocols:` lines. Unknown
-/// or malformed port entries are skipped — definitions are display-only.
-#[must_use]
-pub fn parse_service_info(raw: &str) -> ServiceDefinition {
+/// `--info-service=<name>` block. Unknown attributes are ignored for forward
+/// compatibility, while every consumed value is validated strictly.
+pub fn parse_service_info(raw: &str) -> Result<ServiceDefinition, ParseError> {
     let mut definition = ServiceDefinition::default();
     for line in raw.lines() {
         if let Some((key, value)) = line.trim_start().split_once(':') {
             match key.trim() {
                 "ports" => {
-                    definition.ports = value
-                        .split_whitespace()
-                        .filter_map(|spec| spec.parse().ok())
-                        .collect();
+                    definition.ports = parse_items(value, str::parse, "service port")?;
                 }
                 "protocols" => {
-                    definition.protocols = value.split_whitespace().map(str::to_owned).collect();
+                    definition.protocols =
+                        parse_items(value, IpProtocol::parse, "service protocol")?;
+                }
+                "source-ports" => {
+                    definition.source_ports =
+                        parse_items(value, str::parse, "service source port")?;
+                }
+                "destination" => {
+                    definition.destinations = value
+                        .split_whitespace()
+                        .map(parse_service_destination)
+                        .collect::<Result<_, _>>()?;
+                }
+                "includes" => {
+                    definition.includes =
+                        parse_items(value, ServiceName::parse, "included service")?;
+                }
+                "helpers" => {
+                    definition.helpers = parse_items(value, ServiceName::parse, "service helper")?;
+                }
+                "modules" => {
+                    definition.modules =
+                        parse_items(value, ServiceModuleName::parse, "service module")?;
                 }
                 _ => {}
             }
         }
     }
-    definition
+    Ok(definition)
+}
+
+fn parse_service_destination(raw: &str) -> Result<ServiceDestination, ParseError> {
+    let (family, address) = raw.split_once(':').ok_or_else(|| {
+        ParseError::new(format!(
+            "invalid service destination `{raw}`: expected ipv4:<address> or ipv6:<address>"
+        ))
+    })?;
+    let family = match family {
+        "ipv4" => crate::domain::AddressFamily::Ipv4,
+        "ipv6" => crate::domain::AddressFamily::Ipv6,
+        _ => {
+            return Err(ParseError::new(format!(
+                "invalid service destination family `{family}`"
+            )));
+        }
+    };
+    let address = SourceAddress::parse(address)
+        .map_err(|err| ParseError::new(format!("invalid service destination `{raw}`: {err}")))?;
+    if address.family() != Some(family) {
+        return Err(ParseError::new(format!(
+            "service destination `{raw}` does not match its family"
+        )));
+    }
+    Ok(ServiceDestination { family, address })
 }
 
 /// `--direct --get-all-rules`: raw lines, kept verbatim (deprecated feature,

@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "fixture_version": "phase0-v1",
+  "reviewed_on": "2026-08-21",
+  "features": [
+    {
+      "feature": "policy_objects",
+      "kind": "syntax",
+      "minimum": "0.9.0",
+      "source": "https://firewalld.org/2020/09/firewalld-0-9-0-release"
+    },
+    {
+      "feature": "zone_priorities",
+      "kind": "syntax",
+      "minimum": "2.0.0",
+      "source": "https://firewalld.org/2023/06/firewalld-2-0-0-release"
+    },
+    {
+      "feature": "rich_rule_priorities",
+      "kind": "syntax",
+      "minimum": "0.7.0",
+      "source": "https://firewalld.org/2019/06/firewalld-0-7-0-release"
+    },
+    {
+      "feature": "intra_zone_forwarding",
+      "kind": "syntax",
+      "minimum": "0.9.0",
+      "source": "https://firewalld.org/2020/09/firewalld-0-9-0-release"
+    },
+    {
+      "feature": "intra_zone_forwarding_default_enabled",
+      "kind": "behavior",
+      "minimum": "1.0.0",
+      "source": "https://firewalld.org/2021/07/firewalld-1-0-0-release"
+    },
+    {
+      "feature": "default_target_reject_semantics",
+      "kind": "behavior",
+      "minimum": "1.0.0",
+      "source": "https://firewalld.org/2021/07/firewalld-1-0-0-release"
+    },
+    {
+      "feature": "icmp_blocks_input_only",
+      "kind": "behavior",
+      "minimum": "1.0.0",
+      "source": "https://firewalld.org/2021/07/firewalld-1-0-0-release"
+    },
+    {
+      "feature": "positive_policy_priority_before_zone_target",
+      "kind": "behavior",
+      "minimum": "1.0.0",
+      "source": "https://firewalld.org/2021/06/the-upcoming-1-0-0"
+    },
+    {
+      "feature": "policy_sets",
+      "kind": "syntax",
+      "minimum": "2.4.0",
+      "source": "https://firewalld.org/2025/10/policy-set-gateway"
+    }
+  ]
+}

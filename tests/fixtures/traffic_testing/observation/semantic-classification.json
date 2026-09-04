@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "fixture_version": "phase0-v1",
+  "reviewed_on": "2026-08-21",
+  "sources": [
+    "https://firewalld.org/documentation/man-pages/firewalld.richlanguage.html",
+    "https://firewalld.org/documentation/man-pages/firewall-cmd"
+  ],
+  "rich_rules": [
+    {
+      "id": "supported-priority-service",
+      "raw": "rule family=\"ipv4\" priority=\"-100\" source address=\"203.0.113.0/24\" service name=\"ssh\" accept",
+      "expected": "supported"
+    },
+    {
+      "id": "unsupported-rate-limit",
+      "raw": "rule source address=\"203.0.113.1\" limit value=\"1/m\" accept",
+      "expected": "unsupported"
+    },
+    {
+      "id": "malformed-missing-action",
+      "raw": "rule source address=\"203.0.113.1\"",
+      "expected": "malformed"
+    }
+  ],
+  "operation_effects": [
+    {
+      "id": "add-service-both",
+      "expected_support": "supported_exact",
+      "expected_targets": "runtime_then_permanent",
+      "expected_dimensions": ["service"],
+      "expected_temporal": "immediate",
+      "expected_partial": "reconcile_executed_steps"
+    },
+    {
+      "id": "temporary-service",
+      "expected_support": "supported_at_evaluation_instant",
+      "expected_targets": "runtime",
+      "expected_dimensions": ["service"],
+      "expected_temporal": "expires_after_90_seconds",
+      "expected_partial": "single_step"
+    },
+    {
+      "id": "reload",
+      "expected_support": "global_transform",
+      "expected_targets": "runtime_from_permanent",
+      "expected_dimensions": ["global_configuration"],
+      "expected_temporal": "global_replacement",
+      "expected_partial": "single_step"
+    },
+    {
+      "id": "set-log-denied",
+      "expected_support": "traffic_irrelevant_logging_side_effect_only",
+      "expected_targets": "runtime_and_permanent",
+      "expected_dimensions": ["observability"],
+      "expected_temporal": "no_traffic_decision_effect",
+      "expected_partial": "single_step"
+    },
+    {
+      "id": "create-ipset",
+      "expected_support": "unsupported_relevant_ipset_semantics",
+      "expected_targets": "permanent",
+      "expected_dimensions": ["ipset"],
+      "expected_temporal": "stored_until_reload",
+      "expected_partial": "single_step"
+    }
+  ]
+}

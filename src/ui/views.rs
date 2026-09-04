@@ -797,7 +797,7 @@ fn services_rows(snap: &FirewallSnapshot, zone: &ZoneName) -> Vec<ViewRow> {
                 .filter(|p| p != "-")
                 .unwrap_or_else(|| "-".to_owned());
             let protocols = definition
-                .map(|d| d.protocols.join(","))
+                .map(|d| join(&d.protocols))
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| "-".to_owned());
             ViewRow::scoped(

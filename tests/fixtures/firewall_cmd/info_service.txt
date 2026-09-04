@@ -1,8 +1,8 @@
 ssh
-  ports: 22/tcp
-  protocols: 
-  source-ports: 
-  modules: 
-  destination: 
+  ports: 22/tcp 2222/sctp
+  protocols: gre
+  source-ports: 1024-65535/tcp
+  modules: nf_conntrack_ftp
+  destination: ipv4:192.0.2.0/24 ipv6:2001:db8::/32
   includes: 
-  helpers: 
+  helpers: ftp

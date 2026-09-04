@@ -222,7 +222,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::KeepChanges => {
             if !state.pending_rollback.is_empty() {
-                let kept: Vec<_> = state.pending_rollback.drain(..).collect();
+                let kept = std::mem::take(&mut state.pending_rollback);
                 // Every kept, reversible change joins the undo stack (oldest
                 // first) now that its countdown is resolved, so undo can revert
                 // them newest-first.
@@ -305,10 +305,12 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             match (state.session_baseline.clone(), state.snapshot.clone()) {
                 (Some(baseline), Some(current)) => {
                     // Ops that transform the baseline into now = what changed.
-                    let ops = crate::domain::restore::plan(&baseline, &current);
+                    let analysis = crate::domain::restore::analyze(&baseline, &current);
+                    let differences = analysis.operations.len() + analysis.limitations.len();
                     let content = details::diff(
-                        format!("Session diff — changes since startup ({})", ops.len()),
-                        &ops,
+                        format!("Session diff — changes since startup ({differences})"),
+                        &analysis.operations,
+                        &analysis.limitations,
                     );
                     state.overlays.push(Overlay::Details(content));
                 }
@@ -685,12 +687,20 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             if state.active_refresh != Some(schedule.id) {
                 return Vec::new();
             }
+            if matches!(
+                &result,
+                Ok(snapshot) if snapshot.identity().refresh_id() != schedule.id
+            ) {
+                return Vec::new();
+            }
             let selected = selected_row_id(state);
             state.active_refresh = None;
             state.refresh_overview = None;
             state.last_refresh = Some(observation);
             match result {
                 Ok(snapshot) => {
+                    let snapshot_identity = snapshot.identity();
+                    let snapshot = snapshot.into_snapshot();
                     state.backend_error = None;
                     // Postcondition check: EVERY operation applied since the
                     // last refresh must actually be visible in this fresh
@@ -726,6 +736,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                         state.session_baseline = Some(std::sync::Arc::clone(&snapshot));
                     }
                     state.snapshot = Some(snapshot);
+                    state.snapshot_identity = Some(snapshot_identity);
                 }
                 // Keep the stale snapshot: outdated data plus a visible error
                 // beats an empty screen.
@@ -1423,6 +1434,19 @@ mod tests {
         state
     }
 
+    fn observed(
+        id: crate::application::RefreshId,
+        snapshot: std::sync::Arc<crate::domain::FirewallSnapshot>,
+    ) -> crate::application::ObservedSnapshot {
+        crate::application::ObservedSnapshot::new(
+            crate::application::SnapshotIdentity::new(
+                id,
+                crate::application::SnapshotGeneration::new(std::num::NonZeroU64::MIN),
+            ),
+            snapshot,
+        )
+    }
+
     fn active_plan_id(state: &UiState) -> crate::application::PlanId {
         state.in_flight_plan_rollback.unwrap().id
     }
@@ -2005,7 +2029,7 @@ mod tests {
             &mut state,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule_for(id, crate::application::RefreshTrigger::Periodic),
-                result: Ok(std::sync::Arc::new(mock::sample().unwrap())),
+                result: Ok(observed(id, std::sync::Arc::new(mock::sample().unwrap()))),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::from_millis(20),
                 ),
@@ -2042,7 +2066,10 @@ mod tests {
                     stale_id,
                     crate::application::RefreshTrigger::Manual,
                 ),
-                result: Ok(std::sync::Arc::new(mock::sample().unwrap())),
+                result: Ok(observed(
+                    stale_id,
+                    std::sync::Arc::new(mock::sample().unwrap()),
+                )),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::from_millis(20),
                 ),
@@ -2053,6 +2080,46 @@ mod tests {
             state.refresh_overview.as_ref().map(|preview| preview.id),
             Some(current)
         );
+    }
+
+    #[test]
+    fn mismatched_snapshot_identity_cannot_complete_the_active_refresh() {
+        let mut state = state();
+        let active_id = crate::application::RefreshId::new(12);
+        let wrong_id = crate::application::RefreshId::new(11);
+        let original = std::sync::Arc::clone(state.snapshot.as_ref().unwrap());
+        update(
+            &mut state,
+            UiAction::RefreshStarted {
+                id: active_id,
+                trigger: crate::application::RefreshTrigger::Periodic,
+            },
+        );
+
+        update(
+            &mut state,
+            UiAction::RefreshCompleted {
+                schedule: refresh_schedule_for(
+                    active_id,
+                    crate::application::RefreshTrigger::Periodic,
+                ),
+                result: Ok(observed(
+                    wrong_id,
+                    std::sync::Arc::new(mock::sample().unwrap()),
+                )),
+                observation: crate::domain::RefreshObservation::total_only(
+                    std::time::Duration::from_millis(20),
+                ),
+            },
+        );
+
+        assert_eq!(state.active_refresh, Some(active_id));
+        assert!(std::sync::Arc::ptr_eq(
+            state.snapshot.as_ref().unwrap(),
+            &original
+        ));
+        assert!(state.snapshot_identity.is_none());
+        assert!(state.last_refresh.is_none());
     }
 
     #[test]
@@ -2265,7 +2332,10 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule_for(RefreshId::new(1), RefreshTrigger::Manual),
-                result: Ok(Arc::new(mock::sample().unwrap())),
+                result: Ok(observed(
+                    RefreshId::new(1),
+                    Arc::new(mock::sample().unwrap()),
+                )),
                 observation: RefreshObservation::total_only(Duration::from_secs(9)),
             },
         );
@@ -2476,7 +2546,7 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule_for(refresh_id, RefreshTrigger::Manual),
-                result: Ok(Arc::clone(&completed_snapshot)),
+                result: Ok(observed(refresh_id, Arc::clone(&completed_snapshot))),
                 observation: completed_refresh.clone(),
             },
         );
@@ -2549,7 +2619,7 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule(),
-                result: Ok(snapshot),
+                result: Ok(observed(refresh_schedule().id, snapshot)),
                 observation: observation.clone(),
             },
         );
@@ -2767,7 +2837,10 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule(),
-                result: Ok(std::sync::Arc::new(refreshed)),
+                result: Ok(observed(
+                    refresh_schedule().id,
+                    std::sync::Arc::new(refreshed),
+                )),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::ZERO,
                 ),
@@ -3249,7 +3322,7 @@ mod tests {
             &mut s,
             UiAction::RefreshCompleted {
                 schedule: refresh_schedule(),
-                result: Ok(snap),
+                result: Ok(observed(refresh_schedule().id, snap)),
                 observation: crate::domain::RefreshObservation::total_only(
                     std::time::Duration::ZERO,
                 ),
@@ -3342,6 +3415,64 @@ mod tests {
             Some(Overlay::Details(c)) => assert!(c.title.contains("Session diff")),
             other => panic!("expected a session-diff overlay, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn priority_only_session_diff_is_visible_as_unapplied() {
+        let mut s = state();
+        let baseline = s.snapshot.clone().unwrap();
+        let mut current = (*baseline).clone();
+        let public = ZoneName::parse("public").unwrap();
+        current.runtime.get_mut(&public).unwrap().egress_priority =
+            crate::domain::RulePriority::new(99).unwrap();
+        s.session_baseline = Some(baseline);
+        s.snapshot = Some(std::sync::Arc::new(current));
+
+        update(&mut s, UiAction::ShowSessionDiff);
+
+        let Some(Overlay::Details(content)) = s.overlays.last() else {
+            panic!("priority drift must open the session diff");
+        };
+        assert!(content.title.ends_with("(1)"));
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(key, value)| { key == "unapplied" && value.contains("cannot be restored") })
+        );
+    }
+
+    #[test]
+    fn priority_only_runtime_permanent_drift_is_not_claimed_as_synced() {
+        let mut s = state();
+        let mut snapshot = (*s.snapshot.clone().unwrap()).clone();
+        let public = ZoneName::parse("public").unwrap();
+        snapshot.permanent = snapshot.runtime.clone();
+        snapshot.runtime.get_mut(&public).unwrap().ingress_priority =
+            crate::domain::RulePriority::new(-25).unwrap();
+        s.snapshot = Some(std::sync::Arc::new(snapshot));
+
+        update(&mut s, UiAction::StageDriftSync);
+
+        assert!(s.staged.is_empty());
+        assert_eq!(
+            s.toasts.back().map(|toast| toast.kind),
+            Some(ToastKind::Warning)
+        );
+        assert!(
+            s.toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("cannot be restored"))
+        );
+        let Some(Overlay::Details(content)) = s.overlays.last() else {
+            panic!("priority-only drift must remain visible");
+        };
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(_, value)| value.contains("cannot be restored"))
+        );
     }
 
     #[test]
@@ -4699,6 +4830,44 @@ mod tests {
             },
         );
         assert_eq!(s.toasts.back().map(|t| t.kind), Some(ToastKind::Error));
+    }
+
+    #[test]
+    fn priority_only_snapshot_restore_is_never_claimed_as_restored() {
+        let mut s = state();
+        let current = s.snapshot.clone().unwrap();
+        let mut target = (*current).clone();
+        let public = ZoneName::parse("public").unwrap();
+        target.permanent.get_mut(&public).unwrap().ingress_priority =
+            crate::domain::RulePriority::new(-99).unwrap();
+
+        update(
+            &mut s,
+            UiAction::SnapshotLoaded {
+                name: "priority.json".to_owned(),
+                result: Ok(Box::new(target)),
+            },
+        );
+
+        assert!(s.staged.is_empty());
+        assert_eq!(
+            s.toasts.back().map(|toast| toast.kind),
+            Some(ToastKind::Warning)
+        );
+        assert!(
+            s.toasts
+                .back()
+                .is_some_and(|toast| toast.text.contains("cannot be restored"))
+        );
+        let Some(Overlay::Details(content)) = s.overlays.last() else {
+            panic!("unsupported priority restore must show exact evidence");
+        };
+        assert!(
+            content
+                .lines
+                .iter()
+                .any(|(_, value)| value.contains("cannot be restored"))
+        );
     }
 
     #[test]

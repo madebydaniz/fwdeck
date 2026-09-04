@@ -1,0 +1,11 @@
+rate-limit|rule source address="203.0.113.1" limit value="1/m" accept
+mac-source|rule source mac="00:11:22:33:44:55" accept
+helper|rule helper name="ftp" accept
+mark|rule mark set="1"
+tcp-mss-clamp|rule tcp-mss-clamp value="pmtu"
+log-only|rule log prefix="fwdeck"
+audit-only|rule audit
+ipset|rule source ipset="blocklist" drop
+unknown|rule future-element value="x" accept
+duplicate|rule source address="203.0.113.1" source address="198.51.100.1" accept
+conflicting|rule service name="ssh" port port="22" protocol="tcp" accept

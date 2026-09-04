@@ -1,0 +1,6 @@
+all-fields|rule family="ipv4" priority="-100" source address="203.0.113.0/24" destination address="192.0.2.10" service name="ssh" accept
+destination-port|rule family="ipv6" port port="443-445" protocol="tcp" reject
+source-port|rule source-port port="1024-65535" protocol="udp" drop
+raw-protocol|rule protocol value="gre" accept
+inverted-source|rule source NOT address="198.51.100.0/24" accept
+inverted-destination|rule destination invert="true" address="2001:db8::/32" drop

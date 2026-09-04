@@ -113,7 +113,7 @@ pub fn parse(json: &str) -> Result<Vec<ChainCounter>, String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(unknown_lints, clippy::unused_async_trait_impl, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::infrastructure::process::{CommandOutput, ProcessError};

@@ -17,12 +17,82 @@
 
 use super::operation::FirewallOperation;
 use super::snapshot::{ConfigurationTarget, FirewallSnapshot};
+use super::traffic_test::RulePriority;
 use super::zone::ZoneDetails;
+
+/// A difference that `FWDeck` can observe but cannot currently mutate exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreLimitation {
+    /// Zone priorities differ, but no priority mutation exists yet.
+    ZonePriorities {
+        /// Affected zone.
+        zone: super::ids::ZoneName,
+        /// Affected runtime or permanent scope.
+        target: ConfigurationTarget,
+        /// Currently observed ingress priority.
+        current_ingress: RulePriority,
+        /// Desired ingress priority.
+        desired_ingress: RulePriority,
+        /// Currently observed egress priority.
+        current_egress: RulePriority,
+        /// Desired egress priority.
+        desired_egress: RulePriority,
+    },
+}
+
+impl RestoreLimitation {
+    /// Operator-facing statement that never implies the difference was applied.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::ZonePriorities {
+                zone,
+                target,
+                current_ingress,
+                desired_ingress,
+                current_egress,
+                desired_egress,
+            } => format!(
+                "zone `{zone}` {} priorities differ (ingress {} -> {}, egress {} -> {}) and cannot be restored yet",
+                target.label(),
+                current_ingress.get(),
+                desired_ingress.get(),
+                current_egress.get(),
+                desired_egress.get(),
+            ),
+        }
+    }
+
+    /// Scope affected by the unsupported difference.
+    #[must_use]
+    pub const fn target(&self) -> ConfigurationTarget {
+        match self {
+            Self::ZonePriorities { target, .. } => *target,
+        }
+    }
+}
+
+/// Exact executable operations plus observed differences that cannot be
+/// represented safely as operations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RestoreAnalysis {
+    /// Operations the engine can stage and apply.
+    pub operations: Vec<FirewallOperation>,
+    /// Observed differences deliberately left unapplied.
+    pub limitations: Vec<RestoreLimitation>,
+}
 
 /// Operations to make `current` match `target`. Empty when already equal.
 #[must_use]
 pub fn plan(current: &FirewallSnapshot, target: &FirewallSnapshot) -> Vec<FirewallOperation> {
+    analyze(current, target).operations
+}
+
+/// Analyzes executable and unsupported differences without hiding either.
+#[must_use]
+pub fn analyze(current: &FirewallSnapshot, target: &FirewallSnapshot) -> RestoreAnalysis {
     let mut ops = Vec::new();
+    let mut limitations = Vec::new();
 
     // Default zone first: later per-zone edits read more naturally under it.
     // Runtime presence is required — `--set-default-zone` on a permanent-only
@@ -46,6 +116,7 @@ pub fn plan(current: &FirewallSnapshot, target: &FirewallSnapshot) -> Vec<Firewa
                 target_zone,
                 ConfigurationTarget::Runtime,
                 &mut ops,
+                &mut limitations,
             );
         }
     }
@@ -57,10 +128,14 @@ pub fn plan(current: &FirewallSnapshot, target: &FirewallSnapshot) -> Vec<Firewa
                 target_zone,
                 ConfigurationTarget::Permanent,
                 &mut ops,
+                &mut limitations,
             );
         }
     }
-    ops
+    RestoreAnalysis {
+        operations: ops,
+        limitations,
+    }
 }
 
 /// Emits the add/remove/set operations that bring one zone's `current`
@@ -72,7 +147,20 @@ fn diff_zone(
     target: &ZoneDetails,
     scope: ConfigurationTarget,
     ops: &mut Vec<FirewallOperation>,
+    limitations: &mut Vec<RestoreLimitation>,
 ) {
+    if current.ingress_priority != target.ingress_priority
+        || current.egress_priority != target.egress_priority
+    {
+        limitations.push(RestoreLimitation::ZonePriorities {
+            zone: zone.clone(),
+            target: scope,
+            current_ingress: current.ingress_priority,
+            desired_ingress: target.ingress_priority,
+            current_egress: current.egress_priority,
+            desired_egress: target.egress_priority,
+        });
+    }
     diff_pairs(
         &current.services,
         &target.services,
@@ -253,6 +341,34 @@ mod tests {
     fn identical_snapshots_produce_no_operations() {
         let snap = mock::sample().unwrap();
         assert!(plan(&snap, &snap).is_empty());
+    }
+
+    #[test]
+    fn zone_priority_drift_is_reported_as_unsupported_restore_evidence() {
+        let current = mock::sample().unwrap();
+        let mut target = current.clone();
+        let public = ZoneName::parse("public").unwrap();
+        target.runtime.get_mut(&public).unwrap().ingress_priority =
+            super::super::RulePriority::new(-42).unwrap();
+
+        assert_ne!(current, target, "snapshot equality must include priorities");
+        let report = analyze(&current, &target);
+        assert!(report.operations.is_empty());
+        assert_eq!(report.limitations.len(), 1);
+        assert!(matches!(
+            &report.limitations[0],
+            RestoreLimitation::ZonePriorities {
+                zone,
+                target: ConfigurationTarget::Runtime,
+                desired_ingress,
+                ..
+            } if zone == &public && desired_ingress.get() == -42
+        ));
+        assert!(
+            report.limitations[0]
+                .describe()
+                .contains("cannot be restored")
+        );
     }
 
     #[test]

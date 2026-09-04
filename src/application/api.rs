@@ -13,6 +13,7 @@ use crate::domain::{
     RefreshObservation, Scoped, ServiceName, ZoneDetails, ZoneName,
 };
 
+use super::ObservedSnapshot;
 use super::engine;
 use super::ports::{
     FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardId,
@@ -291,13 +292,13 @@ pub enum EngineEvent {
         /// Authoritative overview captured for this lifecycle.
         overview: Arc<RefreshOverview>,
     },
-    /// The snapshot pass ended. `Arc` because the UI keeps the previous
-    /// snapshot alive while diffing against the new one.
+    /// The snapshot pass ended. Successful publications carry immutable
+    /// process-local identity plus the shared authoritative snapshot.
     RefreshFinished {
         /// Scheduler metadata for the completed lifecycle.
         schedule: RefreshScheduleObservation,
         /// Fresh snapshot, or the categorized backend failure.
-        result: Result<Arc<FirewallSnapshot>, FirewallError>,
+        result: Result<ObservedSnapshot, FirewallError>,
         /// Exact telemetry for this snapshot attempt.
         observation: RefreshObservation,
     },

@@ -1,11 +1,11 @@
-//! Fixture-driven parser tests. Every fixture in `fixtures/firewall_cmd/` was
-//! captured from a real firewalld (Fedora 42, firewalld 2.3.2) inside the dev
-//! container — no hand-written approximations of output formats.
+//! Fixture-driven parser tests. Fixture structure was captured from a real
+//! firewalld (Fedora 42, firewalld 2.3.2) inside the dev container. Selected
+//! priority values are deliberately varied to pin signed parsing and drift.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::panic, clippy::expect_used)]
 
-use fwdeck::domain::{NetfilterBackend, ZoneName, ZoneTarget};
+use fwdeck::domain::{FeatureSupport, NetfilterBackend, ZoneName, ZoneTarget};
 use fwdeck::infrastructure::firewalld::parse;
 
 const LIST_ALL_RUNTIME: &str = include_str!("fixtures/firewall_cmd/list_all_zones_runtime.txt");
@@ -14,6 +14,7 @@ const ACTIVE_ZONES: &str = include_str!("fixtures/firewall_cmd/active_zones.txt"
 const DEFAULT_ZONE: &str = include_str!("fixtures/firewall_cmd/default_zone.txt");
 const MALFORMED: &str = include_str!("fixtures/firewall_cmd/malformed.txt");
 const CONF_BACKEND: &str = include_str!("fixtures/firewall_cmd/firewalld_conf_backend.txt");
+const INFO_SERVICE: &str = include_str!("fixtures/firewall_cmd/info_service.txt");
 
 fn zone(name: &str) -> ZoneName {
     ZoneName::parse(name).unwrap()
@@ -65,7 +66,76 @@ fn public_zone_details_are_fully_typed() {
     assert!(services.contains(&"ssh"));
     assert_eq!(public.ports.len(), 1);
     assert_eq!(public.ports[0].to_string(), "8080/tcp");
+    assert_eq!(public.ingress_priority.get(), -120);
+    assert_eq!(public.egress_priority.get(), 240);
     assert!(!public.masquerade);
+}
+
+#[test]
+fn runtime_and_permanent_zone_priorities_remain_distinct() {
+    let runtime = parse::parse_list_all_zones(LIST_ALL_RUNTIME).0;
+    let permanent = parse::parse_list_all_zones(LIST_ALL_PERMANENT).0;
+    let public = zone("public");
+
+    assert_eq!(runtime[&public].ingress_priority.get(), -120);
+    assert_eq!(runtime[&public].egress_priority.get(), 240);
+    assert_eq!(permanent[&public].ingress_priority.get(), -100);
+    assert_eq!(permanent[&public].egress_priority.get(), 200);
+    assert_ne!(runtime[&public], permanent[&public]);
+}
+
+#[test]
+fn malformed_priority_degrades_only_its_zone() {
+    let raw = "broken\n  target: default\n  ingress-priority: not-a-number\n  egress-priority: 0\n\ntrusted\n  target: ACCEPT\n  ingress-priority: -32768\n  egress-priority: 32767\n";
+    let (zones, degraded) = parse::parse_list_all_zones(raw);
+
+    assert!(!zones.contains_key(&zone("broken")));
+    assert_eq!(zones[&zone("trusted")].ingress_priority.get(), -32_768);
+    assert_eq!(zones[&zone("trusted")].egress_priority.get(), 32_767);
+    assert_eq!(degraded.len(), 1);
+    assert!(degraded[0].contains("broken"));
+    assert!(degraded[0].contains("not-a-number"));
+}
+
+#[test]
+fn supported_zone_priorities_require_both_cli_fields_without_dropping_the_zone() {
+    let raw = "public\n  target: default\n  services: ssh\n";
+
+    let (zones, degraded) =
+        parse::parse_list_all_zones_with_priority_support(raw, FeatureSupport::Supported);
+
+    assert!(zones.contains_key(&zone("public")));
+    assert_eq!(zones[&zone("public")].ingress_priority.get(), 0);
+    assert_eq!(zones[&zone("public")].egress_priority.get(), 0);
+    assert_eq!(degraded.len(), 2);
+    assert!(
+        degraded
+            .iter()
+            .any(|item| item.contains("ingress-priority"))
+    );
+    assert!(degraded.iter().any(|item| item.contains("egress-priority")));
+}
+
+#[test]
+fn unknown_zone_priority_support_requires_complete_cli_evidence() {
+    let raw = "public\n  target: default\n  services: ssh\n";
+
+    let (zones, degraded) =
+        parse::parse_list_all_zones_with_priority_support(raw, FeatureSupport::Unknown);
+
+    assert!(zones.contains_key(&zone("public")));
+    assert_eq!(degraded.len(), 2);
+}
+
+#[test]
+fn pre_priority_firewalld_may_omit_cli_fields_without_false_degradation() {
+    let raw = "public\n  target: default\n  services: ssh\n";
+
+    let (zones, degraded) =
+        parse::parse_list_all_zones_with_priority_support(raw, FeatureSupport::Unsupported);
+
+    assert!(zones.contains_key(&zone("public")));
+    assert!(degraded.is_empty());
 }
 
 #[test]
@@ -164,6 +234,44 @@ fn conf_backend_fixture_detects_nftables() {
         parse::parse_conf_backend(CONF_BACKEND),
         NetfilterBackend::Nftables
     );
+}
+
+#[test]
+fn service_definition_fixture_preserves_every_relevant_field() {
+    let definition = parse::parse_service_info(INFO_SERVICE).unwrap();
+
+    assert_eq!(definition.ports.len(), 2);
+    assert_eq!(definition.protocols[0].as_str(), "gre");
+    assert_eq!(definition.source_ports[0].to_string(), "1024-65535/tcp");
+    assert_eq!(definition.destinations.len(), 2);
+    assert_eq!(definition.modules[0].as_str(), "nf_conntrack_ftp");
+    assert_eq!(definition.helpers[0].as_str(), "ftp");
+}
+
+#[test]
+fn service_definition_includes_are_typed_and_ordered() {
+    let raw = "root\n  ports: 443/tcp\n  includes: alpha bravo\n";
+    let definition = parse::parse_service_info(raw).unwrap();
+
+    assert_eq!(
+        definition
+            .includes
+            .iter()
+            .map(fwdeck::domain::ServiceName::as_str)
+            .collect::<Vec<_>>(),
+        vec!["alpha", "bravo"]
+    );
+}
+
+#[test]
+fn malformed_service_evidence_is_rejected_instead_of_skipped() {
+    for raw in [
+        "broken\n  ports: not-a-port\n",
+        "broken\n  destination: ipv4:not-an-address\n",
+        "broken\n  includes: bad/include\n",
+    ] {
+        assert!(parse::parse_service_info(raw).is_err(), "accepted `{raw}`");
+    }
 }
 
 const GET_IPSETS: &str = include_str!("fixtures/firewall_cmd/get_ipsets.txt");

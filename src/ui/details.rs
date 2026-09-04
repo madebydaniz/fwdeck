@@ -3,6 +3,7 @@
 //! error diagnostics with recovery hints.
 
 use crate::application::ports::{FirewallError, OperationOutcome};
+use crate::domain::restore::RestoreLimitation;
 use crate::domain::{
     ConfigurationTarget, FeatureSupport, FirewallOperation, FirewallSnapshot, FirewalldFeature,
     PolicyDependencyGraph, PolicyDependencyResource, PolicySetDetails, SnapshotSection, ZoneName,
@@ -45,8 +46,12 @@ pub fn counters(counters: &[crate::domain::ChainCounter]) -> DetailsContent {
 /// operations that would transform one into the other. Shared by the
 /// session-diff and snapshot-diff views (which never stage — they only show).
 #[must_use]
-pub fn diff(title: String, ops: &[FirewallOperation]) -> DetailsContent {
-    let mut lines: Vec<(String, String)> = if ops.is_empty() {
+pub fn diff(
+    title: String,
+    ops: &[FirewallOperation],
+    limitations: &[RestoreLimitation],
+) -> DetailsContent {
+    let mut lines: Vec<(String, String)> = if ops.is_empty() && limitations.is_empty() {
         vec![(String::new(), "no differences".to_owned())]
     } else {
         ops.iter()
@@ -54,6 +59,11 @@ pub fn diff(title: String, ops: &[FirewallOperation]) -> DetailsContent {
             .map(|(index, op)| (format!("{}.", index + 1), op.describe()))
             .collect()
     };
+    lines.extend(
+        limitations
+            .iter()
+            .map(|limitation| ("unapplied".to_owned(), limitation.describe())),
+    );
     lines.push((String::new(), String::new()));
     lines.push((String::new(), "read-only diff · esc to close".to_owned()));
     DetailsContent { title, lines }

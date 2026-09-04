@@ -157,24 +157,65 @@ pub(super) fn stage_drift_sync(state: &mut UiState) -> Vec<Effect> {
     // the restore differ then emits exactly the permanent-scoped repairs.
     let mut target = (*current).clone();
     target.permanent = target.runtime.clone();
-    let plan: Vec<FirewallOperation> = crate::domain::restore::plan(&current, &target)
+    let analysis = crate::domain::restore::analyze(&current, &target);
+    let plan: Vec<FirewallOperation> = analysis
+        .operations
         .into_iter()
         .filter(|op| op.target() == ConfigurationTarget::Permanent)
         .collect();
-    if plan.is_empty() {
+    let limitations: Vec<_> = analysis
+        .limitations
+        .into_iter()
+        .filter(|limitation| limitation.target() == ConfigurationTarget::Permanent)
+        .collect();
+    if plan.is_empty() && limitations.is_empty() {
         state.toast(
             ToastKind::Info,
             "no drift — permanent already matches runtime",
         );
         return Vec::new();
     }
+    if plan.is_empty() {
+        state.toast(
+            ToastKind::Warning,
+            format!(
+                "{} priority difference(s) cannot be restored yet",
+                limitations.len()
+            ),
+        );
+        state
+            .overlays
+            .push(Overlay::Details(crate::ui::details::diff(
+                "Permanent drift - unsupported changes".to_owned(),
+                &plan,
+                &limitations,
+            )));
+        return Vec::new();
+    }
     let count = plan.len();
     state.staged = plan;
-    state.toast(
-        ToastKind::Success,
-        format!("staged {count} drift repair(s) — review, then apply"),
-    );
-    state.overlays.push(Overlay::Details(plan_details(state)));
+    if limitations.is_empty() {
+        state.toast(
+            ToastKind::Success,
+            format!("staged {count} drift repair(s) — review, then apply"),
+        );
+        state.overlays.push(Overlay::Details(plan_details(state)));
+    } else {
+        state.toast(
+            ToastKind::Warning,
+            format!(
+                "staged {count} repair(s); {} priority difference(s) remain unapplied",
+                limitations.len()
+            ),
+        );
+        state
+            .overlays
+            .push(Overlay::Details(crate::ui::details::diff(
+                "Permanent drift repair".to_owned(),
+                &state.staged,
+                &limitations,
+            )));
+    }
     Vec::new()
 }
 
@@ -223,9 +264,13 @@ pub(super) fn snapshot_diff_loaded(
     };
     // Ops that transform the saved snapshot into the current state = how the
     // live firewall differs from that snapshot.
-    let ops = crate::domain::restore::plan(&snapshot, &current);
-    let content =
-        crate::ui::details::diff(format!("Diff vs snapshot `{name}` ({})", ops.len()), &ops);
+    let analysis = crate::domain::restore::analyze(&snapshot, &current);
+    let differences = analysis.operations.len() + analysis.limitations.len();
+    let content = crate::ui::details::diff(
+        format!("Diff vs snapshot `{name}` ({differences})"),
+        &analysis.operations,
+        &analysis.limitations,
+    );
     state.overlays.push(Overlay::Details(content));
     Vec::new()
 }
@@ -251,22 +296,38 @@ pub(super) fn snapshot_loaded(
             return Vec::new();
         }
     };
-    let plan = crate::domain::restore::plan(&current, &target);
-    if plan.is_empty() {
+    let analysis = crate::domain::restore::analyze(&current, &target);
+    if analysis.operations.is_empty() && analysis.limitations.is_empty() {
         state.toast(
             ToastKind::Info,
             "already matches that snapshot — nothing to restore",
         );
         return Vec::new();
     }
-    let count = plan.len();
-    state.staged = plan;
-    state.toast(
-        ToastKind::Success,
-        format!("staged {count} operation(s) — review, then apply"),
-    );
-    // Open the plan right away: restore review must be zero-friction.
-    state.overlays.push(Overlay::Details(plan_details(state)));
+    let count = analysis.operations.len();
+    state.staged = analysis.operations;
+    if analysis.limitations.is_empty() {
+        state.toast(
+            ToastKind::Success,
+            format!("staged {count} operation(s) — review, then apply"),
+        );
+        state.overlays.push(Overlay::Details(plan_details(state)));
+    } else {
+        state.toast(
+            ToastKind::Warning,
+            format!(
+                "staged {count} operation(s); {} priority difference(s) cannot be restored",
+                analysis.limitations.len()
+            ),
+        );
+        state
+            .overlays
+            .push(Overlay::Details(crate::ui::details::diff(
+                format!("Restore `{name}` - partial plan"),
+                &state.staged,
+                &analysis.limitations,
+            )));
+    }
     Vec::new()
 }
 

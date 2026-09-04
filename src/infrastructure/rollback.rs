@@ -209,7 +209,12 @@ pub async fn disarm_watchdog(unit: &str) -> Result<(), RollbackGuardError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(
+    unknown_lints,
+    clippy::expect_used,
+    clippy::unused_async_trait_impl,
+    clippy::unwrap_used
+)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};

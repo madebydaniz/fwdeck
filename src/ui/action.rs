@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::application::ports::FirewallError;
 use crate::application::{
-    MutationPlan, MutationRequest, RefreshCancellationReason, RefreshId,
+    MutationPlan, MutationRequest, ObservedSnapshot, RefreshCancellationReason, RefreshId,
     RefreshScheduleObservation, RefreshTrigger,
 };
 use crate::domain::LogEntry;
@@ -235,7 +235,7 @@ pub enum UiAction {
         /// Scheduler metadata for the completed lifecycle.
         schedule: RefreshScheduleObservation,
         /// Fresh snapshot, or the categorized backend failure.
-        result: Result<Arc<FirewallSnapshot>, FirewallError>,
+        result: Result<ObservedSnapshot, FirewallError>,
         /// Exact telemetry from the same refresh attempt.
         observation: RefreshObservation,
     },

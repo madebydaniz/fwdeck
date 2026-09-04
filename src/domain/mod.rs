@@ -10,17 +10,22 @@ pub mod ids;
 pub mod mock;
 pub mod observation;
 pub mod operation;
+pub mod operation_effect;
 pub mod policy;
 pub mod policy_set;
 pub mod port;
 pub mod proposal;
 pub mod restore;
 pub mod rich_rule;
+pub mod service;
 pub mod snapshot;
+pub mod traffic_test;
 pub mod zone;
 
 pub use address::{AddressFamily, IpSetEntry, SourceAddress};
-pub use capability::{FeatureSupport, FirewalldFeature};
+pub use capability::{
+    FeatureSupport, FirewalldFeature, SemanticCapabilityKind, SemanticCapabilityMatrix,
+};
 pub use dependency::{PolicyDependency, PolicyDependencyGraph, PolicyDependencyResource};
 pub use direct_migration::{
     DirectChain, DirectMigrationError, DirectPolicyMigration, DirectRuleTranslation,
@@ -35,13 +40,30 @@ pub use observation::{
     RefreshSectionObservation,
 };
 pub use operation::{FirewallOperation, OperationError};
+pub use operation_effect::{
+    AffectedObject, OperationEffect, OperationEffectSupport, OperationTargetSequence,
+    PartialApplicationPolicy, PolicyZoneDirection, TemporalBehavior, TrafficDimension,
+    TrafficIrrelevanceProof, UnsupportedOperationReason,
+};
 pub use policy::{PolicyDetails, PolicyTarget};
 pub use policy_set::{PolicySetDetails, PolicySetScope, PolicySetState};
 pub use port::{ForwardPort, PortNumber, PortRange, PortSelector, PortSpec, Protocol};
 pub use proposal::{DeniedFlow, ProposalError};
-pub use rich_rule::RichRule;
+pub use rich_rule::{
+    RichRule, RichRuleAction, RichRuleAddressMatch, RichRuleAnalysis, RichRuleExpression,
+    RichRuleMalformed, RichRuleUnsupported,
+};
+pub use service::{
+    MAX_SERVICE_INCLUDE_DEPTH, ServiceDefinition, ServiceDestination, ServiceModuleName,
+    ServiceResolution, ServiceResolutionFailure, resolve_service_includes,
+};
 pub use snapshot::{
     ConfigurationTarget, DegradedSection, FirewallSnapshot, FirewallStatus, IpSetInfo, LogDenied,
-    NetfilterBackend, Scoped, ServiceDefinition, SnapshotSection,
+    NetfilterBackend, Scoped, SnapshotSection,
+};
+pub use traffic_test::{
+    FirewallDecision, MAX_TRACE_STEPS, RulePriority, RulePriorityError, TraceObjectRef,
+    TrafficExpectation, TrafficTestStatus, TrafficTraceOutcome, TrafficTraceStage,
+    TrafficTraceStep, UnknownReason,
 };
 pub use zone::{ActiveZone, ZoneDetails, ZoneTarget};

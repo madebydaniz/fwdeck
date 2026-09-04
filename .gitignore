@@ -119,7 +119,11 @@ _site/
 
 # cargo-fuzz (dev-only harness); the targets and fuzz/Cargo.toml are committed
 /fuzz/target/
-/fuzz/corpus/
+/fuzz/corpus/*
+!/fuzz/corpus/analyze_rich_rule/
+/fuzz/corpus/analyze_rich_rule/*
+!/fuzz/corpus/analyze_rich_rule/supported
+!/fuzz/corpus/analyze_rich_rule/unsupported
+!/fuzz/corpus/analyze_rich_rule/malformed
 /fuzz/artifacts/
 /fuzz/Cargo.lock
-

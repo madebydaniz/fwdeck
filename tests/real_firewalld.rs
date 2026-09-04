@@ -18,7 +18,10 @@
 use fwdeck::application::ports::FirewallBackend;
 use fwdeck::domain::{ConfigurationTarget, PortSpec, ServiceName};
 use fwdeck::infrastructure::firewalld::CliBackend;
-use fwdeck::infrastructure::process::TokioRunner;
+use fwdeck::infrastructure::process::{CommandOutput, CommandRequest, CommandRunner, TokioRunner};
+
+const DISPOSABLE_MARKER: &str = "/run/fwdeck-disposable-firewalld";
+const DISPOSABLE_ENV: &str = "FWDECK_REAL_FIREWALLD_TEST";
 
 /// The real-daemon tests share one firewalld, so a `reload` in one test can
 /// flip another's runtime view (a permanent-only zone becomes active mid-test).
@@ -26,10 +29,120 @@ use fwdeck::infrastructure::process::TokioRunner;
 /// `--test-threads=1`.
 static FIREWALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn disposable_environment_allowed(
+    env_value: Option<&str>,
+    marker_exists: bool,
+    docker_identity_exists: bool,
+) -> bool {
+    env_value == Some("1") && marker_exists && docker_identity_exists
+}
+
+fn assert_disposable_environment() {
+    let env_value = std::env::var(DISPOSABLE_ENV).ok();
+    let marker_exists = std::path::Path::new(DISPOSABLE_MARKER).is_file();
+    let docker_identity_exists = std::path::Path::new("/.dockerenv").is_file();
+    assert!(
+        disposable_environment_allowed(env_value.as_deref(), marker_exists, docker_identity_exists,),
+        "real-firewalld tests require the FWDeck disposable container entrypoint"
+    );
+}
+
+async fn guarded_firewall_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    assert_disposable_environment();
+    FIREWALL_LOCK.lock().await
+}
+
+async fn firewall_output(args: &[&str]) -> CommandOutput {
+    TokioRunner
+        .run(CommandRequest {
+            program: "firewall-cmd",
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            timeout: std::time::Duration::from_secs(5),
+        })
+        .await
+        .unwrap()
+}
+
+async fn firewall_ok(args: &[&str]) -> String {
+    let output = firewall_output(args).await;
+    assert_eq!(
+        output.exit_code,
+        Some(0),
+        "firewall-cmd {args:?} failed: {}",
+        output.stderr.trim()
+    );
+    output.stdout.trim().to_owned()
+}
+
+fn sorted_owned(mut items: Vec<String>) -> Vec<String> {
+    items.sort();
+    items
+}
+
+fn sorted_strings<T: std::fmt::Display>(items: &[T]) -> Vec<String> {
+    sorted_owned(items.iter().map(ToString::to_string).collect())
+}
+
+async fn firewall_words(args: &[&str]) -> Vec<String> {
+    sorted_owned(
+        firewall_ok(args)
+            .await
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+async fn firewall_i16(args: &[&str]) -> i16 {
+    firewall_ok(args).await.parse().unwrap()
+}
+
+async fn firewall_zone_info_i16(zone: &str, key: &str) -> i16 {
+    let zone_argument = format!("--zone={zone}");
+    let info = firewall_ok(&[&zone_argument, "--list-all"]).await;
+    info.lines()
+        .find_map(|line| {
+            let (candidate, value) = line.trim_start().split_once(':')?;
+            (candidate.trim() == key).then(|| value.trim().parse().unwrap())
+        })
+        .unwrap_or_else(|| panic!("missing `{key}` in runtime zone `{zone}`"))
+}
+
+async fn firewall_info_values(service: &str, key: &str) -> Vec<String> {
+    let argument = format!("--info-service={service}");
+    let info = firewall_ok(&["--permanent", &argument]).await;
+    let values = info
+        .lines()
+        .find_map(|line| {
+            let (candidate, values) = line.trim_start().split_once(':')?;
+            (candidate.trim() == key).then_some(values)
+        })
+        .unwrap_or_else(|| panic!("missing `{key}` in service `{service}`"));
+    sorted_owned(values.split_whitespace().map(str::to_owned).collect())
+}
+
+async fn ensure_reviewed_zone_runtime_seed() {
+    let query = ["--zone=fwdeck-observe", "--query-service=https"];
+    if firewall_output(&query).await.exit_code != Some(0) {
+        let output = firewall_output(&["--zone=fwdeck-observe", "--add-service=https"]).await;
+        assert_eq!(
+            output.exit_code,
+            Some(0),
+            "failed to restore reviewed runtime service: {}",
+            output.stderr.trim()
+        );
+    }
+    assert_eq!(
+        firewall_output(&query).await.exit_code,
+        Some(0),
+        "reviewed runtime service must be enabled"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a running firewalld (use the dev container)"]
 async fn probe_and_snapshot_against_real_daemon() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     let backend = CliBackend::new(TokioRunner);
 
@@ -58,7 +171,7 @@ async fn probe_and_snapshot_against_real_daemon() {
 #[tokio::test]
 #[ignore = "MUTATES firewalld — dev container only"]
 async fn add_and_remove_service_round_trip() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::application::ports::OperationOutcome;
     use fwdeck::domain::{ConfigurationTarget, FirewallOperation, ServiceName, ZoneName};
@@ -101,7 +214,7 @@ async fn add_and_remove_service_round_trip() {
 #[tokio::test]
 #[ignore = "MUTATES firewalld — dev container only"]
 async fn create_and_delete_zone_round_trip() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::application::ports::OperationOutcome;
     use fwdeck::domain::{FirewallOperation, ZoneName};
@@ -158,7 +271,7 @@ async fn create_and_delete_zone_round_trip() {
 #[tokio::test]
 #[ignore = "MUTATES firewalld — dev container only"]
 async fn custom_service_round_trip() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::application::ports::OperationOutcome;
     use fwdeck::domain::FirewallOperation;
@@ -203,7 +316,7 @@ async fn custom_service_round_trip() {
 #[tokio::test]
 #[ignore = "MUTATES firewalld — dev container only"]
 async fn policy_round_trip() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::application::ports::OperationOutcome;
     use fwdeck::domain::{FirewallOperation, PolicyName, PolicyTarget};
@@ -248,7 +361,7 @@ async fn policy_round_trip() {
 #[tokio::test]
 #[ignore = "MUTATES firewalld — dev container only"]
 async fn direct_rule_migration_creates_additive_policy_replacement() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::application::ports::OperationOutcome;
     use fwdeck::domain::{FirewallOperation, PolicyName, translate_direct_rule};
@@ -309,7 +422,7 @@ async fn direct_rule_migration_creates_additive_policy_replacement() {
 #[tokio::test]
 #[ignore = "MUTATES firewalld policy sets — dev container only"]
 async fn policy_set_gateway_enable_disable_round_trip() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::application::ports::OperationOutcome;
     use fwdeck::domain::{
@@ -380,6 +493,8 @@ fn sorted<T: Clone + Ord>(items: &[T]) -> Vec<T> {
 #[cfg(feature = "dbus")]
 fn assert_zone_parity(cli: &fwdeck::domain::ZoneDetails, dbus: &fwdeck::domain::ZoneDetails) {
     assert_eq!(dbus.target, cli.target, "zone targets must match");
+    assert_eq!(dbus.ingress_priority, cli.ingress_priority);
+    assert_eq!(dbus.egress_priority, cli.egress_priority);
     assert_eq!(sorted(&dbus.services), sorted(&cli.services));
     assert_eq!(sorted(&dbus.ports), sorted(&cli.ports));
     assert_eq!(sorted(&dbus.forward_ports), sorted(&cli.forward_ports));
@@ -425,9 +540,9 @@ fn assert_cleanup_applied(
 #[tokio::test]
 #[ignore = "requires a running firewalld + D-Bus (dev container)"]
 async fn dbus_backend_agrees_with_cli_on_read_path() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
-    use fwdeck::domain::SnapshotSection;
+    use fwdeck::domain::{FeatureSupport, FirewalldFeature, SnapshotSection};
     use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
 
     let cli = CliBackend::new(TokioRunner);
@@ -448,6 +563,17 @@ async fn dbus_backend_agrees_with_cli_on_read_path() {
     let zone = &cli_snap.default_zone;
     assert_zone_parity(&cli_snap.runtime[zone], &dbus_snap.runtime[zone]);
     assert_zone_parity(&cli_snap.permanent[zone], &dbus_snap.permanent[zone]);
+    if FirewalldFeature::ZonePriorities.support_for(cli_status.version.as_deref())
+        == FeatureSupport::Supported
+    {
+        assert!(
+            !dbus_snap.degraded.iter().any(|degraded| {
+                degraded.section == SnapshotSection::Zones
+                    && degraded.object.as_deref() == Some(zone.as_str())
+            }),
+            "supported zone priorities must have complete D-Bus evidence"
+        );
+    }
     // The D-Bus adapter intentionally omits these resource families. Its
     // aggregate drift value is therefore not comparable to the full CLI
     // snapshot, but the missing capabilities must be reported honestly.
@@ -471,7 +597,7 @@ async fn dbus_backend_agrees_with_cli_on_read_path() {
 #[tokio::test]
 #[ignore = "MUTATES firewalld via D-Bus — dev container only"]
 async fn dbus_backend_add_and_remove_service_runtime() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::domain::{ConfigurationTarget, FirewallOperation, ServiceName, ZoneName};
     use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
@@ -529,7 +655,7 @@ async fn dbus_backend_add_and_remove_service_runtime() {
 #[tokio::test]
 #[ignore = "requires firewalld + D-Bus — dev container only"]
 async fn dbus_backend_refuses_permanent_scope_honestly() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::application::ports::OperationOutcome;
     use fwdeck::domain::{ConfigurationTarget, FirewallOperation, ServiceName, ZoneName};
@@ -560,7 +686,7 @@ async fn dbus_backend_refuses_permanent_scope_honestly() {
 #[tokio::test]
 #[ignore = "MUTATES firewalld via D-Bus — dev container only"]
 async fn dbus_backend_add_and_remove_port_runtime() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::domain::{FirewallOperation, ZoneName};
     use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
@@ -616,7 +742,7 @@ async fn dbus_backend_add_and_remove_port_runtime() {
 #[tokio::test]
 #[ignore = "MUTATES firewalld via D-Bus — dev container only"]
 async fn dbus_backend_restores_masquerade_runtime_state() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::domain::{FirewallOperation, ZoneName};
     use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
@@ -670,7 +796,7 @@ async fn dbus_backend_restores_masquerade_runtime_state() {
 #[tokio::test]
 #[ignore = "MUTATES permanent config offline — dev container only"]
 async fn offline_backend_reads_and_writes_permanent_config() {
-    let _serial = FIREWALL_LOCK.lock().await;
+    let _serial = guarded_firewall_lock().await;
 
     use fwdeck::application::ports::OperationOutcome;
     use fwdeck::domain::{ConfigurationTarget, FirewallOperation, SnapshotSection};
@@ -724,6 +850,8 @@ async fn offline_backend_reads_and_writes_permanent_config() {
 #[tokio::test]
 #[ignore = "requires nftables + root (use the dev container)"]
 async fn nft_counters_parse_against_real_ruleset() {
+    let _serial = guarded_firewall_lock().await;
+
     // Reads via the real `nft` binary; on the nftables backend this must return
     // Ok (possibly empty — firewalld counters only some rules), never a parse
     // error, which would mean the libnftables JSON shape drifted.
@@ -736,4 +864,324 @@ async fn nft_counters_parse_against_real_ruleset() {
         }
         Err(err) => panic!("nft counter read/parse failed on a real ruleset: {err}"),
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReviewedZoneDocument {
+    zones: Vec<ReviewedZone>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReviewedZone {
+    name: String,
+    runtime: ReviewedZoneScope,
+    permanent: ReviewedZoneScope,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReviewedZoneScope {
+    ingress_priority: i16,
+    egress_priority: i16,
+    services: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReviewedServiceDocument {
+    complete_case: ReviewedServiceCase,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReviewedServiceCase {
+    root: String,
+    definitions: Vec<ReviewedServiceDefinition>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReviewedServiceDefinition {
+    name: String,
+    ports: Vec<String>,
+    protocols: Vec<String>,
+    source_ports: Vec<String>,
+    destinations: Vec<ReviewedDestination>,
+    includes: Vec<String>,
+    helpers: Vec<String>,
+    modules: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReviewedDestination {
+    family: String,
+    address: String,
+}
+
+fn reviewed_destinations(definition: &ReviewedServiceDefinition) -> Vec<String> {
+    sorted_owned(
+        definition
+            .destinations
+            .iter()
+            .map(|destination| format!("{}:{}", destination.family, destination.address))
+            .collect(),
+    )
+}
+
+fn observed_destinations(definition: &fwdeck::domain::ServiceDefinition) -> Vec<String> {
+    sorted_owned(
+        definition
+            .destinations
+            .iter()
+            .map(|destination| format!("{}:{}", destination.family.as_str(), destination.address))
+            .collect(),
+    )
+}
+
+fn assert_service_definition(
+    observed: &fwdeck::domain::ServiceDefinition,
+    reviewed: &ReviewedServiceDefinition,
+) {
+    assert_eq!(
+        sorted_strings(&observed.ports),
+        sorted_owned(reviewed.ports.clone())
+    );
+    assert_eq!(
+        sorted_strings(&observed.protocols),
+        sorted_owned(reviewed.protocols.clone())
+    );
+    assert_eq!(
+        sorted_strings(&observed.source_ports),
+        sorted_owned(reviewed.source_ports.clone())
+    );
+    assert_eq!(
+        observed_destinations(observed),
+        reviewed_destinations(reviewed)
+    );
+    assert_eq!(
+        sorted_strings(&observed.includes),
+        sorted_owned(reviewed.includes.clone())
+    );
+    assert_eq!(
+        sorted_strings(&observed.helpers),
+        sorted_owned(reviewed.helpers.clone())
+    );
+    assert_eq!(
+        sorted_strings(&observed.modules),
+        sorted_owned(reviewed.modules.clone())
+    );
+}
+
+fn reviewed_zone() -> ReviewedZone {
+    let document: ReviewedZoneDocument = serde_json::from_str(include_str!(
+        "fixtures/traffic_testing/observation/zone-observation.json"
+    ))
+    .unwrap();
+    document
+        .zones
+        .into_iter()
+        .find(|zone| zone.name == "public")
+        .unwrap()
+}
+
+fn reviewed_service() -> ReviewedServiceCase {
+    let document: ReviewedServiceDocument = serde_json::from_str(include_str!(
+        "fixtures/traffic_testing/observation/service-evidence.json"
+    ))
+    .unwrap();
+    document.complete_case
+}
+
+async fn assert_reviewed_priorities(
+    runtime: &fwdeck::domain::ZoneDetails,
+    permanent: &fwdeck::domain::ZoneDetails,
+    reviewed: &ReviewedZone,
+    version: &str,
+) {
+    use fwdeck::domain::{FeatureSupport, FirewalldFeature};
+
+    match FirewalldFeature::ZonePriorities.support_for(Some(version.trim())) {
+        FeatureSupport::Supported => {
+            assert_eq!(
+                runtime.ingress_priority.get(),
+                reviewed.permanent.ingress_priority
+            );
+            assert_eq!(
+                runtime.egress_priority.get(),
+                reviewed.permanent.egress_priority
+            );
+            assert_eq!(
+                permanent.ingress_priority.get(),
+                reviewed.permanent.ingress_priority
+            );
+            assert_eq!(
+                permanent.egress_priority.get(),
+                reviewed.permanent.egress_priority
+            );
+            assert_eq!(
+                firewall_zone_info_i16("fwdeck-observe", "ingress-priority").await,
+                reviewed.permanent.ingress_priority
+            );
+            assert_eq!(
+                firewall_zone_info_i16("fwdeck-observe", "egress-priority").await,
+                reviewed.permanent.egress_priority
+            );
+            assert_eq!(
+                firewall_i16(&[
+                    "--permanent",
+                    "--zone=fwdeck-observe",
+                    "--get-ingress-priority",
+                ])
+                .await,
+                reviewed.permanent.ingress_priority
+            );
+            assert_eq!(
+                firewall_i16(&[
+                    "--permanent",
+                    "--zone=fwdeck-observe",
+                    "--get-egress-priority",
+                ])
+                .await,
+                reviewed.permanent.egress_priority
+            );
+        }
+        FeatureSupport::Unsupported => {
+            assert_ne!(
+                firewall_output(&[
+                    "--permanent",
+                    "--zone=fwdeck-observe",
+                    "--get-ingress-priority",
+                ])
+                .await
+                .exit_code,
+                Some(0),
+                "pre-2.0 firewalld must not be treated as priority-capable"
+            );
+        }
+        FeatureSupport::Unknown => panic!("unusable firewalld version `{version}`"),
+    }
+}
+
+async fn assert_reviewed_zone(
+    snapshot: &fwdeck::domain::FirewallSnapshot,
+    reviewed: &ReviewedZone,
+    version: &str,
+) -> fwdeck::domain::ZoneName {
+    let zone = fwdeck::domain::ZoneName::parse("fwdeck-observe").unwrap();
+    let runtime = &snapshot.runtime[&zone];
+    let permanent = &snapshot.permanent[&zone];
+
+    assert_eq!(
+        sorted_strings(&runtime.services),
+        sorted_owned(reviewed.runtime.services.clone())
+    );
+    assert_eq!(
+        sorted_strings(&permanent.services),
+        sorted_owned(reviewed.permanent.services.clone())
+    );
+    assert_eq!(
+        firewall_words(&["--zone=fwdeck-observe", "--list-services"]).await,
+        sorted_owned(reviewed.runtime.services.clone())
+    );
+    assert_eq!(
+        firewall_words(&["--permanent", "--zone=fwdeck-observe", "--list-services"]).await,
+        sorted_owned(reviewed.permanent.services.clone())
+    );
+    assert_reviewed_priorities(runtime, permanent, reviewed, version).await;
+    zone
+}
+
+async fn assert_reviewed_service_definition(
+    snapshot: &fwdeck::domain::FirewallSnapshot,
+    reviewed: &ReviewedServiceCase,
+) {
+    let root = reviewed
+        .definitions
+        .iter()
+        .find(|definition| definition.name == reviewed.root)
+        .unwrap();
+    let service = ServiceName::parse(&reviewed.root).unwrap();
+    assert_service_definition(&snapshot.service_definitions[&service], root);
+    assert_eq!(
+        firewall_words(&["--permanent", "--service=admin-stack", "--get-ports"]).await,
+        sorted_owned(root.ports.clone())
+    );
+    assert_eq!(
+        firewall_words(&["--permanent", "--service=admin-stack", "--get-protocols"]).await,
+        sorted_owned(root.protocols.clone())
+    );
+    assert_eq!(
+        firewall_words(&["--permanent", "--service=admin-stack", "--get-source-ports",]).await,
+        sorted_owned(root.source_ports.clone())
+    );
+    assert_eq!(
+        firewall_words(&["--permanent", "--service=admin-stack", "--get-destinations"]).await,
+        reviewed_destinations(root)
+    );
+    assert_eq!(
+        firewall_words(&["--permanent", "--service=admin-stack", "--get-includes"]).await,
+        sorted_owned(root.includes.clone())
+    );
+    assert_eq!(
+        firewall_words(&[
+            "--permanent",
+            "--service=admin-stack",
+            "--get-service-helpers",
+        ])
+        .await,
+        sorted_owned(root.helpers.clone())
+    );
+    assert_eq!(
+        firewall_info_values("admin-stack", "modules").await,
+        sorted_owned(root.modules.clone())
+    );
+}
+
+#[cfg(feature = "dbus")]
+async fn assert_semantic_dbus_parity(
+    cli: &fwdeck::domain::FirewallSnapshot,
+    zone: &fwdeck::domain::ZoneName,
+) {
+    use fwdeck::domain::SnapshotSection;
+    use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
+
+    let dbus = DbusBackend::connect().await.unwrap();
+    let dbus_snapshot = dbus.snapshot().await.unwrap();
+    assert_zone_parity(&cli.runtime[zone], &dbus_snapshot.runtime[zone]);
+    assert_zone_parity(&cli.permanent[zone], &dbus_snapshot.permanent[zone]);
+    assert!(
+        dbus_snapshot
+            .degraded
+            .iter()
+            .any(|degraded| degraded.section == SnapshotSection::ServiceDefinitions)
+    );
+}
+
+#[test]
+fn disposable_real_daemon_guard_rejects_host_like_processes() {
+    assert!(!disposable_environment_allowed(None, false, false));
+    assert!(!disposable_environment_allowed(Some("1"), false, true));
+    assert!(!disposable_environment_allowed(Some("1"), true, false));
+    assert!(disposable_environment_allowed(Some("1"), true, true));
+}
+
+#[tokio::test]
+#[ignore = "requires a seeded disposable firewalld container"]
+async fn semantic_observation_matches_reviewed_seed_and_daemon_oracle() {
+    let _serial = guarded_firewall_lock().await;
+    let reviewed_zone = reviewed_zone();
+    let reviewed_service = reviewed_service();
+    let version = firewall_ok(&["--version"]).await;
+    eprintln!("firewalld-version={}", version.trim());
+
+    // Earlier integration tests may reload the shared daemon and clear
+    // runtime-only seeds. Restore this test's reviewed precondition so it is
+    // independent of suite order while remaining idempotent in isolation.
+    ensure_reviewed_zone_runtime_seed().await;
+
+    let backend = CliBackend::new(TokioRunner);
+    let snapshot = backend.snapshot().await.unwrap();
+    let zone = assert_reviewed_zone(&snapshot, &reviewed_zone, &version).await;
+    assert_reviewed_service_definition(&snapshot, &reviewed_service).await;
+
+    #[cfg(feature = "dbus")]
+    assert_semantic_dbus_parity(&snapshot, &zone).await;
+    #[cfg(not(feature = "dbus"))]
+    let _ = zone;
 }

@@ -131,7 +131,7 @@ pub(super) fn fire_rollback(state: &mut UiState) -> Vec<Effect> {
         );
         return Vec::new();
     }
-    let pending: Vec<_> = state.pending_rollback.drain(..).collect();
+    let pending = std::mem::take(&mut state.pending_rollback);
     fire_pending(state, pending)
 }
 

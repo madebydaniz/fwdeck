@@ -2,7 +2,7 @@
 //! treat one ingress packet, evaluated against the RUNTIME snapshot.
 //!
 //! This is an **approximation of firewalld's zone dispatch**, not an nftables
-//! simulator: rich rules are matched textually against their raw text, the
+//! simulator: rich rules use a typed supported subset, the
 //! ingress interface is unknown (so interface-bound zones are only reported as
 //! candidates), and rule priorities are ignored. It exists to answer "why is
 //! this blocked/allowed" at the zone level, honestly labeled as best-effort.
@@ -14,8 +14,9 @@ use std::str::FromStr;
 use super::address::{AddressFamily, SourceAddress};
 use super::ids::{IpSetName, ServiceName, ZoneName};
 use super::port::{PortSelector, PortSpec};
-use super::rich_rule::RichRule;
-use super::snapshot::{FirewallSnapshot, IpSetInfo, ServiceDefinition};
+use super::rich_rule::{RichRule, RichRuleAnalysis, RichRuleExpression};
+use super::service::ServiceDefinition;
+use super::snapshot::{FirewallSnapshot, IpSetInfo};
 use super::zone::{ZoneDetails, ZoneTarget};
 
 /// Explains how firewalld would treat ingress traffic from `source` to
@@ -108,18 +109,16 @@ fn evaluate_zone(
 ) {
     let zone = &details.name;
 
-    // Stage 2: rich rules, matched against their raw text — a textual
-    // approximation, priorities and non-source conditions are ignored.
+    // Stage 2: rich rules use only the typed, supported analysis subset.
     let rich_match = details
         .rich_rules
         .iter()
-        .find(|rule| rich_rule_matches(rule, ip, port, &snapshot.service_definitions));
-    if let Some(rule) = rich_match {
-        lines.push(("rich rules".to_owned(), format!("textual match: {rule}")));
-        let action = rule.action().unwrap_or("unknown action");
+        .find_map(|rule| rich_rule_match(rule, ip, port, &snapshot.service_definitions));
+    if let Some((rule, action)) = rich_match {
+        lines.push(("rich rules".to_owned(), format!("typed match: {rule}")));
         lines.push((
             "verdict".to_owned(),
-            format!("{action} — by the rich rule above (textual approximation)"),
+            format!("{} — by the rich rule above", action.as_str()),
         ));
         return;
     }
@@ -263,12 +262,25 @@ fn masked_eq(net: &[u8], ip: &[u8], prefix: u8) -> bool {
     true
 }
 
-/// Best-effort textual rich-rule match: the raw text must carry a
-/// `source address="…"` covering `ip` (family-compatible), and either no
-/// port/service condition, a `port port="…" protocol="…"` covering the query,
-/// or a `service name="…"` whose cached definition opens the queried port.
-fn rich_rule_matches(
-    rule: &RichRule,
+/// Matches only the typed supported subset. Unsupported or malformed rules
+/// never become an inferred decision.
+fn rich_rule_match<'a>(
+    rule: &'a RichRule,
+    ip: IpAddr,
+    port: PortSpec,
+    definitions: &BTreeMap<ServiceName, ServiceDefinition>,
+) -> Option<(&'a RichRule, super::rich_rule::RichRuleAction)> {
+    let RichRuleAnalysis::Supported(expression) = rule.analyze() else {
+        return None;
+    };
+    if !expression_matches(&expression, ip, port, definitions) {
+        return None;
+    }
+    Some((rule, expression.action))
+}
+
+fn expression_matches(
+    expression: &RichRuleExpression,
     ip: IpAddr,
     port: PortSpec,
     definitions: &BTreeMap<ServiceName, ServiceDefinition>,
@@ -278,34 +290,36 @@ fn rich_rule_matches(
     } else {
         AddressFamily::Ipv6
     };
-    if rule.family().is_some_and(|f| f != family.as_str()) {
+    if expression.family.is_some_and(|expected| expected != family) {
         return false;
     }
-    let raw = rule.as_str();
-    let Some(source) = attr(raw, "source address") else {
-        return false;
-    };
-    if !entry_matches(source, ip) {
+    if expression.destination.is_some() || expression.source_port.is_some() {
+        // This explain input has no destination address or source port.
         return false;
     }
-    if let Some(rule_port) = attr(raw, "port port") {
-        return attr(raw, "protocol") == Some(port.protocol.as_str())
-            && rule_port
-                .parse::<PortSelector>()
-                .is_ok_and(|selector| selector_covers(selector, port.port));
+    if let Some(source) = &expression.source {
+        let matches = match &source.address {
+            SourceAddress::Ip { addr, prefix: None } => *addr == ip,
+            SourceAddress::Ip {
+                addr,
+                prefix: Some(prefix),
+            } => cidr_contains(*addr, *prefix, ip),
+            SourceAddress::Mac(_) | SourceAddress::IpSet(_) => false,
+        };
+        if matches == source.inverted {
+            return false;
+        }
     }
-    if let Some(service) = attr(raw, "service name") {
-        return ServiceName::parse(service)
-            .is_ok_and(|name| service_opens(definitions.get(&name), port));
+    if let Some(rule_port) = expression.destination_port {
+        return port_covers(rule_port, port);
     }
-    true // source-wide rule with no port/service condition
-}
-
-/// Extracts the value of a `key="value"` attribute from raw rich-rule text.
-fn attr<'a>(raw: &'a str, key: &str) -> Option<&'a str> {
-    let pattern = format!("{key}=\"");
-    let start = raw.find(&pattern)? + pattern.len();
-    raw.get(start..)?.split('"').next()
+    if let Some(service) = &expression.service {
+        return service_opens(definitions.get(service), port);
+    }
+    expression
+        .protocol
+        .as_ref()
+        .is_none_or(|protocol| protocol.as_str() == port.protocol.as_str())
 }
 
 /// Whether a cached service definition opens the queried port.
