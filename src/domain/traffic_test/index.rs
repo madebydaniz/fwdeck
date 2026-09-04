@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use super::{EvaluationTarget, RulePriority};
 use crate::domain::{
-    ConfigurationTarget, FirewallSnapshot, InterfaceName, PolicyDetails, PolicyName, ServiceName,
-    ServiceResolution, SnapshotSection, SourceAddress, ZoneDetails, ZoneName,
-    resolve_service_includes,
+    ConfigurationTarget, FirewallSnapshot, InterfaceName, PolicyDetails, PolicyName,
+    RichRuleAnalysis, ServiceName, ServiceResolution, SnapshotSection, SourceAddress, ZoneDetails,
+    ZoneName, resolve_service_includes,
 };
 
 /// Exact binding evidence used to classify ingress traffic.
@@ -114,6 +114,17 @@ impl TrafficEvaluationIndex {
                 .values()
                 .flat_map(|policy| policy.services.iter().cloned()),
         );
+        for rule in zones
+            .values()
+            .flat_map(|zone| &zone.rich_rules)
+            .chain(policies.values().flat_map(|policy| &policy.rich_rules))
+        {
+            if let RichRuleAnalysis::Supported(expression) = rule.analyze()
+                && let Some(service) = expression.service
+            {
+                referenced_services.insert(service);
+            }
+        }
         let services = referenced_services
             .into_iter()
             .map(|name| {

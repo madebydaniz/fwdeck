@@ -11,7 +11,8 @@ use super::{
     TrafficValidationError, UnknownReason,
 };
 use crate::domain::{
-    FeatureSupport, FirewalldFeature, PolicyDetails, PortSelector, Protocol, ServiceDefinition,
+    AddressFamily, FeatureSupport, FirewalldFeature, PolicyDetails, PolicyTarget, PortSelector,
+    Protocol, RichRule, RichRuleAction, RichRuleAnalysis, RichRuleExpression, ServiceDefinition,
     SnapshotSection, SourceAddress, TraceObjectRef, ZoneDetails, ZoneName, ZoneTarget,
 };
 
@@ -155,11 +156,13 @@ fn evaluate_selected_zone(
             TraceObjectRef::SnapshotSection(SnapshotSection::Policies),
         );
     }
-    if let Some(policy) = index
-        .policies()
-        .values()
-        .find(|policy| policy_may_apply(policy, &selected_zone, index.target()))
+    let policies = applicable_policies(index, &selected_zone);
+    if !policies.is_empty()
+        && let Err(reason) = require_capability(index, FirewalldFeature::PolicyObjects, &mut trace)
     {
+        return unknown(scenario, trace, TrafficTraceStage::PolicyEvaluation, reason);
+    }
+    if let Some(policy) = policies.iter().find(|policy| policy.priority == 0) {
         return unknown_with_object(
             scenario,
             trace,
@@ -169,24 +172,61 @@ fn evaluate_selected_zone(
         );
     }
 
-    if !zone.rich_rules.is_empty() {
-        return unknown_with_object(
-            scenario,
-            trace,
-            TrafficTraceStage::RichRuleEvaluation,
-            UnknownReason::UnsupportedRichRule,
-            TraceObjectRef::RichRule {
-                zone: selected_zone,
-                index: 0,
-            },
-        );
+    match evaluate_policy_range(
+        index,
+        scenario,
+        &policies,
+        PolicyRange::Negative,
+        &mut trace,
+    ) {
+        PathOutcome::Decision(decision) => return finish(scenario, trace, decision, None),
+        PathOutcome::Unknown(reason) => {
+            return unknown(scenario, trace, TrafficTraceStage::PolicyEvaluation, reason);
+        }
+        PathOutcome::Continue => {}
     }
 
-    match evaluate_zone(index, scenario, zone, &mut trace) {
-        ZoneOutcome::Decision(decision) => finish(scenario, trace, decision, None),
-        ZoneOutcome::Unknown(reason) => {
-            unknown(scenario, trace, TrafficTraceStage::ZoneEvaluation, reason)
+    match evaluate_zone_before_target(index, scenario, zone, &mut trace) {
+        PathOutcome::Decision(decision) => return finish(scenario, trace, decision, None),
+        PathOutcome::Unknown(reason) => {
+            return unknown(scenario, trace, TrafficTraceStage::ZoneEvaluation, reason);
         }
+        PathOutcome::Continue => {}
+    }
+
+    evaluate_after_zone(index, scenario, zone, &policies, trace)
+}
+
+fn evaluate_after_zone(
+    index: &TrafficEvaluationIndex,
+    scenario: &TrafficScenario,
+    zone: &ZoneDetails,
+    policies: &[&PolicyDetails],
+    mut trace: Vec<TrafficTraceStep>,
+) -> Result<TrafficTestResult, TrafficEvaluationError> {
+    if policies.iter().any(|policy| policy.priority > 0)
+        && let Err(reason) = require_capability(
+            index,
+            FirewalldFeature::PositivePolicyPriorityBeforeZoneTarget,
+            &mut trace,
+        )
+    {
+        return unknown(scenario, trace, TrafficTraceStage::PolicyEvaluation, reason);
+    }
+    let outcome =
+        evaluate_policy_range(index, scenario, policies, PolicyRange::Positive, &mut trace);
+    match outcome {
+        PathOutcome::Decision(decision) => finish(scenario, trace, decision, None),
+        PathOutcome::Unknown(reason) => {
+            unknown(scenario, trace, TrafficTraceStage::PolicyEvaluation, reason)
+        }
+        PathOutcome::Continue => match zone_target_decision(index, scenario, zone, &mut trace) {
+            PathOutcome::Decision(decision) => finish(scenario, trace, decision, None),
+            PathOutcome::Unknown(reason) => {
+                unknown(scenario, trace, TrafficTraceStage::TargetEvaluation, reason)
+            }
+            PathOutcome::Continue => unreachable!("zone targets are terminal"),
+        },
     }
 }
 
@@ -386,85 +426,272 @@ fn policy_may_apply(
             .ingress_zones
             .iter()
             .any(|zone| zone == "ANY" || zone == ingress_zone.as_str())
-        && policy
-            .egress_zones
-            .iter()
-            .any(|zone| zone == "HOST" || zone == "ANY")
+        && policy.egress_zones.iter().any(|zone| zone == "HOST")
 }
 
-enum ZoneOutcome {
+fn applicable_policies<'a>(
+    index: &'a TrafficEvaluationIndex,
+    selected_zone: &ZoneName,
+) -> Vec<&'a PolicyDetails> {
+    index
+        .policy_order()
+        .iter()
+        .filter_map(|name| index.policy(name))
+        .filter(|policy| policy_may_apply(policy, selected_zone, index.target()))
+        .collect()
+}
+
+enum PathOutcome {
     Decision(FirewallDecision),
+    Continue,
     Unknown(UnknownReason),
 }
 
-fn evaluate_zone(
+#[derive(Clone, Copy)]
+enum PolicyRange {
+    Negative,
+    Positive,
+}
+
+impl PolicyRange {
+    const fn contains(self, priority: i32) -> bool {
+        match self {
+            Self::Negative => priority < 0,
+            Self::Positive => priority > 0,
+        }
+    }
+}
+
+fn policy_shape_supported(policy: &PolicyDetails) -> bool {
+    let ingress_any = policy.ingress_zones.iter().any(|zone| zone == "ANY");
+    let egress_host = policy.egress_zones.iter().any(|zone| zone == "HOST");
+    policy.priority != 0
+        && i16::try_from(policy.priority).is_ok()
+        && !policy.masquerade
+        && policy.forward_ports.is_empty()
+        && (!ingress_any || policy.ingress_zones.len() == 1)
+        && (!egress_host || policy.egress_zones.len() == 1)
+}
+
+fn evaluate_policy_range(
+    index: &TrafficEvaluationIndex,
+    scenario: &TrafficScenario,
+    policies: &[&PolicyDetails],
+    range: PolicyRange,
+    trace: &mut Vec<TrafficTraceStep>,
+) -> PathOutcome {
+    let filtered: Vec<&PolicyDetails> = policies
+        .iter()
+        .copied()
+        .filter(|policy| range.contains(policy.priority))
+        .collect();
+    let mut offset = 0;
+    while offset < filtered.len() {
+        let priority = filtered[offset].priority;
+        let end = filtered[offset..]
+            .iter()
+            .position(|policy| policy.priority != priority)
+            .map_or(filtered.len(), |relative| offset + relative);
+        let mut group_decision = None;
+        for policy in &filtered[offset..end] {
+            match evaluate_policy(index, scenario, policy, trace) {
+                PathOutcome::Decision(decision) => {
+                    if group_decision.is_some_and(|previous| previous != decision) {
+                        return PathOutcome::Unknown(UnknownReason::ConflictingEqualPriorityRules);
+                    }
+                    group_decision = Some(decision);
+                }
+                PathOutcome::Unknown(reason) => return PathOutcome::Unknown(reason),
+                PathOutcome::Continue => {}
+            }
+        }
+        if let Some(decision) = group_decision {
+            return PathOutcome::Decision(decision);
+        }
+        offset = end;
+    }
+    PathOutcome::Continue
+}
+
+fn evaluate_policy(
+    index: &TrafficEvaluationIndex,
+    scenario: &TrafficScenario,
+    policy: &PolicyDetails,
+    trace: &mut Vec<TrafficTraceStep>,
+) -> PathOutcome {
+    if !policy_shape_supported(policy) {
+        trace.push(
+            TrafficTraceStep::new(
+                TrafficTraceStage::PolicyEvaluation,
+                TrafficTraceOutcome::Unknown(UnknownReason::UnsupportedPolicyFeature),
+            )
+            .with_object(TraceObjectRef::Policy(policy.name.clone())),
+        );
+        return PathOutcome::Unknown(UnknownReason::UnsupportedPolicyFeature);
+    }
+    trace.push(
+        TrafficTraceStep::new(
+            TrafficTraceStage::PolicyEvaluation,
+            TrafficTraceOutcome::Matched,
+        )
+        .with_object(TraceObjectRef::Policy(policy.name.clone())),
+    );
+    let owner = RichRuleOwner::Policy(&policy.name);
+    let rich_rules = match analyze_rich_rules(&policy.rich_rules) {
+        Ok(rules) => rules,
+        Err(failure) => {
+            push_rich_analysis_failure(trace, owner, failure);
+            return PathOutcome::Unknown(UnknownReason::UnsupportedRichRule);
+        }
+    };
+    if rich_rules
+        .iter()
+        .any(|(_, expression)| expression.priority.get() != 0)
+        && let Err(reason) = require_capability(index, FirewalldFeature::RichRulePriorities, trace)
+    {
+        return PathOutcome::Unknown(reason);
+    }
+    for phase in [RichRulePhase::Negative, RichRulePhase::ZeroDeny] {
+        match evaluate_rich_phase(index, scenario, &rich_rules, phase, owner, trace) {
+            PathOutcome::Continue => {}
+            terminal => return terminal,
+        }
+    }
+    if let TrafficTransport::Icmp { icmp_type } = &scenario.transport
+        && policy.icmp_blocks.contains(icmp_type)
+    {
+        trace.push(policy_decision_step(policy, FirewallDecision::Block));
+        return PathOutcome::Decision(FirewallDecision::Block);
+    }
+    match evaluate_rich_phase(
+        index,
+        scenario,
+        &rich_rules,
+        RichRulePhase::ZeroAllow,
+        owner,
+        trace,
+    ) {
+        PathOutcome::Continue => {}
+        terminal => return terminal,
+    }
+    let primitives = PrimitiveRules {
+        ports: &policy.ports,
+        source_ports: &policy.source_ports,
+        protocols: &policy.protocols,
+        services: &policy.services,
+        object: TraceObjectRef::Policy(policy.name.clone()),
+        stage: TrafficTraceStage::PolicyEvaluation,
+    };
+    match evaluate_primitives(index, scenario, primitives, trace) {
+        PathOutcome::Continue => {}
+        terminal => return terminal,
+    }
+    match evaluate_rich_phase(
+        index,
+        scenario,
+        &rich_rules,
+        RichRulePhase::Positive,
+        owner,
+        trace,
+    ) {
+        PathOutcome::Continue => {}
+        terminal => return terminal,
+    }
+    let outcome = match policy.target {
+        PolicyTarget::Continue => TrafficTraceOutcome::Continued,
+        PolicyTarget::Accept => TrafficTraceOutcome::Decision(FirewallDecision::Allow),
+        PolicyTarget::Reject | PolicyTarget::Drop => {
+            TrafficTraceOutcome::Decision(FirewallDecision::Block)
+        }
+    };
+    trace.push(
+        TrafficTraceStep::new(TrafficTraceStage::TargetEvaluation, outcome)
+            .with_object(TraceObjectRef::Policy(policy.name.clone())),
+    );
+    match policy.target {
+        PolicyTarget::Continue => PathOutcome::Continue,
+        PolicyTarget::Accept => PathOutcome::Decision(FirewallDecision::Allow),
+        PolicyTarget::Reject | PolicyTarget::Drop => PathOutcome::Decision(FirewallDecision::Block),
+    }
+}
+
+fn evaluate_zone_before_target(
     index: &TrafficEvaluationIndex,
     scenario: &TrafficScenario,
     zone: &ZoneDetails,
     trace: &mut Vec<TrafficTraceStep>,
-) -> ZoneOutcome {
+) -> PathOutcome {
+    let owner = RichRuleOwner::Zone(&zone.name);
+    let rich_rules = match analyze_rich_rules(&zone.rich_rules) {
+        Ok(rules) => rules,
+        Err(failure) => {
+            push_rich_analysis_failure(trace, owner, failure);
+            return PathOutcome::Unknown(UnknownReason::UnsupportedRichRule);
+        }
+    };
+    if rich_rules
+        .iter()
+        .any(|(_, expression)| expression.priority.get() != 0)
+        && let Err(reason) = require_capability(index, FirewalldFeature::RichRulePriorities, trace)
+    {
+        return PathOutcome::Unknown(reason);
+    }
+    for phase in [RichRulePhase::Negative, RichRulePhase::ZeroDeny] {
+        match evaluate_rich_phase(index, scenario, &rich_rules, phase, owner, trace) {
+            PathOutcome::Continue => {}
+            terminal => return terminal,
+        }
+    }
     if let TrafficTransport::Icmp { icmp_type } = &scenario.transport {
         let blocked = if zone.icmp_block_inversion {
             !zone.icmp_blocks.contains(icmp_type)
         } else {
             zone.icmp_blocks.contains(icmp_type)
         };
-        trace.push(
-            TrafficTraceStep::new(
-                TrafficTraceStage::ZoneEvaluation,
-                if blocked {
-                    TrafficTraceOutcome::Decision(FirewallDecision::Block)
-                } else {
-                    TrafficTraceOutcome::Decision(FirewallDecision::Allow)
-                },
-            )
-            .with_object(TraceObjectRef::Zone(zone.name.clone())),
-        );
-        return ZoneOutcome::Decision(if blocked {
-            FirewallDecision::Block
-        } else {
-            FirewallDecision::Allow
-        });
-    }
-
-    if zone_port_match(zone, scenario) {
-        trace.push(zone_decision_step(zone, FirewallDecision::Allow));
-        return ZoneOutcome::Decision(FirewallDecision::Allow);
-    }
-
-    if !zone.services.is_empty() {
-        if !index.section_is_complete(SnapshotSection::Services)
-            || !index.section_is_complete(SnapshotSection::ServiceDefinitions)
-        {
-            return ZoneOutcome::Unknown(UnknownReason::IncompleteSnapshot);
-        }
-        for service_name in &zone.services {
-            let Some(resolution) = index.service(service_name) else {
-                return ZoneOutcome::Unknown(UnknownReason::IncompleteServiceDefinition);
-            };
-            if !resolution.failures.is_empty() {
-                return ZoneOutcome::Unknown(UnknownReason::IncompleteServiceDefinition);
-            }
-            match service_match(&resolution.effective, scenario) {
-                ServiceMatch::Matched => {
-                    trace.push(
-                        TrafficTraceStep::new(
-                            TrafficTraceStage::ServiceExpansion,
-                            TrafficTraceOutcome::Expanded,
-                        )
-                        .with_object(TraceObjectRef::Service(service_name.clone())),
-                    );
-                    trace.push(zone_decision_step(zone, FirewallDecision::Allow));
-                    return ZoneOutcome::Decision(FirewallDecision::Allow);
-                }
-                ServiceMatch::Unknown => {
-                    return ZoneOutcome::Unknown(UnknownReason::UnsupportedServiceFeature);
-                }
-                ServiceMatch::NotMatched => {}
-            }
+        if blocked {
+            trace.push(zone_decision_step(zone, FirewallDecision::Block));
+            return PathOutcome::Decision(FirewallDecision::Block);
         }
     }
+    match evaluate_rich_phase(
+        index,
+        scenario,
+        &rich_rules,
+        RichRulePhase::ZeroAllow,
+        owner,
+        trace,
+    ) {
+        PathOutcome::Continue => {}
+        terminal => return terminal,
+    }
+    let primitives = PrimitiveRules {
+        ports: &zone.ports,
+        source_ports: &zone.source_ports,
+        protocols: &zone.protocols,
+        services: &zone.services,
+        object: TraceObjectRef::Zone(zone.name.clone()),
+        stage: TrafficTraceStage::ZoneEvaluation,
+    };
+    match evaluate_primitives(index, scenario, primitives, trace) {
+        PathOutcome::Continue => {}
+        terminal => return terminal,
+    }
+    evaluate_rich_phase(
+        index,
+        scenario,
+        &rich_rules,
+        RichRulePhase::Positive,
+        owner,
+        trace,
+    )
+}
 
+fn zone_target_decision(
+    index: &TrafficEvaluationIndex,
+    scenario: &TrafficScenario,
+    zone: &ZoneDetails,
+    trace: &mut Vec<TrafficTraceStep>,
+) -> PathOutcome {
     let decision = match zone.target {
         ZoneTarget::Accept => FirewallDecision::Allow,
         ZoneTarget::Drop | ZoneTarget::Reject => FirewallDecision::Block,
@@ -472,9 +699,13 @@ fn evaluate_zone(
             if let Err(reason) =
                 require_capability(index, FirewalldFeature::DefaultTargetRejectSemantics, trace)
             {
-                return ZoneOutcome::Unknown(reason);
+                return PathOutcome::Unknown(reason);
             }
-            FirewallDecision::Block
+            if matches!(scenario.transport, TrafficTransport::Icmp { .. }) {
+                FirewallDecision::Allow
+            } else {
+                FirewallDecision::Block
+            }
         }
     };
     trace.push(
@@ -484,29 +715,346 @@ fn evaluate_zone(
         )
         .with_object(TraceObjectRef::Zone(zone.name.clone())),
     );
-    ZoneOutcome::Decision(decision)
+    PathOutcome::Decision(decision)
 }
 
-fn zone_port_match(zone: &ZoneDetails, scenario: &TrafficScenario) -> bool {
+fn primitive_port_match(
+    ports: &[crate::domain::PortSpec],
+    source_ports: &[crate::domain::PortSpec],
+    protocols: &[crate::domain::IpProtocol],
+    scenario: &TrafficScenario,
+) -> bool {
     match &scenario.transport {
         TrafficTransport::Tcp | TrafficTransport::Udp => {
             let Some(protocol) = transport_protocol(&scenario.transport) else {
                 return false;
             };
             let destination_match = scenario.destination_port.is_some_and(|query| {
-                zone.ports
+                ports
                     .iter()
                     .any(|rule| rule.protocol == protocol && selector_covers(rule.port, query))
             });
             let source_match = scenario.source_port.is_some_and(|query| {
-                zone.source_ports
+                source_ports
                     .iter()
                     .any(|rule| rule.protocol == protocol && selector_covers(rule.port, query))
             });
             destination_match || source_match
         }
-        TrafficTransport::RawProtocol { protocol } => zone.protocols.contains(protocol),
+        TrafficTransport::RawProtocol { protocol } => protocols.contains(protocol),
         TrafficTransport::Icmp { .. } => false,
+    }
+}
+
+struct PrimitiveRules<'a> {
+    ports: &'a [crate::domain::PortSpec],
+    source_ports: &'a [crate::domain::PortSpec],
+    protocols: &'a [crate::domain::IpProtocol],
+    services: &'a [crate::domain::ServiceName],
+    object: TraceObjectRef,
+    stage: TrafficTraceStage,
+}
+
+fn evaluate_primitives(
+    index: &TrafficEvaluationIndex,
+    scenario: &TrafficScenario,
+    rules: PrimitiveRules<'_>,
+    trace: &mut Vec<TrafficTraceStep>,
+) -> PathOutcome {
+    if primitive_port_match(rules.ports, rules.source_ports, rules.protocols, scenario) {
+        trace.push(
+            TrafficTraceStep::new(
+                rules.stage,
+                TrafficTraceOutcome::Decision(FirewallDecision::Allow),
+            )
+            .with_object(rules.object),
+        );
+        return PathOutcome::Decision(FirewallDecision::Allow);
+    }
+    if rules.services.is_empty() {
+        return PathOutcome::Continue;
+    }
+    if !index.section_is_complete(SnapshotSection::Services)
+        || !index.section_is_complete(SnapshotSection::ServiceDefinitions)
+    {
+        return PathOutcome::Unknown(UnknownReason::IncompleteSnapshot);
+    }
+    for service_name in rules.services {
+        let Some(resolution) = index.service(service_name) else {
+            return PathOutcome::Unknown(UnknownReason::IncompleteServiceDefinition);
+        };
+        if !resolution.failures.is_empty() {
+            return PathOutcome::Unknown(UnknownReason::IncompleteServiceDefinition);
+        }
+        match service_match(&resolution.effective, scenario) {
+            ServiceMatch::Matched => {
+                trace.push(
+                    TrafficTraceStep::new(
+                        TrafficTraceStage::ServiceExpansion,
+                        TrafficTraceOutcome::Expanded,
+                    )
+                    .with_object(TraceObjectRef::Service(service_name.clone())),
+                );
+                trace.push(
+                    TrafficTraceStep::new(
+                        rules.stage,
+                        TrafficTraceOutcome::Decision(FirewallDecision::Allow),
+                    )
+                    .with_object(rules.object.clone()),
+                );
+                return PathOutcome::Decision(FirewallDecision::Allow);
+            }
+            ServiceMatch::Unknown => {
+                return PathOutcome::Unknown(UnknownReason::UnsupportedServiceFeature);
+            }
+            ServiceMatch::NotMatched => {}
+        }
+    }
+    PathOutcome::Continue
+}
+
+type AnalyzedRichRules = Vec<(u32, RichRuleExpression)>;
+
+#[derive(Clone, Copy)]
+struct RichRuleAnalysisFailure {
+    index: Option<u32>,
+}
+
+fn analyze_rich_rules(rules: &[RichRule]) -> Result<AnalyzedRichRules, RichRuleAnalysisFailure> {
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            let stable_index =
+                u32::try_from(index).map_err(|_| RichRuleAnalysisFailure { index: None })?;
+            match rule.analyze() {
+                RichRuleAnalysis::Supported(expression) => Ok((stable_index, *expression)),
+                RichRuleAnalysis::Unsupported(_) | RichRuleAnalysis::Malformed(_) => {
+                    Err(RichRuleAnalysisFailure {
+                        index: Some(stable_index),
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum RichRuleOwner<'a> {
+    Zone(&'a ZoneName),
+    Policy(&'a crate::domain::PolicyName),
+}
+
+impl RichRuleOwner<'_> {
+    fn object(self, index: u32) -> TraceObjectRef {
+        match self {
+            Self::Zone(zone) => TraceObjectRef::RichRule {
+                zone: zone.clone(),
+                index,
+            },
+            Self::Policy(policy) => TraceObjectRef::PolicyRichRule {
+                policy: policy.clone(),
+                index,
+            },
+        }
+    }
+}
+
+fn push_rich_analysis_failure(
+    trace: &mut Vec<TrafficTraceStep>,
+    owner: RichRuleOwner<'_>,
+    failure: RichRuleAnalysisFailure,
+) {
+    let step = TrafficTraceStep::new(
+        TrafficTraceStage::RichRuleEvaluation,
+        TrafficTraceOutcome::Unknown(UnknownReason::UnsupportedRichRule),
+    );
+    trace.push(match failure.index {
+        Some(index) => step.with_object(owner.object(index)),
+        None => step,
+    });
+}
+
+#[derive(Clone, Copy)]
+enum RichRulePhase {
+    Negative,
+    ZeroDeny,
+    ZeroAllow,
+    Positive,
+}
+
+impl RichRulePhase {
+    const fn includes(self, expression: &RichRuleExpression) -> bool {
+        let priority = expression.priority.get();
+        match self {
+            Self::Negative => priority < 0,
+            Self::ZeroDeny => {
+                priority == 0
+                    && matches!(
+                        expression.action,
+                        RichRuleAction::Reject | RichRuleAction::Drop
+                    )
+            }
+            Self::ZeroAllow => priority == 0 && matches!(expression.action, RichRuleAction::Accept),
+            Self::Positive => priority > 0,
+        }
+    }
+}
+
+fn evaluate_rich_phase(
+    index: &TrafficEvaluationIndex,
+    scenario: &TrafficScenario,
+    rules: &AnalyzedRichRules,
+    phase: RichRulePhase,
+    owner: RichRuleOwner<'_>,
+    trace: &mut Vec<TrafficTraceStep>,
+) -> PathOutcome {
+    let mut candidates: Vec<&(u32, RichRuleExpression)> = rules
+        .iter()
+        .filter(|(_, expression)| phase.includes(expression))
+        .collect();
+    candidates.sort_by_key(|(index, expression)| (expression.priority, *index));
+    let mut offset = 0;
+    while offset < candidates.len() {
+        let priority = candidates[offset].1.priority;
+        let end = candidates[offset..]
+            .iter()
+            .position(|(_, expression)| expression.priority != priority)
+            .map_or(candidates.len(), |relative| offset + relative);
+        let mut group_decision = None;
+        for (rule_index, expression) in &candidates[offset..end] {
+            let object = owner.object(*rule_index);
+            match rich_expression_match(index, expression, scenario) {
+                RichMatch::Matched => {
+                    let decision = rich_action_decision(expression.action);
+                    trace.push(
+                        TrafficTraceStep::new(
+                            TrafficTraceStage::RichRuleEvaluation,
+                            TrafficTraceOutcome::Decision(decision),
+                        )
+                        .with_object(object),
+                    );
+                    if group_decision.is_some_and(|previous| previous != decision) {
+                        return PathOutcome::Unknown(UnknownReason::ConflictingEqualPriorityRules);
+                    }
+                    group_decision = Some(decision);
+                }
+                RichMatch::NotMatched => trace.push(
+                    TrafficTraceStep::new(
+                        TrafficTraceStage::RichRuleEvaluation,
+                        TrafficTraceOutcome::NotMatched,
+                    )
+                    .with_object(object),
+                ),
+                RichMatch::Unknown(reason) => return PathOutcome::Unknown(reason),
+            }
+        }
+        if let Some(decision) = group_decision {
+            return PathOutcome::Decision(decision);
+        }
+        offset = end;
+    }
+    PathOutcome::Continue
+}
+
+const fn rich_action_decision(action: RichRuleAction) -> FirewallDecision {
+    match action {
+        RichRuleAction::Accept => FirewallDecision::Allow,
+        RichRuleAction::Reject | RichRuleAction::Drop => FirewallDecision::Block,
+    }
+}
+
+fn rich_expression_match(
+    index: &TrafficEvaluationIndex,
+    expression: &RichRuleExpression,
+    scenario: &TrafficScenario,
+) -> RichMatch {
+    let Some(family) = scenario.source.family() else {
+        return RichMatch::Unknown(UnknownReason::CapabilityUnavailable);
+    };
+    if expression.family.is_some_and(|expected| expected != family) {
+        return RichMatch::NotMatched;
+    }
+    if let Some(source) = &expression.source {
+        let matches = source_selector_covered(&source.address, &scenario.source);
+        if matches == source.inverted {
+            return RichMatch::NotMatched;
+        }
+    }
+    if let Some(destination) = &expression.destination {
+        let TrafficDestination::Address(candidate) = &scenario.destination else {
+            return RichMatch::Unknown(UnknownReason::CapabilityUnavailable);
+        };
+        let matches = source_selector_covered(&destination.address, candidate);
+        if matches == destination.inverted {
+            return RichMatch::NotMatched;
+        }
+    }
+    if let Some(rule) = expression.destination_port {
+        let Some(protocol) = transport_protocol(&scenario.transport) else {
+            return RichMatch::NotMatched;
+        };
+        let matched = scenario
+            .destination_port
+            .is_some_and(|query| rule.protocol == protocol && selector_covers(rule.port, query));
+        return if matched {
+            RichMatch::Matched
+        } else {
+            RichMatch::NotMatched
+        };
+    }
+    if let Some(rule) = expression.source_port {
+        let Some(protocol) = transport_protocol(&scenario.transport) else {
+            return RichMatch::NotMatched;
+        };
+        let matched = scenario
+            .source_port
+            .is_some_and(|query| rule.protocol == protocol && selector_covers(rule.port, query));
+        return if matched {
+            RichMatch::Matched
+        } else {
+            RichMatch::NotMatched
+        };
+    }
+    if let Some(service_name) = &expression.service {
+        if !index.section_is_complete(SnapshotSection::Services)
+            || !index.section_is_complete(SnapshotSection::ServiceDefinitions)
+        {
+            return RichMatch::Unknown(UnknownReason::IncompleteSnapshot);
+        }
+        let Some(resolution) = index.service(service_name) else {
+            return RichMatch::Unknown(UnknownReason::IncompleteServiceDefinition);
+        };
+        if !resolution.failures.is_empty() {
+            return RichMatch::Unknown(UnknownReason::IncompleteServiceDefinition);
+        }
+        return match service_match(&resolution.effective, scenario) {
+            ServiceMatch::Matched => RichMatch::Matched,
+            ServiceMatch::NotMatched => RichMatch::NotMatched,
+            ServiceMatch::Unknown => RichMatch::Unknown(UnknownReason::UnsupportedServiceFeature),
+        };
+    }
+    if let Some(protocol) = &expression.protocol {
+        return if scenario_protocol(scenario)
+            .is_some_and(|candidate| candidate == protocol.as_str())
+        {
+            RichMatch::Matched
+        } else {
+            RichMatch::NotMatched
+        };
+    }
+    RichMatch::Matched
+}
+
+fn scenario_protocol(scenario: &TrafficScenario) -> Option<&str> {
+    match &scenario.transport {
+        TrafficTransport::Tcp => Some("tcp"),
+        TrafficTransport::Udp => Some("udp"),
+        TrafficTransport::RawProtocol { protocol } => Some(protocol.as_str()),
+        TrafficTransport::Icmp { .. } => scenario.source.family().map(|family| match family {
+            AddressFamily::Ipv4 => "icmp",
+            AddressFamily::Ipv6 => "ipv6-icmp",
+        }),
     }
 }
 
@@ -514,6 +1062,12 @@ enum ServiceMatch {
     Matched,
     NotMatched,
     Unknown,
+}
+
+enum RichMatch {
+    Matched,
+    NotMatched,
+    Unknown(UnknownReason),
 }
 
 fn service_match(definition: &ServiceDefinition, scenario: &TrafficScenario) -> ServiceMatch {
@@ -658,6 +1212,14 @@ fn zone_decision_step(zone: &ZoneDetails, decision: FirewallDecision) -> Traffic
         TrafficTraceOutcome::Decision(decision),
     )
     .with_object(TraceObjectRef::Zone(zone.name.clone()))
+}
+
+fn policy_decision_step(policy: &PolicyDetails, decision: FirewallDecision) -> TrafficTraceStep {
+    TrafficTraceStep::new(
+        TrafficTraceStage::PolicyEvaluation,
+        TrafficTraceOutcome::Decision(decision),
+    )
+    .with_object(TraceObjectRef::Policy(policy.name.clone()))
 }
 
 fn unknown(

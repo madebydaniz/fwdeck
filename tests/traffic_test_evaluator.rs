@@ -6,13 +6,13 @@ use std::sync::Arc;
 use fwdeck::domain::{
     AddressFamily, ConfigurationTarget, DegradedSection, EvaluationContext, EvaluationPhase,
     EvaluationSnapshotIdentity, EvaluationTarget, FirewallDecision, FirewallSnapshot,
-    FirewallStatus, IcmpType, InterfaceName, IpProtocol, LogDenied, NetfilterBackend, PortSelector,
-    RulePriority, Scoped, ServiceDefinition, ServiceDestination, ServiceName, SnapshotSection,
-    SourceAddress, TrafficConnectionState, TrafficDestination, TrafficDirection,
-    TrafficExpectation, TrafficScenario, TrafficScenarioId, TrafficSeverity, TrafficSuiteId,
-    TrafficSuiteRevision, TrafficTestRunId, TrafficTestStatus, TrafficTraceOutcome,
-    TrafficTraceStage, TrafficTransport, UnknownReason, ZoneDetails, ZoneName, ZoneTarget,
-    evaluate_scenario,
+    FirewallStatus, IcmpType, InterfaceName, IpProtocol, LogDenied, NetfilterBackend,
+    PolicyDetails, PolicyName, PolicyTarget, PortSelector, RichRule, RulePriority, Scoped,
+    ServiceDefinition, ServiceDestination, ServiceName, SnapshotSection, SourceAddress,
+    TrafficConnectionState, TrafficDestination, TrafficDirection, TrafficExpectation,
+    TrafficScenario, TrafficScenarioId, TrafficSeverity, TrafficSuiteId, TrafficSuiteRevision,
+    TrafficTestRunId, TrafficTestStatus, TrafficTraceOutcome, TrafficTraceStage, TrafficTransport,
+    UnknownReason, ZoneDetails, ZoneName, ZoneTarget, evaluate_scenario,
 };
 use serde::Deserialize;
 
@@ -23,6 +23,7 @@ struct Fixture {
     reviewed_against: String,
     sources: Vec<String>,
     cases: Vec<Case>,
+    policy_cases: Vec<Case>,
 }
 
 #[derive(Deserialize)]
@@ -99,7 +100,7 @@ fn snapshot(setup: &str) -> FirewallSnapshot {
         direct_rules.push("ipv4 filter INPUT 0 -j ACCEPT".to_owned());
     }
 
-    FirewallSnapshot {
+    let mut snapshot = FirewallSnapshot {
         status: FirewallStatus {
             daemon_running: true,
             version: Some("2.4.0".to_owned()),
@@ -142,14 +143,235 @@ fn snapshot(setup: &str) -> FirewallSnapshot {
                     ..ServiceDefinition::default()
                 },
             ),
+            (
+                ServiceName::parse("admin-api").unwrap(),
+                ServiceDefinition {
+                    ports: vec!["9443/tcp".parse().unwrap()],
+                    ..ServiceDefinition::default()
+                },
+            ),
         ]),
         available_services: vec![
+            ServiceName::parse("admin-api").unwrap(),
             ServiceName::parse("destination-web").unwrap(),
             ServiceName::parse("ssh").unwrap(),
         ],
         policies: Scoped::default(),
         direct_rules,
         degraded,
+    };
+    configure_policy_case(&mut snapshot, setup);
+    snapshot
+}
+
+fn policy(name: &str, priority: i32, target: PolicyTarget) -> PolicyDetails {
+    let mut policy = PolicyDetails::empty(PolicyName::parse(name).unwrap());
+    policy.active = true;
+    policy.priority = priority;
+    policy.target = target;
+    policy.ingress_zones = vec!["public".to_owned()];
+    policy.egress_zones = vec!["HOST".to_owned()];
+    policy
+}
+
+fn add_runtime_policy(snapshot: &mut FirewallSnapshot, policy: PolicyDetails) {
+    snapshot
+        .policies
+        .runtime
+        .insert(policy.name.clone(), policy);
+}
+
+fn configure_policy_case(snapshot: &mut FirewallSnapshot, setup: &str) {
+    let mut configured = match setup {
+        "policy_port" => {
+            let mut policy = policy("allow-port", -100, PolicyTarget::Continue);
+            policy.ports = vec!["2222/tcp".parse().unwrap()];
+            vec![policy]
+        }
+        "policy_service" => {
+            let mut policy = policy("allow-ssh", -100, PolicyTarget::Continue);
+            policy.services = vec![ServiceName::parse("ssh").unwrap()];
+            vec![policy]
+        }
+        "policy_protocol" => {
+            let mut policy = policy("allow-gre", -100, PolicyTarget::Continue);
+            policy.protocols = vec![IpProtocol::parse("gre").unwrap()];
+            vec![policy]
+        }
+        "policy_source_port" => {
+            let mut policy = policy("allow-source", -100, PolicyTarget::Continue);
+            policy.source_ports = vec!["45000/udp".parse().unwrap()];
+            vec![policy]
+        }
+        "policy_icmp_block" => {
+            let mut policy = policy("block-ping", -100, PolicyTarget::Continue);
+            policy.icmp_blocks = vec![IcmpType::parse("destination-unreachable").unwrap()];
+            vec![policy]
+        }
+        "policy_accept_target" => vec![policy("accept-all", -100, PolicyTarget::Accept)],
+        "policy_reject_target" => vec![policy("reject-all", -100, PolicyTarget::Reject)],
+        "policy_drop_target" => vec![policy("drop-all", -100, PolicyTarget::Drop)],
+        "policy_continue" => vec![policy("continue", -100, PolicyTarget::Continue)],
+        "policy_disabled" => {
+            let mut policy = policy("disabled", -100, PolicyTarget::Accept);
+            policy.disabled = true;
+            vec![policy]
+        }
+        "policy_inactive" => {
+            let mut policy = policy("inactive", -100, PolicyTarget::Accept);
+            policy.active = false;
+            vec![policy]
+        }
+        "policy_any_ingress" => {
+            let mut policy = policy("any-ingress", -100, PolicyTarget::Accept);
+            policy.ingress_zones = vec!["ANY".to_owned()];
+            vec![policy]
+        }
+        "policy_any_egress" => {
+            let mut policy = policy("any-egress", -100, PolicyTarget::Accept);
+            policy.egress_zones = vec!["ANY".to_owned()];
+            vec![policy]
+        }
+        "policy_positive" => {
+            let mut policy = policy("late-allow", 100, PolicyTarget::Continue);
+            policy.ports = vec!["65000/tcp".parse().unwrap()];
+            vec![policy]
+        }
+        "policy_negative_preempts_zone" => vec![policy("early-drop", -100, PolicyTarget::Drop)],
+        "policy_zero_priority" => vec![policy("reserved", 0, PolicyTarget::Accept)],
+        "policy_masquerade" => {
+            let mut policy = policy("masquerade", -100, PolicyTarget::Continue);
+            policy.masquerade = true;
+            vec![policy]
+        }
+        "policy_forward_port" => {
+            let mut policy = policy("forward-port", -100, PolicyTarget::Continue);
+            policy.forward_ports = vec!["port=65000:proto=tcp:toport=22".parse().unwrap()];
+            vec![policy]
+        }
+        "policy_equal_conflict" => vec![
+            policy("allow-same-priority", -100, PolicyTarget::Accept),
+            policy("drop-same-priority", -100, PolicyTarget::Drop),
+        ],
+        "policy_rich_allow" => {
+            let mut policy = policy("rich-allow", -100, PolicyTarget::Continue);
+            policy.rich_rules = vec![RichRule::parse(
+                r#"rule family="ipv4" source address="203.0.113.0/24" port port="65000" protocol="tcp" accept"#,
+            )
+            .unwrap()];
+            vec![policy]
+        }
+        "policy_rich_service" => {
+            let mut policy = policy("rich-service", -100, PolicyTarget::Continue);
+            policy.rich_rules = vec![RichRule::parse(
+                r#"rule family="ipv4" source address="203.0.113.0/24" service name="admin-api" accept"#,
+            )
+            .unwrap()];
+            vec![policy]
+        }
+        "policy_rich_unsupported" => {
+            let mut policy = policy("rich-unsupported", -100, PolicyTarget::Continue);
+            policy.rich_rules =
+                vec![RichRule::parse(r#"rule family="ipv4" source ipset="blocked" drop"#).unwrap()];
+            vec![policy]
+        }
+        "zone_rich_negative" => {
+            snapshot
+                .runtime
+                .get_mut(&ZoneName::parse("public").unwrap())
+                .unwrap()
+                .rich_rules = vec![
+                RichRule::parse(r#"rule priority="-10" port port="8080" protocol="tcp" drop"#)
+                    .unwrap(),
+            ];
+            Vec::new()
+        }
+        "zone_rich_positive" => {
+            snapshot
+                .runtime
+                .get_mut(&ZoneName::parse("public").unwrap())
+                .unwrap()
+                .rich_rules = vec![
+                RichRule::parse(r#"rule priority="10" port port="65000" protocol="tcp" accept"#)
+                    .unwrap(),
+            ];
+            Vec::new()
+        }
+        "zone_rich_zero_deny_before_allow" => {
+            snapshot
+                .runtime
+                .get_mut(&ZoneName::parse("public").unwrap())
+                .unwrap()
+                .rich_rules = vec![
+                RichRule::parse(r#"rule port port="65000" protocol="tcp" accept"#).unwrap(),
+                RichRule::parse(r#"rule port port="65000" protocol="tcp" drop"#).unwrap(),
+            ];
+            Vec::new()
+        }
+        "zone_rich_reject" => {
+            snapshot
+                .runtime
+                .get_mut(&ZoneName::parse("public").unwrap())
+                .unwrap()
+                .rich_rules =
+                vec![RichRule::parse(r#"rule port port="65000" protocol="tcp" reject"#).unwrap()];
+            Vec::new()
+        }
+        "zone_rich_source_destination_source_port" => {
+            snapshot
+                .runtime
+                .get_mut(&ZoneName::parse("public").unwrap())
+                .unwrap()
+                .rich_rules = vec![RichRule::parse(
+                r#"rule family="ipv4" source address="203.0.113.0/24" destination address="192.0.2.10" source-port port="45000" protocol="udp" accept"#,
+            )
+            .unwrap()];
+            Vec::new()
+        }
+        "zone_rich_equal_conflict" => {
+            snapshot
+                .runtime
+                .get_mut(&ZoneName::parse("public").unwrap())
+                .unwrap()
+                .rich_rules = vec![
+                RichRule::parse(r#"rule priority="5" port port="65000" protocol="tcp" accept"#)
+                    .unwrap(),
+                RichRule::parse(r#"rule priority="5" port port="65000" protocol="tcp" drop"#)
+                    .unwrap(),
+            ];
+            Vec::new()
+        }
+        "zone_rich_unsupported" => {
+            snapshot
+                .runtime
+                .get_mut(&ZoneName::parse("public").unwrap())
+                .unwrap()
+                .rich_rules =
+                vec![RichRule::parse(r#"rule family="ipv4" source ipset="blocked" drop"#).unwrap()];
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+
+    if setup == "incomplete_policies" {
+        snapshot.degraded.push(DegradedSection::new(
+            SnapshotSection::Policies,
+            Some(ConfigurationTarget::Runtime),
+            "fixture intentionally omits runtime policy evidence",
+        ));
+    }
+    if setup == "incomplete_policy_service" {
+        let mut policy = policy("incomplete-service", -100, PolicyTarget::Continue);
+        policy.services = vec![ServiceName::parse("ssh").unwrap()];
+        configured.push(policy);
+        snapshot.degraded.push(DegradedSection::new(
+            SnapshotSection::ServiceDefinitions,
+            Some(ConfigurationTarget::Runtime),
+            "fixture intentionally omits service definition evidence",
+        ));
+    }
+    for policy in configured.drain(..) {
+        add_runtime_policy(snapshot, policy);
     }
 }
 
@@ -334,4 +556,68 @@ fn host_ingress_context_target_mismatch_is_unknown_not_a_false_decision() {
 
     assert_eq!(result.decision(), FirewallDecision::Unknown);
     assert_eq!(result.unknown_reason(), Some(UnknownReason::StaleSnapshot));
+}
+
+#[test]
+fn ingress_to_host_policy_cases_are_ordered_and_fail_closed() {
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "fixtures/traffic_testing/evaluation/host-ingress-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.policy_cases.len(), 31);
+
+    for case in fixture.policy_cases {
+        let scenario = scenario(&case);
+        scenario.validate().unwrap();
+        let index = fwdeck::domain::TrafficEvaluationIndex::new(
+            Arc::new(snapshot(&case.setup)),
+            EvaluationTarget::Runtime,
+        );
+        let first = evaluate_scenario(&index, &scenario, &context()).unwrap();
+        let second = evaluate_scenario(&index, &scenario, &context()).unwrap();
+
+        assert_eq!(first, second, "{} must be deterministic", case.id);
+        assert_eq!(first.decision(), case.expected_decision, "{}", case.id);
+        assert_eq!(first.status(), case.expected_status, "{}", case.id);
+        assert_eq!(first.unknown_reason(), case.expected_reason, "{}", case.id);
+        if case.id == "policy-rich-allow" {
+            assert!(first.trace().iter().any(|step| {
+                matches!(
+                    step.object(),
+                    Some(fwdeck::domain::TraceObjectRef::PolicyRichRule { index: 0, .. })
+                ) && step.outcome() == TrafficTraceOutcome::Decision(FirewallDecision::Allow)
+            }));
+        }
+        if case.id == "policy-rich-unsupported" {
+            assert!(first.trace().iter().any(|step| {
+                matches!(
+                    step.object(),
+                    Some(fwdeck::domain::TraceObjectRef::PolicyRichRule { index: 0, .. })
+                ) && step.outcome()
+                    == TrafficTraceOutcome::Unknown(UnknownReason::UnsupportedRichRule)
+            }));
+        }
+    }
+}
+
+#[test]
+fn permanent_policy_evaluation_ignores_the_runtime_active_marker() {
+    let mut snapshot = snapshot("policy_inactive");
+    snapshot.permanent = snapshot.runtime.clone();
+    snapshot.policies.permanent = snapshot.policies.runtime.clone();
+    let index = fwdeck::domain::TrafficEvaluationIndex::new(
+        Arc::new(snapshot),
+        EvaluationTarget::Permanent,
+    );
+    let case: Case = serde_json::from_str(
+        r#"{"id":"permanent-inactive-marker","setup":"policy_inactive","source":"203.0.113.10","destination":"local","transport":"tcp","destination_port":"65000","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"public"}"#,
+    )
+    .unwrap();
+    let mut evaluation_context = context();
+    evaluation_context.target = EvaluationTarget::Permanent;
+
+    let result = evaluate_scenario(&index, &scenario(&case), &evaluation_context).unwrap();
+
+    assert_eq!(result.decision(), FirewallDecision::Allow);
+    assert_eq!(result.status(), TrafficTestStatus::Pass);
 }

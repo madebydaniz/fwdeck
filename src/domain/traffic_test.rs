@@ -242,6 +242,13 @@ pub enum TraceObjectRef {
         /// Position in the immutable observed rule list.
         index: u32,
     },
+    /// A rich rule by owning policy and stable snapshot index.
+    PolicyRichRule {
+        /// Owning policy.
+        policy: PolicyName,
+        /// Position in the immutable observed rule list.
+        index: u32,
+    },
     /// A direct rule by stable snapshot index.
     DirectRule {
         /// Position in the immutable observed rule list.
@@ -482,6 +489,7 @@ mod tests {
     #[test]
     fn trace_steps_require_typed_stages_outcomes_and_object_references() {
         let zone = ZoneName::parse("public").unwrap();
+        let policy = PolicyName::parse("host-ingress").unwrap();
         let service = ServiceName::parse("ssh").unwrap();
         let steps = [
             TrafficTraceStep::new(
@@ -499,14 +507,23 @@ mod tests {
                 TrafficTraceOutcome::Unknown(UnknownReason::IncompleteSnapshot),
             )
             .with_object(TraceObjectRef::SnapshotSection(SnapshotSection::Policies)),
+            TrafficTraceStep::new(
+                TrafficTraceStage::RichRuleEvaluation,
+                TrafficTraceOutcome::Decision(FirewallDecision::Allow),
+            )
+            .with_object(TraceObjectRef::PolicyRichRule { policy, index: 2 }),
         ];
 
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 4);
         assert_eq!(MAX_TRACE_STEPS, 128);
         assert!(steps.iter().all(|step| step.object().is_some()));
         assert_eq!(
             serde_json::to_string(&steps[2]).unwrap(),
             r#"{"stage":"completeness_check","object":{"snapshot_section":"policies"},"outcome":{"unknown":"incomplete_snapshot"}}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&steps[3]).unwrap(),
+            r#"{"stage":"rich_rule_evaluation","object":{"policy_rich_rule":{"policy":"host-ingress","index":2}},"outcome":{"decision":"allow"}}"#,
         );
     }
 }
