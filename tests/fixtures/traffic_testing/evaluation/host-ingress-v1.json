@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "reviewed_on": "2026-09-04",
+  "reviewed_against": "FWDeck host-ingress Phase 1 contract",
+  "sources": [
+    "https://firewalld.org/documentation/man-pages/firewalld.zone.html",
+    "https://firewalld.org/documentation/man-pages/firewalld.service.html",
+    "https://firewalld.org/2021/07/firewalld-1-0-0-release",
+    "https://firewalld.org/2023/06/firewalld-2-0-0-release"
+  ],
+  "cases": [
+    {"id":"panic-mode","setup":"panic","source":"198.51.100.10","destination":"local","transport":"tcp","destination_port":"22","expectation":"allow","expected_decision":"block","expected_status":"fail","expected_reason":null,"expected_zone":null},
+    {"id":"explicit-zone","setup":"standard","source":"198.51.100.10","ingress_zone":"trusted","destination":"local","transport":"tcp","destination_port":"65000","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"trusted"},
+    {"id":"interface-binding","setup":"standard","source":"198.51.100.10","ingress_interface":"eth0","destination":"local","transport":"tcp","destination_port":"8080","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"public"},
+    {"id":"longest-prefix-source","setup":"standard","source":"10.10.20.5","destination":"local","transport":"tcp","destination_port":"22","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"management"},
+    {"id":"equal-priority-ambiguity","setup":"standard","source":"172.16.1.5","destination":"local","transport":"tcp","destination_port":"22","expectation":"allow","expected_decision":"unknown","expected_status":"indeterminate","expected_reason":"ambiguous_ingress_zone","expected_zone":null},
+    {"id":"default-zone","setup":"standard","source":"203.0.113.10","destination":"local","transport":"tcp","destination_port":"8080","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"public"},
+    {"id":"udp-port","setup":"standard","source":"203.0.113.10","destination":"local","transport":"udp","destination_port":"5353","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"public"},
+    {"id":"raw-protocol","setup":"standard","source":"203.0.113.10","destination":"local","transport":"raw:gre","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"public"},
+    {"id":"source-port","setup":"standard","source":"203.0.113.10","destination":"local","transport":"udp","destination_port":"9999","source_port":"40050","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"public"},
+    {"id":"named-service","setup":"standard","source":"10.10.20.5","destination":"local","transport":"tcp","destination_port":"22","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"management"},
+    {"id":"service-destination-match","setup":"standard","source":"203.0.113.10","destination":"192.0.2.10","transport":"tcp","destination_port":"8443","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"public"},
+    {"id":"service-destination-unspecified","setup":"standard","source":"203.0.113.10","destination":"local","transport":"tcp","destination_port":"8443","expectation":"allow","expected_decision":"unknown","expected_status":"indeterminate","expected_reason":"unsupported_service_feature","expected_zone":"public"},
+    {"id":"icmp-block","setup":"standard","source":"203.0.113.10","destination":"local","transport":"icmp:echo-request","expectation":"allow","expected_decision":"block","expected_status":"fail","expected_reason":null,"expected_zone":"public"},
+    {"id":"icmp-inversion-block","setup":"standard","source":"203.0.113.10","ingress_zone":"icmp-inverted","destination":"local","transport":"icmp:destination-unreachable","expectation":"block","expected_decision":"block","expected_status":"pass","expected_reason":null,"expected_zone":"icmp-inverted"},
+    {"id":"icmp-inversion-allow","setup":"standard","source":"203.0.113.10","ingress_zone":"icmp-inverted","destination":"local","transport":"icmp:echo-request","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"icmp-inverted"},
+    {"id":"accept-target","setup":"standard","source":"203.0.113.10","ingress_zone":"trusted","destination":"local","transport":"tcp","destination_port":"65000","expectation":"allow","expected_decision":"allow","expected_status":"pass","expected_reason":null,"expected_zone":"trusted"},
+    {"id":"drop-target","setup":"standard","source":"203.0.113.10","ingress_zone":"drop-zone","destination":"local","transport":"tcp","destination_port":"65000","expectation":"block","expected_decision":"block","expected_status":"pass","expected_reason":null,"expected_zone":"drop-zone"},
+    {"id":"non-matching-fall-through","setup":"standard","source":"203.0.113.10","destination":"local","transport":"tcp","destination_port":"65000","expectation":"allow","expected_decision":"block","expected_status":"fail","expected_reason":null,"expected_zone":"public"},
+    {"id":"unsupported-direction","setup":"standard","source":"203.0.113.10","direction":"from_host","destination":"local","transport":"tcp","destination_port":"8080","expectation":"allow","expected_decision":"unknown","expected_status":"indeterminate","expected_reason":"unsupported_direction","expected_zone":null},
+    {"id":"unsupported-state","setup":"standard","source":"203.0.113.10","connection_state":"established","destination":"local","transport":"tcp","destination_port":"8080","expectation":"allow","expected_decision":"unknown","expected_status":"indeterminate","expected_reason":"unsupported_connection_state","expected_zone":null},
+    {"id":"incomplete-zones","setup":"incomplete_zones","source":"203.0.113.10","destination":"local","transport":"tcp","destination_port":"8080","expectation":"allow","expected_decision":"unknown","expected_status":"indeterminate","expected_reason":"incomplete_snapshot","expected_zone":null},
+    {"id":"external-direct-rule","setup":"direct_rule","source":"203.0.113.10","destination":"local","transport":"tcp","destination_port":"8080","expectation":"allow","expected_decision":"unknown","expected_status":"indeterminate","expected_reason":"external_rules_outside_model","expected_zone":"public"}
+  ]
+}

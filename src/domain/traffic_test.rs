@@ -2,9 +2,11 @@
 
 use super::{PolicyName, ServiceName, SnapshotSection, ZoneName};
 
+mod evaluator;
 mod index;
 mod report;
 mod scenario;
+pub use evaluator::{TrafficEvaluationError, evaluate_scenario};
 pub use index::{IndexedZoneBinding, IndexedZoneBindingKind, TrafficEvaluationIndex};
 pub use report::{
     CandidateIdentity, EvaluationContext, EvaluationPhase, EvaluationPlanId,
@@ -113,6 +115,8 @@ pub enum UnknownReason {
     UnsupportedServiceFeature,
     /// The requested connection state has no supported model.
     UnsupportedConnectionState,
+    /// The requested traffic direction has no supported model.
+    UnsupportedDirection,
     /// A relevant mutation effect cannot be represented exactly.
     UnsupportedOperationEffect,
     /// Potentially intersecting rules exist outside the firewalld model.
@@ -428,6 +432,7 @@ mod tests {
                 UnknownReason::UnsupportedConnectionState,
                 "unsupported_connection_state",
             ),
+            (UnknownReason::UnsupportedDirection, "unsupported_direction"),
             (
                 UnknownReason::UnsupportedOperationEffect,
                 "unsupported_operation_effect",
