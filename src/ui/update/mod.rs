@@ -222,7 +222,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::KeepChanges => {
             if !state.pending_rollback.is_empty() {
-                let kept: Vec<_> = state.pending_rollback.drain(..).collect();
+                let kept = std::mem::take(&mut state.pending_rollback);
                 // Every kept, reversible change joins the undo stack (oldest
                 // first) now that its countdown is resolved, so undo can revert
                 // them newest-first.

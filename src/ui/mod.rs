@@ -634,7 +634,7 @@ fn collect_armed_rollbacks(
     state: &mut UiState,
     deferred: &mut std::collections::VecDeque<RollbackRequest>,
 ) {
-    let pending: Vec<_> = state.pending_rollback.drain(..).collect();
+    let pending = std::mem::take(&mut state.pending_rollback);
     for rollback in pending.into_iter().rev() {
         tracing::warn!(operation = %rollback.description, "quit inside rollback window — reverting");
         deferred.push_back(RollbackRequest {
@@ -698,7 +698,12 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(
+    unknown_lints,
+    clippy::panic,
+    clippy::unused_async_trait_impl,
+    clippy::unwrap_used
+)]
 mod tests {
     use std::collections::VecDeque;
     use std::num::NonZeroU64;

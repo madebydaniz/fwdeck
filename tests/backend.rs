@@ -64,6 +64,7 @@ fn output(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandOutput {
     }
 }
 
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl CommandRunner for FakeRunner {
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, ProcessError> {
         assert_eq!(request.program, "firewall-cmd");

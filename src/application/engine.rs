@@ -1443,7 +1443,12 @@ async fn send_refresh_finished(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(
+    unknown_lints,
+    clippy::panic,
+    clippy::unused_async_trait_impl,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
     use crate::application::ports::{
