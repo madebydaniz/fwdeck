@@ -3,6 +3,8 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt as _;
+
 use crate::domain::{
     MAX_TRAFFIC_NAME_BYTES, TrafficSuite, TrafficSuiteId, TrafficSuiteRevision,
     TrafficValidationError,
@@ -226,6 +228,7 @@ impl TrafficSuiteStore {
         &self,
         name: &TrafficSuiteFileName,
     ) -> Result<TrafficSuiteLoad, TrafficSuiteStoreError> {
+        validate_store_directory(&self.directory)?;
         load_path(&self.directory.join(name.as_str()), name)
     }
 
@@ -246,7 +249,10 @@ impl TrafficSuiteStore {
             });
         }
 
+        reject_symlink_directory(&self.directory)?;
         super::state_file::create_private_dir(&self.directory)?;
+        validate_store_directory(&self.directory)?;
+        let _lock = lock_store(&self.directory)?;
         match expectation {
             TrafficSuiteWriteExpectation::Missing => {
                 reject_existing_create_target(&path)?;
@@ -292,6 +298,71 @@ impl TrafficSuiteStore {
             path,
         })
     }
+}
+
+fn reject_symlink_directory(directory: &Path) -> Result<(), TrafficSuiteStoreError> {
+    match std::fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(TrafficSuiteStoreError::SymlinkRejected)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_store_directory(directory: &Path) -> Result<(), TrafficSuiteStoreError> {
+    let metadata = std::fs::symlink_metadata(directory).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            TrafficSuiteStoreError::NotFound
+        } else {
+            error.into()
+        }
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(TrafficSuiteStoreError::SymlinkRejected);
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(TrafficSuiteStoreError::NotRegularFile);
+    }
+    Ok(())
+}
+
+fn lock_store(directory: &Path) -> Result<std::fs::File, TrafficSuiteStoreError> {
+    let path = directory.join(".fwdeck-traffic-test-store.lock");
+    let before = std::fs::symlink_metadata(&path).ok();
+    if before
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(TrafficSuiteStoreError::SymlinkRejected);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(&path).map_err(map_safe_open_error)?;
+    validate_opened_regular(before.as_ref(), &file)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
+fn map_safe_open_error(error: std::io::Error) -> TrafficSuiteStoreError {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return TrafficSuiteStoreError::SymlinkRejected;
+    }
+    error.into()
 }
 
 /// Returns the default suite path below an XDG configuration root.
@@ -429,13 +500,28 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, TrafficSuiteStoreErro
         return Err(TrafficSuiteStoreError::NotRegularFile);
     }
 
-    let file = std::fs::File::open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(map_safe_open_error)?;
+    validate_opened_regular(Some(&link_metadata), &file)?;
+    Ok(file)
+}
+
+fn validate_opened_regular(
+    before: Option<&std::fs::Metadata>,
+    file: &std::fs::File,
+) -> Result<(), TrafficSuiteStoreError> {
     let opened_metadata = file.metadata()?;
     if !opened_metadata.file_type().is_file() {
         return Err(TrafficSuiteStoreError::NotRegularFile);
     }
     #[cfg(unix)]
-    {
+    if let Some(link_metadata) = before {
         use std::os::unix::fs::MetadataExt as _;
         if link_metadata.dev() != opened_metadata.dev()
             || link_metadata.ino() != opened_metadata.ino()
@@ -443,5 +529,5 @@ fn open_regular_file(path: &Path) -> Result<std::fs::File, TrafficSuiteStoreErro
             return Err(TrafficSuiteStoreError::ChangedWhileOpening);
         }
     }
-    Ok(file)
+    Ok(())
 }

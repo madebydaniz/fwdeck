@@ -705,6 +705,7 @@ dependencies = [
  "directories",
  "fs2",
  "futures-util",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

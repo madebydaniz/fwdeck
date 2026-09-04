@@ -10,7 +10,7 @@ use fwdeck::domain::{
 use fwdeck::infrastructure::traffic_test_store::{
     MAX_TRAFFIC_SUITE_FILE_BYTES, StoredTrafficSuite, TRAFFIC_SUITE_SCHEMA_VERSION,
     TrafficSuiteFileName, TrafficSuiteLoad, TrafficSuiteStore, TrafficSuiteStoreError,
-    TrafficSuiteWriteExpectation, default_suite_path_from,
+    TrafficSuiteWriteExpectation, default_suite_path, default_suite_path_from,
 };
 
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -81,6 +81,7 @@ fn schema_v1_round_trip_is_deterministic_private_and_uses_the_default_suffix() {
 
     assert_eq!(round_trip.suite, expected);
     assert_eq!(round_trip.fingerprint, first.fingerprint);
+    assert_eq!(round_trip.fingerprint.to_string().len(), 32);
     assert_eq!(round_trip.path, first.path);
     assert!(
         std::str::from_utf8(&first_bytes)
@@ -116,6 +117,67 @@ fn schema_v1_round_trip_is_deterministic_private_and_uses_the_default_suffix() {
         );
     }
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn schema_zero_and_malformed_schema_one_are_rejected() {
+    let root = scratch("invalid-schemas");
+    std::fs::create_dir_all(&root).unwrap();
+    let store = TrafficSuiteStore::new(root.clone());
+    let name = TrafficSuiteFileName::default();
+    let path = root.join(name.as_str());
+
+    std::fs::write(&path, "schema_version = 0\n").unwrap();
+    assert!(matches!(
+        store.load(&name),
+        Err(TrafficSuiteStoreError::UnsupportedSchema { schema_version: 0 })
+    ));
+    std::fs::write(&path, "schema_version = 1\nid = \"default\"\n").unwrap();
+    assert!(matches!(
+        store.load(&name),
+        Err(TrafficSuiteStoreError::InvalidSchema(_))
+    ));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn missing_and_non_directory_store_roots_are_typed() {
+    let missing = scratch("missing-root");
+    let store = TrafficSuiteStore::new(missing);
+    assert!(matches!(
+        store.load(&TrafficSuiteFileName::default()),
+        Err(TrafficSuiteStoreError::NotFound)
+    ));
+
+    let file_root = scratch("file-root");
+    std::fs::write(&file_root, b"not a directory").unwrap();
+    let store = TrafficSuiteStore::new(file_root.clone());
+    assert!(matches!(
+        store.load(&TrafficSuiteFileName::default()),
+        Err(TrafficSuiteStoreError::NotRegularFile)
+    ));
+    let _ = std::fs::remove_file(file_root);
+}
+
+#[test]
+fn platform_default_path_and_valid_but_oversized_encoding_are_bounded() {
+    assert!(default_suite_path().is_some());
+    let root = scratch("encoded-size");
+    let mut oversized = suite(1);
+    oversized.scenarios = (0..1000)
+        .map(|index| {
+            let mut scenario = scenario(&format!("large-{index}"));
+            scenario.note = Some("x".repeat(1024));
+            scenario
+        })
+        .collect();
+    oversized.validate().unwrap();
+    assert!(matches!(
+        TrafficSuiteStore::new(root.clone())
+            .save(&oversized, TrafficSuiteWriteExpectation::Missing),
+        Err(TrafficSuiteStoreError::FileTooLarge { .. })
+    ));
+    assert!(!root.exists());
 }
 
 #[test]
@@ -408,5 +470,104 @@ fn missing_expectation_never_overwrites_an_existing_suite() {
         Err(TrafficSuiteStoreError::AlreadyExists)
     ));
     assert_eq!(std::fs::read(&existing.path).unwrap(), before);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn store_root_symlink_is_rejected_for_load_and_save() {
+    let parent = scratch("root-symlink");
+    let target = parent.join("target");
+    let link = parent.join("link");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let store = TrafficSuiteStore::new(link);
+
+    assert!(matches!(
+        store.load(&TrafficSuiteFileName::default()),
+        Err(TrafficSuiteStoreError::SymlinkRejected)
+    ));
+    assert!(matches!(
+        store.save(&suite(1), TrafficSuiteWriteExpectation::Missing),
+        Err(TrafficSuiteStoreError::SymlinkRejected)
+    ));
+    assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+    let _ = std::fs::remove_dir_all(parent);
+}
+
+#[test]
+fn concurrent_existing_saves_allow_only_one_observed_fingerprint() {
+    let root = scratch("concurrent-existing");
+    let initial = TrafficSuiteStore::new(root.clone())
+        .save(&suite(1), TrafficSuiteWriteExpectation::Missing)
+        .unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let handles = [2, 3].map(|revision| {
+        let root = root.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            let store = TrafficSuiteStore::new(root);
+            barrier.wait();
+            store.save(
+                &suite(revision),
+                TrafficSuiteWriteExpectation::Existing {
+                    revision: TrafficSuiteRevision::new(1).unwrap(),
+                    fingerprint: initial.fingerprint,
+                },
+            )
+        })
+    });
+    barrier.wait();
+    let outcomes = handles.map(|handle| handle.join().unwrap());
+
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_err()).count(),
+        1
+    );
+    assert!(outcomes.iter().any(|outcome| matches!(
+        outcome,
+        Err(TrafficSuiteStoreError::RevisionConflict { actual: 2 | 3, .. })
+    )));
+    let final_revision = loaded(
+        TrafficSuiteStore::new(root.clone())
+            .load(&TrafficSuiteFileName::default())
+            .unwrap(),
+    )
+    .suite
+    .revision
+    .get();
+    assert!(matches!(final_revision, 2 | 3));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn malicious_lock_symlink_and_fifo_are_rejected_without_following_or_blocking() {
+    let root = scratch("malicious-lock");
+    std::fs::create_dir_all(&root).unwrap();
+    let lock = root.join(".fwdeck-traffic-test-store.lock");
+    let target = root.join("target");
+    std::fs::write(&target, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&target, &lock).unwrap();
+    let store = TrafficSuiteStore::new(root.clone());
+    assert!(matches!(
+        store.save(&suite(1), TrafficSuiteWriteExpectation::Missing),
+        Err(TrafficSuiteStoreError::SymlinkRejected)
+    ));
+    assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+
+    std::fs::remove_file(&lock).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(&lock)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(matches!(
+        store.save(&suite(1), TrafficSuiteWriteExpectation::Missing),
+        Err(TrafficSuiteStoreError::NotRegularFile)
+    ));
+    assert!(!root.join("default.toml").exists());
     let _ = std::fs::remove_dir_all(root);
 }
