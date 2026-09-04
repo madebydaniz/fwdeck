@@ -62,10 +62,11 @@ pub use snapshot::{
     NetfilterBackend, Scoped, SnapshotSection,
 };
 pub use traffic_test::{
-    CandidateIdentity, EvaluationContext, EvaluationPhase, EvaluationPlanId,
-    EvaluationSnapshotIdentity, EvaluationTarget, FirewallDecision, IndexedZoneBinding,
-    IndexedZoneBindingKind, MAX_SCENARIOS_PER_SUITE, MAX_TRACE_STEPS, MAX_TRAFFIC_NAME_BYTES,
-    MAX_TRAFFIC_NOTE_BYTES, MAX_TRAFFIC_REPORT_BYTES, MutationIntentId, OrderedOperationDigest,
+    CandidateIdentity, CandidateProjection, CandidateProjectionError, CandidateProjector,
+    EvaluationContext, EvaluationPhase, EvaluationPlanId, EvaluationSnapshotIdentity,
+    EvaluationTarget, FirewallDecision, IndexedZoneBinding, IndexedZoneBindingKind,
+    MAX_SCENARIOS_PER_SUITE, MAX_TRACE_STEPS, MAX_TRAFFIC_NAME_BYTES, MAX_TRAFFIC_NOTE_BYTES,
+    MAX_TRAFFIC_REPORT_BYTES, MutationIntentId, OrderedOperationDigest, ProjectionUnknownEffect,
     RulePriority, RulePriorityError, TraceObjectRef, TrafficConnectionState, TrafficDestination,
     TrafficDirection, TrafficEvaluationError, TrafficEvaluationIndex, TrafficExpectation,
     TrafficReportError, TrafficScenario, TrafficScenarioId, TrafficSeverity, TrafficSuite,

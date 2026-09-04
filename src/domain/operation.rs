@@ -20,7 +20,7 @@ use super::zone::ZoneTarget;
 /// One typed firewall mutation — everything the UI can do to firewalld.
 /// Execution layers translate a variant into the matching `firewall-cmd`
 /// invocation(s) per configuration target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum FirewallOperation {
     /// Enable a service in a zone.
     AddService {

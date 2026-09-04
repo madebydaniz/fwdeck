@@ -4,10 +4,14 @@ use super::{PolicyName, ServiceName, SnapshotSection, ZoneName};
 
 mod evaluator;
 mod index;
+mod projection;
 mod report;
 mod scenario;
 pub use evaluator::{TrafficEvaluationError, evaluate_scenario};
 pub use index::{IndexedZoneBinding, IndexedZoneBindingKind, TrafficEvaluationIndex};
+pub use projection::{
+    CandidateProjection, CandidateProjectionError, CandidateProjector, ProjectionUnknownEffect,
+};
 pub use report::{
     CandidateIdentity, EvaluationContext, EvaluationPhase, EvaluationPlanId,
     EvaluationSnapshotIdentity, EvaluationTarget, MAX_TRAFFIC_REPORT_BYTES, MutationIntentId,
