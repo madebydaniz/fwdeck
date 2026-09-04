@@ -6,6 +6,7 @@ pub mod engine;
 mod observation;
 pub mod ports;
 mod refresh_scheduler;
+mod traffic_test;
 
 pub use api::{
     EngineEvent, EngineHandle, EngineRequest, ManualRefreshRequest, MutationPlan, MutationRequest,
@@ -17,4 +18,12 @@ pub use observation::{ObservedSnapshot, SnapshotGeneration, SnapshotIdentity};
 pub use ports::{
     FirewallBackend, FirewallError, OperationOutcome, RollbackGuard, RollbackGuardError,
     RollbackGuardId, StepReport,
+};
+pub use traffic_test::{
+    TRAFFIC_TEST_CANCELLATION_INTERVAL, TRAFFIC_TEST_EVALUATION_DEADLINE,
+    TRAFFIC_TEST_EVENT_CAPACITY, TRAFFIC_TEST_PENDING_CONTEXT_CAPACITY,
+    TRAFFIC_TEST_REQUEST_CAPACITY, TRAFFIC_TEST_SHUTDOWN_DEADLINE, TrafficScenarioEvaluator,
+    TrafficTestCancellationReason, TrafficTestCoordinator, TrafficTestEvaluationRequest,
+    TrafficTestEvent, TrafficTestFailureReason, TrafficTestRequestError, TrafficTestShutdownError,
+    TrafficTestSubmissionError,
 };
