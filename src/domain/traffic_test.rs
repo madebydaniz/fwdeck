@@ -2,7 +2,14 @@
 
 use super::{PolicyName, ServiceName, SnapshotSection, ZoneName};
 
+mod report;
 mod scenario;
+pub use report::{
+    CandidateIdentity, EvaluationContext, EvaluationPhase, EvaluationPlanId,
+    EvaluationSnapshotIdentity, EvaluationTarget, MAX_TRAFFIC_REPORT_BYTES, MutationIntentId,
+    OrderedOperationDigest, TrafficReportError, TrafficTestReport, TrafficTestResult,
+    TrafficTestRunId, TrafficTestSummary,
+};
 pub use scenario::{
     MAX_SCENARIOS_PER_SUITE, MAX_TRAFFIC_NAME_BYTES, MAX_TRAFFIC_NOTE_BYTES,
     TrafficConnectionState, TrafficDestination, TrafficDirection, TrafficScenario,
