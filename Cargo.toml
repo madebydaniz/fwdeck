@@ -111,6 +111,9 @@ zbus = { version = "5.17", default-features = false, features = [
     "tokio",
 ], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.186"
+
 [features]
 default = []
 # Native firewalld D-Bus backend (ADR-4). Off by default: the CLI backend is

@@ -50,10 +50,10 @@
     },
     {
       "id": "set-log-denied",
-      "expected_support": "traffic_irrelevant_logging_side_effect_only",
-      "expected_targets": "runtime_and_permanent",
-      "expected_dimensions": ["observability"],
-      "expected_temporal": "no_traffic_decision_effect",
+      "expected_support": "global_transform",
+      "expected_targets": "runtime_from_permanent",
+      "expected_dimensions": ["observability", "global_configuration"],
+      "expected_temporal": "global_replacement",
       "expected_partial": "single_step"
     },
     {
