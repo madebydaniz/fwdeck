@@ -122,12 +122,25 @@ impl PortRange {
 }
 
 /// A single port or an inclusive range, the port half of a port spec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PortSelector {
     /// One port.
     Single(PortNumber),
     /// An inclusive port range.
     Range(PortRange),
+}
+
+impl serde::Serialize for PortSelector {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PortSelector {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 impl fmt::Display for PortSelector {
@@ -305,6 +318,18 @@ mod tests {
     fn parses_port_range_spec() {
         let spec: PortSpec = "5000-5010/udp".parse().unwrap();
         assert_eq!(spec.to_string(), "5000-5010/udp");
+    }
+
+    #[test]
+    fn port_selector_uses_one_validated_string_representation() {
+        let selector: PortSelector = "8000-8080".parse().unwrap();
+        let encoded = serde_json::to_string(&selector).unwrap();
+        assert_eq!(encoded, "\"8000-8080\"");
+        assert_eq!(
+            serde_json::from_str::<PortSelector>(&encoded).unwrap(),
+            selector
+        );
+        assert!(serde_json::from_str::<PortSelector>("\"0\"").is_err());
     }
 
     #[test]

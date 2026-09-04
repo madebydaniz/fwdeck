@@ -2,6 +2,14 @@
 
 use super::{PolicyName, ServiceName, SnapshotSection, ZoneName};
 
+mod scenario;
+pub use scenario::{
+    MAX_SCENARIOS_PER_SUITE, MAX_TRAFFIC_NAME_BYTES, MAX_TRAFFIC_NOTE_BYTES,
+    TrafficConnectionState, TrafficDestination, TrafficDirection, TrafficScenario,
+    TrafficScenarioId, TrafficSeverity, TrafficSuite, TrafficSuiteId, TrafficSuiteRevision,
+    TrafficTransport, TrafficValidationError,
+};
+
 /// Maximum ordered trace steps retained for one scenario result.
 pub const MAX_TRACE_STEPS: usize = 128;
 

@@ -62,8 +62,11 @@ pub use snapshot::{
     NetfilterBackend, Scoped, SnapshotSection,
 };
 pub use traffic_test::{
-    FirewallDecision, MAX_TRACE_STEPS, RulePriority, RulePriorityError, TraceObjectRef,
-    TrafficExpectation, TrafficTestStatus, TrafficTraceOutcome, TrafficTraceStage,
-    TrafficTraceStep, UnknownReason,
+    FirewallDecision, MAX_SCENARIOS_PER_SUITE, MAX_TRACE_STEPS, MAX_TRAFFIC_NAME_BYTES,
+    MAX_TRAFFIC_NOTE_BYTES, RulePriority, RulePriorityError, TraceObjectRef,
+    TrafficConnectionState, TrafficDestination, TrafficDirection, TrafficExpectation,
+    TrafficScenario, TrafficScenarioId, TrafficSeverity, TrafficSuite, TrafficSuiteId,
+    TrafficSuiteRevision, TrafficTestStatus, TrafficTraceOutcome, TrafficTraceStage,
+    TrafficTraceStep, TrafficTransport, TrafficValidationError, UnknownReason,
 };
 pub use zone::{ActiveZone, ZoneDetails, ZoneTarget};
