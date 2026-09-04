@@ -1267,13 +1267,14 @@ fn finish(
         TrafficTraceStage::Status,
         TrafficTraceOutcome::Status(status),
     ));
-    Ok(TrafficTestResult::new(
+    TrafficTestResult::new(
         scenario.id.clone(),
         scenario.expectation,
         decision,
         reason,
         trace,
-    )?)
+    )
+    .map_err(TrafficEvaluationError::from)
 }
 
 fn comparison_outcome(
@@ -1291,3 +1292,7 @@ fn comparison_outcome(
         FirewallDecision::Allow | FirewallDecision::Block => TrafficTraceOutcome::NotMatched,
     }
 }
+
+#[cfg(test)]
+#[path = "evaluator_private_tests.rs"]
+mod private_tests;

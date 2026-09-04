@@ -455,6 +455,275 @@ fn context() -> EvaluationContext {
     }
 }
 
+fn basic_scenario(id: &str) -> TrafficScenario {
+    TrafficScenario {
+        id: TrafficScenarioId::parse(id).unwrap(),
+        name: id.to_owned(),
+        enabled: true,
+        direction: TrafficDirection::ToHost,
+        source: SourceAddress::parse("192.0.2.10").unwrap(),
+        ingress_interface: None,
+        ingress_zone: Some(ZoneName::parse("public").unwrap()),
+        destination: TrafficDestination::LocalHost,
+        egress_interface: None,
+        egress_zone: None,
+        transport: TrafficTransport::Tcp,
+        destination_port: Some("65000".parse().unwrap()),
+        source_port: None,
+        connection_state: TrafficConnectionState::New,
+        expectation: TrafficExpectation::Block,
+        severity: TrafficSeverity::Critical,
+        required_safety_gate: true,
+        note: None,
+    }
+}
+
+fn evaluate_with(
+    snapshot: FirewallSnapshot,
+    scenario: &TrafficScenario,
+) -> fwdeck::domain::TrafficTestResult {
+    let index =
+        fwdeck::domain::TrafficEvaluationIndex::new(Arc::new(snapshot), EvaluationTarget::Runtime);
+    evaluate_scenario(&index, scenario, &context()).unwrap()
+}
+
+#[test]
+fn incomplete_path_and_capability_boundaries_are_typed() {
+    let mut missing_zone_scenario = basic_scenario("missing-explicit-zone");
+    missing_zone_scenario.ingress_zone = Some(ZoneName::parse("absent").unwrap());
+    assert_eq!(
+        evaluate_with(snapshot("default"), &missing_zone_scenario).unknown_reason(),
+        Some(UnknownReason::IncompleteSnapshot)
+    );
+
+    let mut incomplete_direct = snapshot("default");
+    incomplete_direct.degraded.push(DegradedSection::new(
+        SnapshotSection::DirectRules,
+        Some(ConfigurationTarget::Runtime),
+        "missing direct evidence",
+    ));
+    assert_eq!(
+        evaluate_with(incomplete_direct, &basic_scenario("incomplete-direct")).unknown_reason(),
+        Some(UnknownReason::IncompleteSnapshot)
+    );
+
+    let mut missing_default = snapshot("default");
+    missing_default.default_zone = ZoneName::parse("absent").unwrap();
+    let mut implicit = basic_scenario("missing-default");
+    implicit.ingress_zone = None;
+    assert_eq!(
+        evaluate_with(missing_default, &implicit).unknown_reason(),
+        Some(UnknownReason::IncompleteSnapshot)
+    );
+
+    let mut ipset_binding = snapshot("default");
+    ipset_binding
+        .runtime
+        .get_mut(&ZoneName::parse("public").unwrap())
+        .unwrap()
+        .sources
+        .push(SourceAddress::parse("ipset:blocked").unwrap());
+    assert_eq!(
+        evaluate_with(ipset_binding, &implicit).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    for (version, expected) in [
+        (Some("1.0.0"), UnknownReason::VersionUnsupported),
+        (None, UnknownReason::CapabilityUnavailable),
+    ] {
+        let mut observed = snapshot("default");
+        observed.status.version = version.map(str::to_owned);
+        observed
+            .runtime
+            .get_mut(&ZoneName::parse("trusted").unwrap())
+            .unwrap()
+            .ingress_priority = RulePriority::new(-20).unwrap();
+        let mut overlapping = basic_scenario("priority-capability");
+        overlapping.source = SourceAddress::parse("10.10.20.10").unwrap();
+        overlapping.ingress_zone = None;
+        assert_eq!(
+            evaluate_with(observed, &overlapping).unknown_reason(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn rich_rule_and_service_non_match_boundaries_remain_conservative() {
+    let rich_snapshot = snapshot("zone_rich_source_destination_source_port");
+
+    let mut wrong_family = basic_scenario("rich-wrong-family");
+    wrong_family.source = SourceAddress::parse("2001:db8::10").unwrap();
+    wrong_family.destination =
+        TrafficDestination::Address(SourceAddress::parse("2001:db8::20").unwrap());
+    wrong_family.transport = TrafficTransport::Udp;
+    wrong_family.source_port = Some("45000".parse().unwrap());
+    assert_eq!(
+        evaluate_with(rich_snapshot.clone(), &wrong_family).decision(),
+        FirewallDecision::Block
+    );
+
+    let mut missing_destination = basic_scenario("rich-missing-destination");
+    missing_destination.source = SourceAddress::parse("203.0.113.10").unwrap();
+    missing_destination.transport = TrafficTransport::Udp;
+    missing_destination.source_port = Some("45000".parse().unwrap());
+    assert_eq!(
+        evaluate_with(rich_snapshot.clone(), &missing_destination).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let mut inverted_source_miss = missing_destination.clone();
+    inverted_source_miss.id = TrafficScenarioId::parse("rich-source-miss").unwrap();
+    inverted_source_miss.source = SourceAddress::parse("198.51.100.10").unwrap();
+    inverted_source_miss.destination =
+        TrafficDestination::Address(SourceAddress::parse("192.0.2.10").unwrap());
+    assert_eq!(
+        evaluate_with(rich_snapshot.clone(), &inverted_source_miss).decision(),
+        FirewallDecision::Block
+    );
+
+    let mut destination_miss = missing_destination.clone();
+    destination_miss.id = TrafficScenarioId::parse("rich-destination-miss").unwrap();
+    destination_miss.destination =
+        TrafficDestination::Address(SourceAddress::parse("198.51.100.10").unwrap());
+    assert_eq!(
+        evaluate_with(rich_snapshot, &destination_miss).decision(),
+        FirewallDecision::Block
+    );
+
+    let mut service_snapshot = snapshot("default");
+    service_snapshot
+        .service_definitions
+        .get_mut(&ServiceName::parse("destination-web").unwrap())
+        .unwrap()
+        .modules
+        .push(fwdeck::domain::ServiceModuleName::parse("nf_conntrack_ftp").unwrap());
+    let mut service_scenario = basic_scenario("service-module");
+    service_scenario.destination_port = Some("8443".parse().unwrap());
+    assert_eq!(
+        evaluate_with(service_snapshot, &service_scenario).unknown_reason(),
+        Some(UnknownReason::UnsupportedServiceFeature)
+    );
+}
+
+#[test]
+fn service_and_rich_service_completeness_is_never_assumed() {
+    let service = ServiceName::parse("destination-web").unwrap();
+    let mut scenario = basic_scenario("missing-service-definition");
+    scenario.destination_port = Some("8443".parse().unwrap());
+
+    let mut missing = snapshot("default");
+    missing.service_definitions.remove(&service);
+    assert_eq!(
+        evaluate_with(missing, &scenario).unknown_reason(),
+        Some(UnknownReason::IncompleteServiceDefinition)
+    );
+
+    let mut incomplete = snapshot("default");
+    incomplete.degraded.push(DegradedSection::new(
+        SnapshotSection::Services,
+        Some(ConfigurationTarget::Runtime),
+        "service catalog incomplete",
+    ));
+    assert_eq!(
+        evaluate_with(incomplete, &scenario).unknown_reason(),
+        Some(UnknownReason::IncompleteSnapshot)
+    );
+
+    let mut rich_service = snapshot("default");
+    rich_service
+        .runtime
+        .get_mut(&ZoneName::parse("public").unwrap())
+        .unwrap()
+        .rich_rules = vec![RichRule::parse(r#"rule service name="missing" accept"#).unwrap()];
+    assert_eq!(
+        evaluate_with(rich_service, &scenario).unknown_reason(),
+        Some(UnknownReason::IncompleteServiceDefinition)
+    );
+}
+
+#[test]
+fn rich_protocol_matching_covers_transport_families() {
+    let mut observed = snapshot("default");
+    observed
+        .runtime
+        .get_mut(&ZoneName::parse("public").unwrap())
+        .unwrap()
+        .rich_rules = vec![RichRule::parse(r#"rule protocol value="gre" accept"#).unwrap()];
+
+    let mut raw = basic_scenario("rich-raw-protocol");
+    raw.transport = TrafficTransport::RawProtocol {
+        protocol: IpProtocol::parse("gre").unwrap(),
+    };
+    raw.destination_port = None;
+    raw.expectation = TrafficExpectation::Allow;
+    assert_eq!(
+        evaluate_with(observed.clone(), &raw).decision(),
+        FirewallDecision::Allow
+    );
+
+    let tcp = basic_scenario("rich-protocol-miss");
+    assert_eq!(
+        evaluate_with(observed, &tcp).decision(),
+        FirewallDecision::Block
+    );
+}
+
+#[test]
+fn policy_and_rich_priority_capabilities_fail_closed_by_version() {
+    for (setup, version, expected) in [
+        (
+            "policy_accept_target",
+            Some("0.1.0"),
+            UnknownReason::VersionUnsupported,
+        ),
+        (
+            "policy_accept_target",
+            None,
+            UnknownReason::CapabilityUnavailable,
+        ),
+        (
+            "zone_rich_positive",
+            Some("0.1.0"),
+            UnknownReason::VersionUnsupported,
+        ),
+        (
+            "zone_rich_positive",
+            None,
+            UnknownReason::CapabilityUnavailable,
+        ),
+    ] {
+        let mut observed = snapshot(setup);
+        observed.status.version = version.map(str::to_owned);
+        assert_eq!(
+            evaluate_with(observed, &basic_scenario("version-gated-priority")).unknown_reason(),
+            Some(expected),
+            "setup={setup} version={version:?}"
+        );
+    }
+}
+
+#[test]
+fn invalid_scenario_error_is_typed_and_displayable() {
+    let mut invalid = basic_scenario("invalid-scenario");
+    invalid.name.clear();
+    let index = fwdeck::domain::TrafficEvaluationIndex::new(
+        Arc::new(snapshot("default")),
+        EvaluationTarget::Runtime,
+    );
+    let error = evaluate_scenario(&index, &invalid, &context()).unwrap_err();
+    assert!(error.to_string().starts_with("invalid traffic scenario:"));
+    let report_error = fwdeck::domain::TrafficEvaluationError::Report(
+        fwdeck::domain::TrafficReportError::ZeroRunId,
+    );
+    assert!(
+        report_error
+            .to_string()
+            .starts_with("invalid traffic evaluation contract:")
+    );
+}
+
 #[test]
 fn host_ingress_reviewed_cases_are_deterministic_and_fail_closed() {
     let fixture: Fixture = serde_json::from_str(include_str!(

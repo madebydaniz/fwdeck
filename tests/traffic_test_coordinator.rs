@@ -730,3 +730,46 @@ async fn shutdown_timeout_retains_the_worker_handle_for_a_later_join() {
     coordinator.shutdown().await.unwrap();
     assert!(evaluator.calls_for(1) <= TRAFFIC_TEST_CANCELLATION_INTERVAL);
 }
+
+#[test]
+fn request_constructor_rejects_every_identity_boundary_mismatch() {
+    let context = current_context(1, "request-check", 1, 1, EvaluationTarget::Runtime);
+    let valid_suite = suite("request-check", 1, 1);
+    let runtime_index = TrafficEvaluationIndex::new(snapshot(), EvaluationTarget::Runtime);
+    let permanent_index = TrafficEvaluationIndex::new(snapshot(), EvaluationTarget::Permanent);
+
+    let wrong_id = suite("other-suite", 1, 1);
+    assert!(TrafficTestEvaluationRequest::new(context.clone(), wrong_id, runtime_index).is_err());
+    let wrong_revision = suite("request-check", 2, 1);
+    let runtime_index = TrafficEvaluationIndex::new(snapshot(), EvaluationTarget::Runtime);
+    assert!(
+        TrafficTestEvaluationRequest::new(context.clone(), wrong_revision, runtime_index).is_err()
+    );
+    assert!(
+        TrafficTestEvaluationRequest::new(context.clone(), valid_suite.clone(), permanent_index)
+            .is_err()
+    );
+
+    let mut invalid_context = context;
+    invalid_context.phase = EvaluationPhase::StagedCandidate;
+    let runtime_index = TrafficEvaluationIndex::new(snapshot(), EvaluationTarget::Runtime);
+    assert!(
+        TrafficTestEvaluationRequest::new(invalid_context, valid_suite, runtime_index).is_err()
+    );
+}
+
+#[tokio::test]
+async fn native_coordinator_evaluates_one_immutable_request() {
+    let context = current_context(77, "native", 1, 1, EvaluationTarget::Runtime);
+    let mut coordinator = TrafficTestCoordinator::spawn();
+    coordinator.try_evaluate(request(context, 1)).unwrap();
+    assert!(matches!(
+        next_event(&mut coordinator).await,
+        TrafficTestEvent::EvaluationStarted { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut coordinator).await,
+        TrafficTestEvent::EvaluationFinished { .. }
+    ));
+    coordinator.shutdown().await.unwrap();
+}

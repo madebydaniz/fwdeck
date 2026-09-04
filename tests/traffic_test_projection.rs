@@ -8,7 +8,7 @@ use fwdeck::domain::{
     EvaluationTarget, FirewallOperation, FirewallSnapshot, FirewallStatus, LogDenied,
     MutationIntentId, NetfilterBackend, PolicyDetails, PolicyName, PolicyTarget, PortSpec,
     RichRule, Scoped, ServiceDefinition, ServiceName, UnsupportedOperationReason, ZoneDetails,
-    ZoneName,
+    ZoneName, ZoneTarget,
 };
 
 fn identity() -> EvaluationSnapshotIdentity {
@@ -375,4 +375,532 @@ fn projection_never_mutates_the_authoritative_base_snapshot() {
             .iter()
             .all(|service| service != &ssh())
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn exact_zone_primitives_project_as_one_reviewed_sequence() {
+    let base = Arc::new(snapshot());
+    let zone = public();
+    let source_port = "53000/udp".parse().unwrap();
+    let protocol = fwdeck::domain::IpProtocol::parse("gre").unwrap();
+    let forward: fwdeck::domain::ForwardPort = "port=8443:proto=tcp:toport=443".parse().unwrap();
+    let rule = RichRule::parse(
+        r#"rule family="ipv4" source address="192.0.2.0/24" port port="9443" protocol="tcp" accept"#,
+    )
+    .unwrap();
+    let interface = fwdeck::domain::InterfaceName::parse("eth9").unwrap();
+    let source = fwdeck::domain::SourceAddress::parse("198.51.100.0/24").unwrap();
+    let icmp = fwdeck::domain::IcmpType::parse("echo-request").unwrap();
+    let mysql = ServiceName::parse("mysql").unwrap();
+    let operations = vec![
+        FirewallOperation::AddService {
+            zone: zone.clone(),
+            service: mysql.clone(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::RemoveService {
+            zone: zone.clone(),
+            service: mysql,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::SetDefaultZone { zone: zone.clone() },
+        FirewallOperation::SetMasquerade {
+            zone: zone.clone(),
+            enabled: true,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::SetZoneTarget {
+            zone: zone.clone(),
+            zone_target: ZoneTarget::Drop,
+        },
+        FirewallOperation::AddSourcePort {
+            zone: zone.clone(),
+            port: source_port,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::RemoveSourcePort {
+            zone: zone.clone(),
+            port: source_port,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::AddProtocol {
+            zone: zone.clone(),
+            protocol: protocol.clone(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::RemoveProtocol {
+            zone: zone.clone(),
+            protocol,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::SetForward {
+            zone: zone.clone(),
+            enabled: true,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::SetIcmpBlockInversion {
+            zone: zone.clone(),
+            enabled: true,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::AddForwardPort {
+            zone: zone.clone(),
+            forward: forward.clone(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::RemoveForwardPort {
+            zone: zone.clone(),
+            forward,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::AddRichRule {
+            zone: zone.clone(),
+            rule: rule.clone(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::RemoveRichRule {
+            zone: zone.clone(),
+            rule,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::AddInterface {
+            zone: zone.clone(),
+            interface: interface.clone(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::RemoveInterface {
+            zone: zone.clone(),
+            interface,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::AddSource {
+            zone: zone.clone(),
+            source: source.clone(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::RemoveSource {
+            zone: zone.clone(),
+            source,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::AddIcmpBlock {
+            zone: zone.clone(),
+            icmp: icmp.clone(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::RemoveIcmpBlock {
+            zone,
+            icmp,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+    ];
+
+    let runtime = project(&base, EvaluationTarget::Runtime, &operations);
+    let permanent = project(&base, EvaluationTarget::Permanent, &operations);
+    assert!(runtime.is_exact());
+    assert!(permanent.is_exact());
+    assert!(runtime.snapshot().runtime[&public()].masquerade);
+    assert!(runtime.snapshot().runtime[&public()].forward);
+    assert!(runtime.snapshot().runtime[&public()].icmp_block_inversion);
+    assert_eq!(
+        permanent.snapshot().permanent[&public()].target,
+        ZoneTarget::Drop
+    );
+}
+
+#[test]
+fn service_policy_and_zone_lifecycle_failures_are_typed() {
+    let base = Arc::new(snapshot());
+    let missing_service = ServiceName::parse("absent").unwrap();
+    let missing_policy = PolicyName::parse("absent-policy").unwrap();
+    let missing_zone = ZoneName::parse("absent-zone").unwrap();
+    let port: PortSpec = "9443/tcp".parse().unwrap();
+
+    for operation in [
+        FirewallOperation::DeleteService {
+            service: missing_service.clone(),
+        },
+        FirewallOperation::AddServicePort {
+            service: missing_service.clone(),
+            port,
+        },
+        FirewallOperation::RemoveServicePort {
+            service: missing_service,
+            port,
+        },
+        FirewallOperation::DeletePolicy {
+            policy: missing_policy,
+        },
+        FirewallOperation::DeleteZone { zone: missing_zone },
+    ] {
+        let error = CandidateProjector::project(
+            &base,
+            identity(),
+            MutationIntentId::new(9).unwrap(),
+            None,
+            EvaluationTarget::Permanent,
+            &[operation],
+        )
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+    }
+}
+
+#[test]
+fn service_policy_zone_and_active_lifecycles_project_exactly() {
+    let mut base_snapshot = snapshot();
+    let policy = PolicyName::parse("gateway-ingress").unwrap();
+    let mut policy_details = PolicyDetails::empty(policy.clone());
+    policy_details.ingress_zones = vec!["ANY".to_owned()];
+    policy_details.egress_zones = vec!["HOST".to_owned()];
+    base_snapshot
+        .policies
+        .runtime
+        .insert(policy.clone(), policy_details.clone());
+    base_snapshot
+        .policies
+        .permanent
+        .insert(policy.clone(), policy_details);
+    let base = Arc::new(base_snapshot);
+    let service = ServiceName::parse("lifecycle-service").unwrap();
+    let port: PortSpec = "10443/tcp".parse().unwrap();
+    let zone = ZoneName::parse("lifecycle-zone").unwrap();
+    let operations = [
+        FirewallOperation::CreateService {
+            service: service.clone(),
+        },
+        FirewallOperation::AddServicePort {
+            service: service.clone(),
+            port,
+        },
+        FirewallOperation::RemoveServicePort {
+            service: service.clone(),
+            port,
+        },
+        FirewallOperation::AddPolicyService {
+            policy: policy.clone(),
+            service: ssh(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::RemovePolicyService {
+            policy: policy.clone(),
+            service: ssh(),
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::SetPolicySetEnabled {
+            policy_set: fwdeck::domain::PolicySetName::parse("gateway").unwrap(),
+            enabled: false,
+            target: ConfigurationTarget::RuntimeAndPermanent,
+        },
+        FirewallOperation::CreateZone { zone: zone.clone() },
+        FirewallOperation::AddInterface {
+            zone: zone.clone(),
+            interface: fwdeck::domain::InterfaceName::parse("eth77").unwrap(),
+            target: ConfigurationTarget::Permanent,
+        },
+        FirewallOperation::Reload,
+        FirewallOperation::DeleteZone { zone },
+        FirewallOperation::DeleteService { service },
+    ];
+
+    let runtime = project(&base, EvaluationTarget::Runtime, &operations);
+    let permanent = project(&base, EvaluationTarget::Permanent, &operations);
+    assert!(runtime.is_exact());
+    assert!(permanent.is_exact());
+    assert!(runtime.snapshot().policies.runtime[&policy].disabled);
+    assert!(permanent.snapshot().policies.permanent[&policy].disabled);
+    assert!(
+        runtime
+            .snapshot()
+            .active
+            .keys()
+            .any(|zone| zone.as_str() == "lifecycle-zone")
+    );
+    assert!(
+        !permanent
+            .snapshot()
+            .permanent
+            .keys()
+            .any(|zone| zone.as_str() == "lifecycle-zone")
+    );
+}
+
+#[test]
+fn duplicate_creates_and_target_specific_missing_objects_are_rejected() {
+    let base = Arc::new(snapshot());
+    let policy = PolicyName::parse("missing-policy").unwrap();
+    let zone = ZoneName::parse("missing-zone").unwrap();
+    for operation in [
+        FirewallOperation::CreateService { service: ssh() },
+        FirewallOperation::CreateZone { zone: public() },
+        FirewallOperation::AddPolicyService {
+            policy: policy.clone(),
+            service: ssh(),
+            target: ConfigurationTarget::Runtime,
+        },
+        FirewallOperation::AddPolicyService {
+            policy,
+            service: ssh(),
+            target: ConfigurationTarget::Permanent,
+        },
+        FirewallOperation::AddPort {
+            zone: zone.clone(),
+            port: "22/tcp".parse().unwrap(),
+            target: ConfigurationTarget::Runtime,
+        },
+        FirewallOperation::AddPort {
+            zone,
+            port: "22/tcp".parse().unwrap(),
+            target: ConfigurationTarget::Permanent,
+        },
+    ] {
+        let error = CandidateProjector::project(
+            &base,
+            identity(),
+            MutationIntentId::new(19).unwrap(),
+            None,
+            EvaluationTarget::Runtime,
+            &[operation],
+        )
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+    }
+}
+
+#[test]
+fn projection_metadata_degradation_and_policy_lifecycle_are_preserved() {
+    let mut observed = snapshot();
+    observed.degraded = vec![
+        fwdeck::domain::DegradedSection::new(
+            fwdeck::domain::SnapshotSection::Zones,
+            None,
+            "global evidence gap",
+        ),
+        fwdeck::domain::DegradedSection::new(
+            fwdeck::domain::SnapshotSection::Policies,
+            Some(ConfigurationTarget::RuntimeAndPermanent),
+            "shared policy gap",
+        ),
+        fwdeck::domain::DegradedSection::new(
+            fwdeck::domain::SnapshotSection::Services,
+            Some(ConfigurationTarget::Permanent),
+            "permanent service gap",
+        ),
+    ];
+    let base = Arc::new(observed);
+    let policy = PolicyName::parse("lifecycle-policy").unwrap();
+    let created = project(
+        &base,
+        EvaluationTarget::Permanent,
+        &[FirewallOperation::CreatePolicy {
+            policy: policy.clone(),
+        }],
+    );
+    assert!(created.snapshot().policies.permanent.contains_key(&policy));
+    assert_eq!(created.snapshot().degraded.len(), 3);
+    assert!(created.snapshot().degraded.iter().all(|record| {
+        record.target.is_none() || record.target == Some(ConfigurationTarget::Permanent)
+    }));
+
+    let duplicate = CandidateProjector::project(
+        created.snapshot_arc(),
+        identity(),
+        MutationIntentId::new(22).unwrap(),
+        None,
+        EvaluationTarget::Permanent,
+        &[FirewallOperation::CreatePolicy {
+            policy: policy.clone(),
+        }],
+    );
+    assert!(matches!(
+        duplicate,
+        Err(fwdeck::domain::CandidateProjectionError::ObjectAlreadyExists { kind: "policy", .. })
+    ));
+    let deleted = CandidateProjector::project(
+        created.snapshot_arc(),
+        identity(),
+        MutationIntentId::new(23).unwrap(),
+        None,
+        EvaluationTarget::Permanent,
+        &[FirewallOperation::DeletePolicy { policy }],
+    )
+    .unwrap();
+    assert!(deleted.snapshot().policies.permanent.is_empty());
+
+    let unsupported = FirewallOperation::AddRichRule {
+        zone: public(),
+        rule: RichRule::parse(r#"rule log prefix="audit" accept"#).unwrap(),
+        target: ConfigurationTarget::RuntimeAndPermanent,
+    };
+    let projection = project(&base, EvaluationTarget::Runtime, &[unsupported]);
+    assert!(!projection.unknown_effects()[0].dimensions().is_empty());
+    assert!(!format!("{:?}", projection.unknown_effects()[0].object()).is_empty());
+}
+
+#[test]
+fn policy_scope_and_runtime_to_permanent_paths_are_exact() {
+    let mut observed = snapshot();
+    let policy = PolicyName::parse("gateway-ingress").unwrap();
+    let mut details = PolicyDetails::empty(policy.clone());
+    details.ingress_zones = vec!["ANY".to_owned()];
+    details.egress_zones = vec!["HOST".to_owned()];
+    observed
+        .policies
+        .runtime
+        .insert(policy.clone(), details.clone());
+    observed.policies.permanent.insert(policy.clone(), details);
+    let base = Arc::new(observed);
+    let service = ServiceName::parse("mysql").unwrap();
+    let policy_set = fwdeck::domain::PolicySetName::parse("gateway").unwrap();
+
+    let runtime = project(
+        &base,
+        EvaluationTarget::Runtime,
+        &[
+            FirewallOperation::AddPolicyService {
+                policy: policy.clone(),
+                service: service.clone(),
+                target: ConfigurationTarget::Runtime,
+            },
+            FirewallOperation::SetPolicySetEnabled {
+                policy_set: policy_set.clone(),
+                enabled: false,
+                target: ConfigurationTarget::Runtime,
+            },
+        ],
+    );
+    assert!(
+        runtime.snapshot().policies.runtime[&policy]
+            .services
+            .contains(&service)
+    );
+    assert!(runtime.snapshot().policies.runtime[&policy].disabled);
+
+    let permanent = project(
+        &base,
+        EvaluationTarget::Permanent,
+        &[
+            FirewallOperation::AddPolicyService {
+                policy: policy.clone(),
+                service,
+                target: ConfigurationTarget::Permanent,
+            },
+            FirewallOperation::SetPolicySetEnabled {
+                policy_set,
+                enabled: false,
+                target: ConfigurationTarget::Permanent,
+            },
+        ],
+    );
+    assert!(permanent.snapshot().policies.permanent[&policy].disabled);
+
+    let copied = project(
+        &base,
+        EvaluationTarget::Permanent,
+        &[FirewallOperation::RuntimeToPermanent],
+    );
+    assert!(!copied.snapshot().policies.permanent[&policy].active);
+}
+
+#[test]
+fn unsupported_ipset_effects_are_scoped_before_global_copy() {
+    let base = Arc::new(snapshot());
+    let name = fwdeck::domain::IpSetName::parse("blocked").unwrap();
+    let entry = fwdeck::domain::IpSetEntry::parse("203.0.113.9").unwrap();
+    let runtime_only = FirewallOperation::AddIpSetEntry {
+        name: name.clone(),
+        entry: entry.clone(),
+        target: ConfigurationTarget::Runtime,
+    };
+    let runtime = project(&base, EvaluationTarget::Runtime, &[runtime_only]);
+    assert_eq!(runtime.unknown_effects().len(), 1);
+
+    let both = FirewallOperation::AddIpSetEntry {
+        name,
+        entry,
+        target: ConfigurationTarget::RuntimeAndPermanent,
+    };
+    let permanent = project(&base, EvaluationTarget::Permanent, &[both]);
+    assert_eq!(permanent.unknown_effects().len(), 1);
+}
+
+#[test]
+fn every_projection_error_has_stable_operator_text() {
+    let errors = [
+        fwdeck::domain::CandidateProjectionError::OperationEncoding { operation_index: 4 },
+        fwdeck::domain::CandidateProjectionError::MissingZone {
+            target: "runtime",
+            zone: public(),
+        },
+        fwdeck::domain::CandidateProjectionError::MissingPolicy {
+            target: "permanent",
+            policy: PolicyName::parse("policy").unwrap(),
+        },
+        fwdeck::domain::CandidateProjectionError::MissingServiceDefinition { service: ssh() },
+        fwdeck::domain::CandidateProjectionError::ObjectAlreadyExists {
+            kind: "zone",
+            name: "public".to_owned(),
+        },
+    ];
+    assert!(errors.iter().all(|error| !error.to_string().is_empty()));
+}
+
+#[test]
+fn exact_zone_operations_propagate_missing_zone_without_mutating_authority() {
+    let base = Arc::new(snapshot());
+    let before = (*base).clone();
+    let missing = ZoneName::parse("missing-zone").unwrap();
+    let operations = [
+        FirewallOperation::AddService {
+            zone: missing.clone(),
+            service: ssh(),
+            target: ConfigurationTarget::Runtime,
+        },
+        FirewallOperation::AddTemporaryService {
+            zone: missing.clone(),
+            service: ssh(),
+            seconds: 60,
+        },
+        FirewallOperation::RemoveService {
+            zone: missing.clone(),
+            service: ssh(),
+            target: ConfigurationTarget::Runtime,
+        },
+        FirewallOperation::RemovePort {
+            zone: missing.clone(),
+            port: "22/tcp".parse().unwrap(),
+            target: ConfigurationTarget::Runtime,
+        },
+        FirewallOperation::SetMasquerade {
+            zone: missing.clone(),
+            enabled: true,
+            target: ConfigurationTarget::Runtime,
+        },
+        FirewallOperation::SetForward {
+            zone: missing,
+            enabled: true,
+            target: ConfigurationTarget::Runtime,
+        },
+    ];
+
+    for operation in operations {
+        let error = CandidateProjector::project(
+            &base,
+            identity(),
+            MutationIntentId::new(31).unwrap(),
+            None,
+            EvaluationTarget::Runtime,
+            &[operation],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            fwdeck::domain::CandidateProjectionError::MissingZone {
+                target: "runtime",
+                ..
+            }
+        ));
+        assert_eq!(*base, before);
+    }
 }

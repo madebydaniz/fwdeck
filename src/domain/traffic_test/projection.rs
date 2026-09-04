@@ -817,3 +817,7 @@ fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
         values.push(value);
     }
 }
+
+#[cfg(test)]
+#[path = "projection_private_tests.rs"]
+mod private_tests;
