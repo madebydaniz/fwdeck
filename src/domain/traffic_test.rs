@@ -2,8 +2,10 @@
 
 use super::{PolicyName, ServiceName, SnapshotSection, ZoneName};
 
+mod index;
 mod report;
 mod scenario;
+pub use index::{IndexedZoneBinding, IndexedZoneBindingKind, TrafficEvaluationIndex};
 pub use report::{
     CandidateIdentity, EvaluationContext, EvaluationPhase, EvaluationPlanId,
     EvaluationSnapshotIdentity, EvaluationTarget, MAX_TRAFFIC_REPORT_BYTES, MutationIntentId,

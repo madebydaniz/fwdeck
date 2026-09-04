@@ -63,12 +63,13 @@ pub use snapshot::{
 };
 pub use traffic_test::{
     CandidateIdentity, EvaluationContext, EvaluationPhase, EvaluationPlanId,
-    EvaluationSnapshotIdentity, EvaluationTarget, FirewallDecision, MAX_SCENARIOS_PER_SUITE,
-    MAX_TRACE_STEPS, MAX_TRAFFIC_NAME_BYTES, MAX_TRAFFIC_NOTE_BYTES, MAX_TRAFFIC_REPORT_BYTES,
-    MutationIntentId, OrderedOperationDigest, RulePriority, RulePriorityError, TraceObjectRef,
-    TrafficConnectionState, TrafficDestination, TrafficDirection, TrafficExpectation,
-    TrafficReportError, TrafficScenario, TrafficScenarioId, TrafficSeverity, TrafficSuite,
-    TrafficSuiteId, TrafficSuiteRevision, TrafficTestReport, TrafficTestResult, TrafficTestRunId,
+    EvaluationSnapshotIdentity, EvaluationTarget, FirewallDecision, IndexedZoneBinding,
+    IndexedZoneBindingKind, MAX_SCENARIOS_PER_SUITE, MAX_TRACE_STEPS, MAX_TRAFFIC_NAME_BYTES,
+    MAX_TRAFFIC_NOTE_BYTES, MAX_TRAFFIC_REPORT_BYTES, MutationIntentId, OrderedOperationDigest,
+    RulePriority, RulePriorityError, TraceObjectRef, TrafficConnectionState, TrafficDestination,
+    TrafficDirection, TrafficEvaluationIndex, TrafficExpectation, TrafficReportError,
+    TrafficScenario, TrafficScenarioId, TrafficSeverity, TrafficSuite, TrafficSuiteId,
+    TrafficSuiteRevision, TrafficTestReport, TrafficTestResult, TrafficTestRunId,
     TrafficTestStatus, TrafficTestSummary, TrafficTraceOutcome, TrafficTraceStage,
     TrafficTraceStep, TrafficTransport, TrafficValidationError, UnknownReason,
 };
