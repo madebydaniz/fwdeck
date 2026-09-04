@@ -121,6 +121,24 @@ async fn firewall_info_values(service: &str, key: &str) -> Vec<String> {
     sorted_owned(values.split_whitespace().map(str::to_owned).collect())
 }
 
+async fn ensure_reviewed_zone_runtime_seed() {
+    let query = ["--zone=fwdeck-observe", "--query-service=https"];
+    if firewall_output(&query).await.exit_code != Some(0) {
+        let output = firewall_output(&["--zone=fwdeck-observe", "--add-service=https"]).await;
+        assert_eq!(
+            output.exit_code,
+            Some(0),
+            "failed to restore reviewed runtime service: {}",
+            output.stderr.trim()
+        );
+    }
+    assert_eq!(
+        firewall_output(&query).await.exit_code,
+        Some(0),
+        "reviewed runtime service must be enabled"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a running firewalld (use the dev container)"]
 async fn probe_and_snapshot_against_real_daemon() {
@@ -1151,6 +1169,11 @@ async fn semantic_observation_matches_reviewed_seed_and_daemon_oracle() {
     let reviewed_service = reviewed_service();
     let version = firewall_ok(&["--version"]).await;
     eprintln!("firewalld-version={}", version.trim());
+
+    // Earlier integration tests may reload the shared daemon and clear
+    // runtime-only seeds. Restore this test's reviewed precondition so it is
+    // independent of suite order while remaining idempotent in isolation.
+    ensure_reviewed_zone_runtime_seed().await;
 
     let backend = CliBackend::new(TokioRunner);
     let snapshot = backend.snapshot().await.unwrap();
