@@ -36,6 +36,17 @@ pub(crate) fn write_private_atomic_replace(path: &Path, bytes: &[u8]) -> std::io
     sync_dir(dir)
 }
 
+/// Atomically publishes `path` without replacing an existing file.
+pub(crate) fn write_private_atomic_create(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    let temp = write_private_temp(dir, bytes)?;
+    std::fs::hard_link(temp.path(), path)?;
+    temp.remove()?;
+    sync_dir(dir)
+}
+
 /// Publishes a new private file without overwriting an existing candidate.
 ///
 /// `candidate` receives a collision counter. Publication uses `link(2)`, so

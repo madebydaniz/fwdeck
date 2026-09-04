@@ -11,6 +11,7 @@ pub mod retention;
 pub mod rollback;
 pub mod snapshot_store;
 mod state_file;
+pub mod traffic_test_store;
 
 use firewalld::command::ExportFormat;
 
