@@ -76,7 +76,7 @@ impl DirectRuleTranslation {
 
 /// One additive migration operation. The legacy rule deliberately remains in
 /// place until the operator reloads and validates the replacement policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct DirectPolicyMigration {
     /// New permanent policy name.
     policy: PolicyName,

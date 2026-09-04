@@ -24,7 +24,7 @@ pub enum OperationEffectSupport {
 /// Typed proof that an operation does not affect packet decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficIrrelevanceProof {
-    /// `LogDenied` changes logging behavior, not firewall allow/block semantics.
+    /// A logging-only effect with no configuration lifecycle side effect.
     LoggingSideEffectOnly,
 }
 
@@ -561,13 +561,14 @@ impl OperationEffect {
                 partial_application: PartialApplicationPolicy::SingleStep,
             },
             FirewallOperation::SetLogDenied { .. } => Self {
-                support: OperationEffectSupport::TrafficIrrelevant(
-                    TrafficIrrelevanceProof::LoggingSideEffectOnly,
-                ),
-                targets: OperationTargetSequence::RuntimeAndPermanent,
+                support: OperationEffectSupport::GlobalTransform,
+                targets: OperationTargetSequence::RuntimeFromPermanent,
                 object: AffectedObject::Global,
-                dimensions: vec![TrafficDimension::Observability],
-                temporal: TemporalBehavior::NoTrafficDecisionEffect,
+                dimensions: vec![
+                    TrafficDimension::Observability,
+                    TrafficDimension::GlobalConfiguration,
+                ],
+                temporal: TemporalBehavior::GlobalReplacement,
                 partial_application: PartialApplicationPolicy::SingleStep,
             },
             FirewallOperation::Reload => Self {
@@ -686,7 +687,7 @@ mod tests {
 
     use super::{
         AffectedObject, OperationEffectSupport, OperationTargetSequence, PartialApplicationPolicy,
-        TemporalBehavior, TrafficDimension, TrafficIrrelevanceProof, UnsupportedOperationReason,
+        TemporalBehavior, TrafficDimension, UnsupportedOperationReason,
     };
 
     fn zone() -> ZoneName {
@@ -1052,9 +1053,7 @@ mod tests {
                 FirewallOperation::SetLogDenied {
                     value: LogDenied::All,
                 },
-                OperationEffectSupport::TrafficIrrelevant(
-                    TrafficIrrelevanceProof::LoggingSideEffectOnly,
-                ),
+                OperationEffectSupport::GlobalTransform,
             ),
             (
                 FirewallOperation::Reload,

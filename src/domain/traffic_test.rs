@@ -2,6 +2,29 @@
 
 use super::{PolicyName, ServiceName, SnapshotSection, ZoneName};
 
+mod evaluator;
+mod index;
+mod projection;
+mod report;
+mod scenario;
+pub use evaluator::{TrafficEvaluationError, evaluate_scenario};
+pub use index::{IndexedZoneBinding, IndexedZoneBindingKind, TrafficEvaluationIndex};
+pub use projection::{
+    CandidateProjection, CandidateProjectionError, CandidateProjector, ProjectionUnknownEffect,
+};
+pub use report::{
+    CandidateIdentity, EvaluationContext, EvaluationPhase, EvaluationPlanId,
+    EvaluationSnapshotIdentity, EvaluationTarget, MAX_TRAFFIC_REPORT_BYTES, MutationIntentId,
+    OrderedOperationDigest, TrafficReportError, TrafficTestReport, TrafficTestResult,
+    TrafficTestRunId, TrafficTestSummary,
+};
+pub use scenario::{
+    MAX_SCENARIOS_PER_SUITE, MAX_TRAFFIC_NAME_BYTES, MAX_TRAFFIC_NOTE_BYTES,
+    TrafficConnectionState, TrafficDestination, TrafficDirection, TrafficScenario,
+    TrafficScenarioId, TrafficSeverity, TrafficSuite, TrafficSuiteId, TrafficSuiteRevision,
+    TrafficTransport, TrafficValidationError,
+};
+
 /// Maximum ordered trace steps retained for one scenario result.
 pub const MAX_TRACE_STEPS: usize = 128;
 
@@ -96,6 +119,8 @@ pub enum UnknownReason {
     UnsupportedServiceFeature,
     /// The requested connection state has no supported model.
     UnsupportedConnectionState,
+    /// The requested traffic direction has no supported model.
+    UnsupportedDirection,
     /// A relevant mutation effect cannot be represented exactly.
     UnsupportedOperationEffect,
     /// Potentially intersecting rules exist outside the firewalld model.
@@ -218,6 +243,13 @@ pub enum TraceObjectRef {
     RichRule {
         /// Owning zone.
         zone: ZoneName,
+        /// Position in the immutable observed rule list.
+        index: u32,
+    },
+    /// A rich rule by owning policy and stable snapshot index.
+    PolicyRichRule {
+        /// Owning policy.
+        policy: PolicyName,
         /// Position in the immutable observed rule list.
         index: u32,
     },
@@ -411,6 +443,7 @@ mod tests {
                 UnknownReason::UnsupportedConnectionState,
                 "unsupported_connection_state",
             ),
+            (UnknownReason::UnsupportedDirection, "unsupported_direction"),
             (
                 UnknownReason::UnsupportedOperationEffect,
                 "unsupported_operation_effect",
@@ -460,6 +493,7 @@ mod tests {
     #[test]
     fn trace_steps_require_typed_stages_outcomes_and_object_references() {
         let zone = ZoneName::parse("public").unwrap();
+        let policy = PolicyName::parse("host-ingress").unwrap();
         let service = ServiceName::parse("ssh").unwrap();
         let steps = [
             TrafficTraceStep::new(
@@ -477,14 +511,23 @@ mod tests {
                 TrafficTraceOutcome::Unknown(UnknownReason::IncompleteSnapshot),
             )
             .with_object(TraceObjectRef::SnapshotSection(SnapshotSection::Policies)),
+            TrafficTraceStep::new(
+                TrafficTraceStage::RichRuleEvaluation,
+                TrafficTraceOutcome::Decision(FirewallDecision::Allow),
+            )
+            .with_object(TraceObjectRef::PolicyRichRule { policy, index: 2 }),
         ];
 
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 4);
         assert_eq!(MAX_TRACE_STEPS, 128);
         assert!(steps.iter().all(|step| step.object().is_some()));
         assert_eq!(
             serde_json::to_string(&steps[2]).unwrap(),
             r#"{"stage":"completeness_check","object":{"snapshot_section":"policies"},"outcome":{"unknown":"incomplete_snapshot"}}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&steps[3]).unwrap(),
+            r#"{"stage":"rich_rule_evaluation","object":{"policy_rich_rule":{"policy":"host-ingress","index":2}},"outcome":{"decision":"allow"}}"#,
         );
     }
 }

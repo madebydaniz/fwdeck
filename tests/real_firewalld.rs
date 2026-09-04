@@ -1153,6 +1153,59 @@ async fn assert_semantic_dbus_parity(
     );
 }
 
+fn reviewed_host_ingress_context() -> fwdeck::domain::EvaluationContext {
+    fwdeck::domain::EvaluationContext {
+        run_id: fwdeck::domain::TrafficTestRunId::new(1).unwrap(),
+        suite_id: fwdeck::domain::TrafficSuiteId::parse("real-firewalld-host-ingress").unwrap(),
+        suite_revision: fwdeck::domain::TrafficSuiteRevision::new(1).unwrap(),
+        phase: fwdeck::domain::EvaluationPhase::Current,
+        target: fwdeck::domain::EvaluationTarget::Runtime,
+        authoritative_snapshot: fwdeck::domain::EvaluationSnapshotIdentity::new(1, 1).unwrap(),
+        base_snapshot: None,
+        mutation_intent_id: None,
+        plan_id: None,
+        candidate_identity: None,
+    }
+}
+
+fn reviewed_https_host_ingress() -> fwdeck::domain::TrafficScenario {
+    fwdeck::domain::TrafficScenario {
+        id: fwdeck::domain::TrafficScenarioId::parse("real-firewalld-https").unwrap(),
+        name: "Reviewed HTTPS host ingress".to_owned(),
+        enabled: true,
+        direction: fwdeck::domain::TrafficDirection::ToHost,
+        source: fwdeck::domain::SourceAddress::parse("192.0.2.10").unwrap(),
+        ingress_interface: None,
+        ingress_zone: Some(fwdeck::domain::ZoneName::parse("fwdeck-observe").unwrap()),
+        destination: fwdeck::domain::TrafficDestination::LocalHost,
+        egress_interface: None,
+        egress_zone: None,
+        transport: fwdeck::domain::TrafficTransport::Tcp,
+        destination_port: Some("443".parse().unwrap()),
+        source_port: None,
+        connection_state: fwdeck::domain::TrafficConnectionState::New,
+        expectation: fwdeck::domain::TrafficExpectation::Allow,
+        severity: fwdeck::domain::TrafficSeverity::Critical,
+        required_safety_gate: true,
+        note: Some("compared with firewall-cmd query-service evidence".to_owned()),
+    }
+}
+
+fn predict_reviewed_https(
+    snapshot: fwdeck::domain::FirewallSnapshot,
+) -> fwdeck::domain::TrafficTestResult {
+    let index = fwdeck::domain::TrafficEvaluationIndex::new(
+        std::sync::Arc::new(snapshot),
+        fwdeck::domain::EvaluationTarget::Runtime,
+    );
+    fwdeck::domain::evaluate_scenario(
+        &index,
+        &reviewed_https_host_ingress(),
+        &reviewed_host_ingress_context(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn disposable_real_daemon_guard_rejects_host_like_processes() {
     assert!(!disposable_environment_allowed(None, false, false));
@@ -1184,4 +1237,207 @@ async fn semantic_observation_matches_reviewed_seed_and_daemon_oracle() {
     assert_semantic_dbus_parity(&snapshot, &zone).await;
     #[cfg(not(feature = "dbus"))]
     let _ = zone;
+}
+
+#[tokio::test]
+#[ignore = "requires a seeded disposable firewalld container"]
+async fn cli_host_ingress_prediction_matches_daemon_query_evidence() {
+    let _serial = guarded_firewall_lock().await;
+    ensure_reviewed_zone_runtime_seed().await;
+
+    let query = firewall_output(&["--zone=fwdeck-observe", "--query-service=https"]).await;
+    assert_eq!(
+        query.exit_code,
+        Some(0),
+        "reviewed daemon query must prove HTTPS enabled"
+    );
+    let direct = firewall_output(&[
+        "--direct",
+        "--query-rule",
+        "ipv4",
+        "filter",
+        "INPUT",
+        "9",
+        "-p",
+        "tcp",
+        "--dport",
+        "12345",
+        "-j",
+        "ACCEPT",
+    ])
+    .await;
+    assert_eq!(
+        direct.exit_code,
+        Some(0),
+        "reviewed direct-rule seed must exist"
+    );
+    let snapshot = CliBackend::new(TokioRunner).snapshot().await.unwrap();
+    let result = predict_reviewed_https(snapshot);
+    assert_eq!(
+        result.decision(),
+        fwdeck::domain::FirewallDecision::Unknown,
+        "seeded external direct rule must prevent a false positive: {result:?}"
+    );
+    assert_eq!(
+        result.unknown_reason(),
+        Some(fwdeck::domain::UnknownReason::ExternalRulesOutsideModel)
+    );
+}
+
+#[tokio::test]
+#[ignore = "MUTATES reviewed direct seed temporarily — dev container only"]
+#[allow(clippy::too_many_lines)]
+async fn cli_host_ingress_positive_prediction_matches_daemon_query_evidence() {
+    let _serial = guarded_firewall_lock().await;
+    ensure_reviewed_zone_runtime_seed().await;
+    let runtime_remove = firewall_output(&[
+        "--direct",
+        "--remove-rule",
+        "ipv4",
+        "filter",
+        "INPUT",
+        "9",
+        "-p",
+        "tcp",
+        "--dport",
+        "12345",
+        "-j",
+        "ACCEPT",
+    ])
+    .await;
+    let permanent_remove = firewall_output(&[
+        "--permanent",
+        "--direct",
+        "--remove-rule",
+        "ipv4",
+        "filter",
+        "INPUT",
+        "9",
+        "-p",
+        "tcp",
+        "--dport",
+        "12345",
+        "-j",
+        "ACCEPT",
+    ])
+    .await;
+    let policy_seed =
+        firewall_output(&["--policy=allow-host-ipv6", "--query-ingress-zone=ANY"]).await;
+    let policy_remove =
+        firewall_output(&["--policy=allow-host-ipv6", "--remove-ingress-zone=ANY"]).await;
+    let query = firewall_output(&["--zone=fwdeck-observe", "--query-service=https"]).await;
+    let observed = CliBackend::new(TokioRunner).snapshot().await;
+
+    let policy_restore =
+        firewall_output(&["--policy=allow-host-ipv6", "--add-ingress-zone=ANY"]).await;
+    let runtime_restore = firewall_output(&[
+        "--direct",
+        "--add-rule",
+        "ipv4",
+        "filter",
+        "INPUT",
+        "9",
+        "-p",
+        "tcp",
+        "--dport",
+        "12345",
+        "-j",
+        "ACCEPT",
+    ])
+    .await;
+    let permanent_restore = firewall_output(&[
+        "--permanent",
+        "--direct",
+        "--add-rule",
+        "ipv4",
+        "filter",
+        "INPUT",
+        "9",
+        "-p",
+        "tcp",
+        "--dport",
+        "12345",
+        "-j",
+        "ACCEPT",
+    ])
+    .await;
+
+    assert_eq!(
+        runtime_remove.exit_code,
+        Some(0),
+        "runtime direct seed removal failed"
+    );
+    assert_eq!(
+        permanent_remove.exit_code,
+        Some(0),
+        "permanent direct seed removal failed"
+    );
+    assert_eq!(
+        runtime_restore.exit_code,
+        Some(0),
+        "runtime direct seed restore failed"
+    );
+    assert_eq!(
+        permanent_restore.exit_code,
+        Some(0),
+        "permanent direct seed restore failed"
+    );
+    assert_eq!(
+        policy_remove.exit_code,
+        Some(0),
+        "built-in policy isolation failed"
+    );
+    assert_eq!(
+        policy_seed.exit_code,
+        Some(0),
+        "built-in policy seed must own ANY before isolation"
+    );
+    assert_eq!(
+        policy_restore.exit_code,
+        Some(0),
+        "built-in policy restore failed"
+    );
+    assert_eq!(query.exit_code, Some(0), "daemon HTTPS query must succeed");
+    let snapshot = observed.unwrap();
+    let degraded = snapshot.degraded.clone();
+    let result = predict_reviewed_https(snapshot);
+    assert_eq!(
+        result.decision(),
+        fwdeck::domain::FirewallDecision::Allow,
+        "CLI prediction disagrees with daemon evidence: result={result:?} degraded={degraded:?}"
+    );
+    assert_eq!(result.status(), fwdeck::domain::TrafficTestStatus::Pass);
+}
+
+#[cfg(feature = "dbus")]
+#[tokio::test]
+#[ignore = "requires a seeded disposable firewalld container with system D-Bus"]
+async fn dbus_host_ingress_prediction_preserves_unknown_when_snapshot_is_incomplete() {
+    use fwdeck::infrastructure::firewalld::dbus::DbusBackend;
+
+    let _serial = guarded_firewall_lock().await;
+    ensure_reviewed_zone_runtime_seed().await;
+    let query = firewall_output(&["--zone=fwdeck-observe", "--query-service=https"]).await;
+    assert_eq!(
+        query.exit_code,
+        Some(0),
+        "daemon query must prove HTTPS enabled"
+    );
+
+    let snapshot = DbusBackend::connect()
+        .await
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap();
+    let result = predict_reviewed_https(snapshot);
+    assert_eq!(result.decision(), fwdeck::domain::FirewallDecision::Unknown);
+    assert_eq!(
+        result.status(),
+        fwdeck::domain::TrafficTestStatus::Indeterminate
+    );
+    assert_eq!(
+        result.unknown_reason(),
+        Some(fwdeck::domain::UnknownReason::IncompleteSnapshot)
+    );
 }
