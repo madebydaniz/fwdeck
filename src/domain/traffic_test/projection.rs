@@ -561,6 +561,7 @@ impl ProjectionState {
             })?;
             edit(details);
             self.sync_active_zone(zone);
+            self.refresh_runtime_policy_activity();
         }
         if matches!(
             target,
@@ -632,6 +633,7 @@ impl ProjectionState {
                     policy.disabled = !enabled;
                 }
             }
+            self.refresh_runtime_policy_activity();
         }
         if matches!(
             target,
@@ -744,7 +746,9 @@ impl ProjectionState {
                         || ZoneName::parse(zone).is_ok_and(|zone| active_zones.contains_key(&zone))
                 })
             };
-            policy.active = side_active(&policy.ingress_zones) && side_active(&policy.egress_zones);
+            policy.active = !policy.disabled
+                && side_active(&policy.ingress_zones)
+                && side_active(&policy.egress_zones);
         }
     }
 

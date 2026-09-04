@@ -105,11 +105,13 @@ fn scenario(index: usize, expectation: TrafficExpectation) -> TrafficScenario {
 
 #[test]
 fn cross_component_evidence_is_isolated_deterministic_bounded_and_non_mutating() {
-    let authoritative = Arc::new(snapshot());
+    let mut base = snapshot();
+    base.runtime.get_mut(&public()).unwrap().target = ZoneTarget::Drop;
+    let authoritative = Arc::new(base);
     let authoritative_before = serde_json::to_vec(authoritative.as_ref()).unwrap();
     let operation = FirewallOperation::AddPort {
         zone: public(),
-        port: "9443/tcp".parse::<PortSpec>().unwrap(),
+        port: "22/tcp".parse::<PortSpec>().unwrap(),
         target: ConfigurationTarget::Runtime,
     };
     let projection = CandidateProjector::project(
@@ -128,9 +130,11 @@ fn cross_component_evidence_is_isolated_deterministic_bounded_and_non_mutating()
     let runtime_context = candidate_context(1, projection.identity());
     let permanent_context = context(2, EvaluationTarget::Permanent);
     let runtime_index = TrafficEvaluationIndex::new(
-        Arc::new(projection.snapshot().clone()),
+        Arc::clone(projection.snapshot_arc()),
         EvaluationTarget::Runtime,
     );
+    let before_runtime_index =
+        TrafficEvaluationIndex::new(Arc::clone(&authoritative), EvaluationTarget::Runtime);
     let permanent_index =
         TrafficEvaluationIndex::new(Arc::clone(&authoritative), EvaluationTarget::Permanent);
     let scenarios = [
@@ -142,6 +146,17 @@ fn cross_component_evidence_is_isolated_deterministic_bounded_and_non_mutating()
         .iter()
         .map(|item| evaluate_scenario(&runtime_index, item, &runtime_context).unwrap())
         .collect::<Vec<_>>();
+    let before_runtime_results = scenarios
+        .iter()
+        .map(|item| {
+            evaluate_scenario(
+                &before_runtime_index,
+                item,
+                &context(3, EvaluationTarget::Runtime),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
     let permanent_results = scenarios
         .iter()
         .map(|item| evaluate_scenario(&permanent_index, item, &permanent_context).unwrap())
@@ -151,6 +166,11 @@ fn cross_component_evidence_is_isolated_deterministic_bounded_and_non_mutating()
         runtime_results
             .iter()
             .all(|result| result.status() == TrafficTestStatus::Pass)
+    );
+    assert!(
+        before_runtime_results
+            .iter()
+            .all(|result| result.decision() == FirewallDecision::Block)
     );
     assert!(
         permanent_results

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use super::{EvaluationTarget, RulePriority};
 use crate::domain::{
     ConfigurationTarget, FirewallSnapshot, InterfaceName, PolicyDetails, PolicyName,
-    RichRuleAnalysis, ServiceName, ServiceResolution, SnapshotSection, SourceAddress, ZoneDetails,
-    ZoneName, resolve_service_includes,
+    RichRuleAnalysis, ServiceDefinition, ServiceName, ServiceResolution, SnapshotSection,
+    SourceAddress, ZoneDetails, ZoneName, resolve_service_includes,
 };
 
 /// Exact binding evidence used to classify ingress traffic.
@@ -201,6 +201,12 @@ impl TrafficEvaluationIndex {
     #[must_use]
     pub fn service(&self, name: &ServiceName) -> Option<&ServiceResolution> {
         self.services.get(name)
+    }
+
+    /// Returns one original definition without flattening include-local constraints.
+    #[must_use]
+    pub fn service_definition(&self, name: &ServiceName) -> Option<&ServiceDefinition> {
+        self.snapshot.service_definitions.get(name)
     }
 
     /// Returns all target-referenced pre-expanded services.

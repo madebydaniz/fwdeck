@@ -11,9 +11,10 @@ use super::{
     TrafficValidationError, UnknownReason,
 };
 use crate::domain::{
-    AddressFamily, FeatureSupport, FirewalldFeature, PolicyDetails, PolicyTarget, PortSelector,
-    Protocol, RichRule, RichRuleAction, RichRuleAnalysis, RichRuleExpression, ServiceDefinition,
-    SnapshotSection, SourceAddress, TraceObjectRef, ZoneDetails, ZoneName, ZoneTarget,
+    AddressFamily, FeatureSupport, FirewalldFeature, ForwardPort, IpProtocol, PolicyDetails,
+    PolicyTarget, PortSelector, Protocol, RichRule, RichRuleAction, RichRuleAnalysis,
+    RichRuleExpression, ServiceDefinition, ServiceResolution, SnapshotSection, SourceAddress,
+    TraceObjectRef, ZoneDetails, ZoneName, ZoneTarget,
 };
 
 /// Failure to evaluate an invalid input contract or construct a bounded result.
@@ -67,6 +68,19 @@ pub fn evaluate_scenario(
             trace,
             TrafficTraceStage::PathResolution,
             UnknownReason::UnsupportedConnectionState,
+        );
+    }
+    if let TrafficTransport::RawProtocol { protocol } = &scenario.transport
+        && matches!(
+            known_protocol_number(protocol.as_str()),
+            None | Some(1 | 6 | 17 | 58)
+        )
+    {
+        return unknown(
+            scenario,
+            trace,
+            TrafficTraceStage::PathResolution,
+            UnknownReason::CapabilityUnavailable,
         );
     }
     trace.push(TrafficTraceStep::new(
@@ -156,6 +170,15 @@ fn evaluate_selected_zone(
             TraceObjectRef::SnapshotSection(SnapshotSection::Policies),
         );
     }
+    if forward_ports_may_intersect(&zone.forward_ports, scenario) {
+        return unknown_with_object(
+            scenario,
+            trace,
+            TrafficTraceStage::PathResolution,
+            UnknownReason::CapabilityUnavailable,
+            TraceObjectRef::Zone(zone.name.clone()),
+        );
+    }
     let policies = applicable_policies(index, &selected_zone);
     if !policies.is_empty()
         && let Err(reason) = require_capability(index, FirewalldFeature::PolicyObjects, &mut trace)
@@ -243,13 +266,13 @@ fn resolve_ingress(
         return Ok(explicit.clone());
     }
 
-    let has_ipset_binding = index.zone_bindings().iter().any(|binding| {
+    let has_unverifiable_binding = index.zone_bindings().iter().any(|binding| {
         matches!(
             binding.kind(),
-            IndexedZoneBindingKind::Source(SourceAddress::IpSet(_))
+            IndexedZoneBindingKind::Source(SourceAddress::IpSet(_) | SourceAddress::Mac(_))
         )
     });
-    if has_ipset_binding {
+    if has_unverifiable_binding {
         return Err(UnknownReason::CapabilityUnavailable);
     }
 
@@ -273,22 +296,29 @@ fn resolve_source_zone(
     scenario: &TrafficScenario,
     trace: &mut Vec<TrafficTraceStep>,
 ) -> Result<Option<ZoneName>, UnknownReason> {
-    let source_matches: Vec<(i16, u8, ZoneName)> = index
-        .zone_bindings()
-        .iter()
-        .filter_map(|binding| {
-            let IndexedZoneBindingKind::Source(source) = binding.kind() else {
-                return None;
-            };
-            source_binding_specificity(source, &scenario.source).map(|specificity| {
-                (
-                    binding.ingress_priority().get(),
-                    specificity,
-                    binding.zone().clone(),
-                )
-            })
-        })
-        .collect();
+    let mut source_matches = Vec::new();
+    let mut has_partial = false;
+    for binding in index.zone_bindings() {
+        let IndexedZoneBindingKind::Source(source) = binding.kind() else {
+            continue;
+        };
+        match source_selector_match(source, &scenario.source) {
+            SelectorMatch::Matched => {
+                if let Some(specificity) = source_binding_specificity(source, &scenario.source) {
+                    source_matches.push((
+                        binding.ingress_priority().get(),
+                        specificity,
+                        binding.zone().clone(),
+                    ));
+                }
+            }
+            SelectorMatch::Partial => has_partial = true,
+            SelectorMatch::NotMatched => {}
+        }
+    }
+    if has_partial {
+        return Err(UnknownReason::CapabilityUnavailable);
+    }
     let Some(priority) = source_matches
         .iter()
         .map(|(priority, _, _)| *priority)
@@ -718,31 +748,52 @@ fn zone_target_decision(
     PathOutcome::Decision(decision)
 }
 
-fn primitive_port_match(
+fn primitive_match(
     ports: &[crate::domain::PortSpec],
     source_ports: &[crate::domain::PortSpec],
-    protocols: &[crate::domain::IpProtocol],
+    protocols: &[IpProtocol],
     scenario: &TrafficScenario,
-) -> bool {
+) -> SelectorMatch {
+    let mut result = SelectorMatch::NotMatched;
+    if matches!(
+        scenario.transport,
+        TrafficTransport::Tcp | TrafficTransport::Udp
+    ) {
+        let Some(protocol) = transport_protocol(&scenario.transport) else {
+            return SelectorMatch::Partial;
+        };
+        if let Some(query) = scenario.destination_port {
+            for rule in ports.iter().filter(|rule| rule.protocol == protocol) {
+                result = result.or(selector_match(rule.port, query));
+            }
+        }
+        for rule in source_ports.iter().filter(|rule| rule.protocol == protocol) {
+            result = result.or(match scenario.source_port {
+                Some(query) => selector_match(rule.port, query),
+                None => SelectorMatch::Partial,
+            });
+        }
+    }
+    for protocol in protocols {
+        result = result.or(protocol_match(protocol, scenario));
+    }
+    result
+}
+
+fn forward_ports_may_intersect(forward_ports: &[ForwardPort], scenario: &TrafficScenario) -> bool {
     match &scenario.transport {
         TrafficTransport::Tcp | TrafficTransport::Udp => {
             let Some(protocol) = transport_protocol(&scenario.transport) else {
                 return false;
             };
-            let destination_match = scenario.destination_port.is_some_and(|query| {
-                ports
-                    .iter()
-                    .any(|rule| rule.protocol == protocol && selector_covers(rule.port, query))
-            });
-            let source_match = scenario.source_port.is_some_and(|query| {
-                source_ports
-                    .iter()
-                    .any(|rule| rule.protocol == protocol && selector_covers(rule.port, query))
-            });
-            destination_match || source_match
+            scenario.destination_port.is_some_and(|query| {
+                forward_ports.iter().any(|forward| {
+                    forward.protocol == protocol
+                        && selector_match(forward.port, query) != SelectorMatch::NotMatched
+                })
+            })
         }
-        TrafficTransport::RawProtocol { protocol } => protocols.contains(protocol),
-        TrafficTransport::Icmp { .. } => false,
+        TrafficTransport::RawProtocol { .. } | TrafficTransport::Icmp { .. } => false,
     }
 }
 
@@ -761,15 +812,21 @@ fn evaluate_primitives(
     rules: PrimitiveRules<'_>,
     trace: &mut Vec<TrafficTraceStep>,
 ) -> PathOutcome {
-    if primitive_port_match(rules.ports, rules.source_ports, rules.protocols, scenario) {
-        trace.push(
-            TrafficTraceStep::new(
-                rules.stage,
-                TrafficTraceOutcome::Decision(FirewallDecision::Allow),
-            )
-            .with_object(rules.object),
-        );
-        return PathOutcome::Decision(FirewallDecision::Allow);
+    match primitive_match(rules.ports, rules.source_ports, rules.protocols, scenario) {
+        SelectorMatch::Matched => {
+            trace.push(
+                TrafficTraceStep::new(
+                    rules.stage,
+                    TrafficTraceOutcome::Decision(FirewallDecision::Allow),
+                )
+                .with_object(rules.object),
+            );
+            return PathOutcome::Decision(FirewallDecision::Allow);
+        }
+        SelectorMatch::Partial => {
+            return PathOutcome::Unknown(UnknownReason::CapabilityUnavailable);
+        }
+        SelectorMatch::NotMatched => {}
     }
     if rules.services.is_empty() {
         return PathOutcome::Continue;
@@ -786,7 +843,7 @@ fn evaluate_primitives(
         if !resolution.failures.is_empty() {
             return PathOutcome::Unknown(UnknownReason::IncompleteServiceDefinition);
         }
-        match service_match(&resolution.effective, scenario) {
+        match service_resolution_match(index, resolution, scenario) {
             ServiceMatch::Matched => {
                 trace.push(
                     TrafficTraceStep::new(
@@ -804,8 +861,8 @@ fn evaluate_primitives(
                 );
                 return PathOutcome::Decision(FirewallDecision::Allow);
             }
-            ServiceMatch::Unknown => {
-                return PathOutcome::Unknown(UnknownReason::UnsupportedServiceFeature);
+            ServiceMatch::Unknown(reason) => {
+                return PathOutcome::Unknown(reason);
             }
             ServiceMatch::NotMatched => {}
         }
@@ -975,18 +1032,31 @@ fn rich_expression_match(
     if expression.family.is_some_and(|expected| expected != family) {
         return RichMatch::NotMatched;
     }
+    let mut result = SelectorMatch::Matched;
     if let Some(source) = &expression.source {
-        let matches = source_selector_covered(&source.address, &scenario.source);
-        if matches == source.inverted {
+        let matched = source_selector_match(&source.address, &scenario.source);
+        result = result.and(if source.inverted {
+            matched.inverted()
+        } else {
+            matched
+        });
+        if result == SelectorMatch::NotMatched {
             return RichMatch::NotMatched;
         }
     }
     if let Some(destination) = &expression.destination {
-        let TrafficDestination::Address(candidate) = &scenario.destination else {
-            return RichMatch::Unknown(UnknownReason::CapabilityUnavailable);
+        let matched = match &scenario.destination {
+            TrafficDestination::Address(candidate) => {
+                source_selector_match(&destination.address, candidate)
+            }
+            TrafficDestination::LocalHost => SelectorMatch::Partial,
         };
-        let matches = source_selector_covered(&destination.address, candidate);
-        if matches == destination.inverted {
+        result = result.and(if destination.inverted {
+            matched.inverted()
+        } else {
+            matched
+        });
+        if result == SelectorMatch::NotMatched {
             return RichMatch::NotMatched;
         }
     }
@@ -994,27 +1064,31 @@ fn rich_expression_match(
         let Some(protocol) = transport_protocol(&scenario.transport) else {
             return RichMatch::NotMatched;
         };
-        let matched = scenario
-            .destination_port
-            .is_some_and(|query| rule.protocol == protocol && selector_covers(rule.port, query));
-        return if matched {
-            RichMatch::Matched
+        let matched = if rule.protocol == protocol {
+            scenario
+                .destination_port
+                .map_or(SelectorMatch::Partial, |query| {
+                    selector_match(rule.port, query)
+                })
         } else {
-            RichMatch::NotMatched
+            SelectorMatch::NotMatched
         };
+        result = result.and(matched);
     }
     if let Some(rule) = expression.source_port {
         let Some(protocol) = transport_protocol(&scenario.transport) else {
             return RichMatch::NotMatched;
         };
-        let matched = scenario
-            .source_port
-            .is_some_and(|query| rule.protocol == protocol && selector_covers(rule.port, query));
-        return if matched {
-            RichMatch::Matched
+        let matched = if rule.protocol == protocol {
+            scenario
+                .source_port
+                .map_or(SelectorMatch::Partial, |query| {
+                    selector_match(rule.port, query)
+                })
         } else {
-            RichMatch::NotMatched
+            SelectorMatch::NotMatched
         };
+        result = result.and(matched);
     }
     if let Some(service_name) = &expression.service {
         if !index.section_is_complete(SnapshotSection::Services)
@@ -1028,22 +1102,21 @@ fn rich_expression_match(
         if !resolution.failures.is_empty() {
             return RichMatch::Unknown(UnknownReason::IncompleteServiceDefinition);
         }
-        return match service_match(&resolution.effective, scenario) {
-            ServiceMatch::Matched => RichMatch::Matched,
-            ServiceMatch::NotMatched => RichMatch::NotMatched,
-            ServiceMatch::Unknown => RichMatch::Unknown(UnknownReason::UnsupportedServiceFeature),
+        let matched = match service_resolution_match(index, resolution, scenario) {
+            ServiceMatch::Matched => SelectorMatch::Matched,
+            ServiceMatch::NotMatched => SelectorMatch::NotMatched,
+            ServiceMatch::Unknown(reason) => return RichMatch::Unknown(reason),
         };
+        result = result.and(matched);
     }
     if let Some(protocol) = &expression.protocol {
-        return if scenario_protocol(scenario)
-            .is_some_and(|candidate| candidate == protocol.as_str())
-        {
-            RichMatch::Matched
-        } else {
-            RichMatch::NotMatched
-        };
+        result = result.and(protocol_match(protocol, scenario));
     }
-    RichMatch::Matched
+    match result {
+        SelectorMatch::Matched => RichMatch::Matched,
+        SelectorMatch::NotMatched => RichMatch::NotMatched,
+        SelectorMatch::Partial => RichMatch::Unknown(UnknownReason::CapabilityUnavailable),
+    }
 }
 
 fn scenario_protocol(scenario: &TrafficScenario) -> Option<&str> {
@@ -1058,10 +1131,50 @@ fn scenario_protocol(scenario: &TrafficScenario) -> Option<&str> {
     }
 }
 
+fn protocol_match(rule: &IpProtocol, scenario: &TrafficScenario) -> SelectorMatch {
+    if scenario_protocol(scenario).is_some_and(|candidate| candidate == rule.as_str()) {
+        return SelectorMatch::Matched;
+    }
+    match (
+        known_protocol_number(rule.as_str()),
+        scenario_protocol_number(scenario),
+    ) {
+        (Some(rule), Some(candidate)) if rule == candidate => SelectorMatch::Matched,
+        (Some(_), Some(_)) => SelectorMatch::NotMatched,
+        _ => SelectorMatch::Partial,
+    }
+}
+
+fn scenario_protocol_number(scenario: &TrafficScenario) -> Option<u8> {
+    match &scenario.transport {
+        TrafficTransport::Tcp => Some(6),
+        TrafficTransport::Udp => Some(17),
+        TrafficTransport::Icmp { .. } => scenario.source.family().map(|family| match family {
+            AddressFamily::Ipv4 => 1,
+            AddressFamily::Ipv6 => 58,
+        }),
+        TrafficTransport::RawProtocol { protocol } => known_protocol_number(protocol.as_str()),
+    }
+}
+
+fn known_protocol_number(raw: &str) -> Option<u8> {
+    match raw {
+        "icmp" => Some(1),
+        "igmp" => Some(2),
+        "tcp" => Some(6),
+        "udp" => Some(17),
+        "gre" => Some(47),
+        "esp" => Some(50),
+        "ah" => Some(51),
+        "ipv6-icmp" | "icmpv6" => Some(58),
+        numeric => numeric.parse().ok(),
+    }
+}
+
 enum ServiceMatch {
     Matched,
     NotMatched,
-    Unknown,
+    Unknown(UnknownReason),
 }
 
 enum RichMatch {
@@ -1070,58 +1183,124 @@ enum RichMatch {
     Unknown(UnknownReason),
 }
 
-fn service_match(definition: &ServiceDefinition, scenario: &TrafficScenario) -> ServiceMatch {
-    let primitive_matches = match &scenario.transport {
-        TrafficTransport::Tcp | TrafficTransport::Udp => {
-            let Some(protocol) = transport_protocol(&scenario.transport) else {
-                return ServiceMatch::Unknown;
-            };
-            let destination_match = scenario.destination_port.is_some_and(|query| {
-                definition
-                    .ports
-                    .iter()
-                    .any(|rule| rule.protocol == protocol && selector_covers(rule.port, query))
-            });
-            let source_match = scenario.source_port.is_some_and(|query| {
-                definition
-                    .source_ports
-                    .iter()
-                    .any(|rule| rule.protocol == protocol && selector_covers(rule.port, query))
-            });
-            destination_match || source_match
+fn service_resolution_match(
+    index: &TrafficEvaluationIndex,
+    resolution: &ServiceResolution,
+    scenario: &TrafficScenario,
+) -> ServiceMatch {
+    let mut result = ServiceMatch::NotMatched;
+    for name in &resolution.services {
+        let Some(definition) = index.service_definition(name) else {
+            return ServiceMatch::Unknown(UnknownReason::IncompleteServiceDefinition);
+        };
+        match service_definition_match(definition, scenario) {
+            ServiceMatch::Matched => return ServiceMatch::Matched,
+            ServiceMatch::Unknown(reason) => result = ServiceMatch::Unknown(reason),
+            ServiceMatch::NotMatched => {}
         }
-        TrafficTransport::RawProtocol { protocol } => definition.protocols.contains(protocol),
-        TrafficTransport::Icmp { .. } => false,
-    };
-    if !primitive_matches {
+    }
+    result
+}
+
+fn service_definition_match(
+    definition: &ServiceDefinition,
+    scenario: &TrafficScenario,
+) -> ServiceMatch {
+    let primitive = primitive_match(
+        &definition.ports,
+        &definition.source_ports,
+        &definition.protocols,
+        scenario,
+    );
+    if primitive == SelectorMatch::NotMatched {
+        return ServiceMatch::NotMatched;
+    }
+
+    if matches!(scenario.destination, TrafficDestination::LocalHost)
+        && scenario.source.family().is_some_and(|family| {
+            definition
+                .destinations
+                .iter()
+                .any(|destination| destination.family == family)
+        })
+    {
+        return ServiceMatch::Unknown(UnknownReason::UnsupportedServiceFeature);
+    }
+
+    let destination = service_destination_match(definition, scenario);
+    let matched = primitive.and(destination);
+    if matched == SelectorMatch::NotMatched {
         return ServiceMatch::NotMatched;
     }
     if !definition.helpers.is_empty() || !definition.modules.is_empty() {
-        return ServiceMatch::Unknown;
+        return ServiceMatch::Unknown(UnknownReason::UnsupportedServiceFeature);
     }
+    match matched {
+        SelectorMatch::Matched => ServiceMatch::Matched,
+        SelectorMatch::NotMatched => ServiceMatch::NotMatched,
+        SelectorMatch::Partial => ServiceMatch::Unknown(UnknownReason::CapabilityUnavailable),
+    }
+}
 
+fn service_destination_match(
+    definition: &ServiceDefinition,
+    scenario: &TrafficScenario,
+) -> SelectorMatch {
+    if definition.destinations.is_empty() {
+        return SelectorMatch::Matched;
+    }
     let Some(family) = scenario.source.family() else {
-        return ServiceMatch::Unknown;
+        return SelectorMatch::Partial;
     };
-    let destinations: Vec<&SourceAddress> = definition
+    let matching_family: Vec<&SourceAddress> = definition
         .destinations
         .iter()
         .filter(|destination| destination.family == family)
         .map(|destination| &destination.address)
         .collect();
-    if destinations.is_empty() {
-        return ServiceMatch::Matched;
+    if matching_family.is_empty() {
+        return SelectorMatch::NotMatched;
     }
     let TrafficDestination::Address(candidate) = &scenario.destination else {
-        return ServiceMatch::Unknown;
+        return SelectorMatch::Partial;
     };
-    if destinations
+    matching_family
         .into_iter()
-        .any(|destination| source_selector_covered(destination, candidate))
-    {
-        ServiceMatch::Matched
-    } else {
-        ServiceMatch::NotMatched
+        .fold(SelectorMatch::NotMatched, |result, destination| {
+            result.or(source_selector_match(destination, candidate))
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectorMatch {
+    Matched,
+    NotMatched,
+    Partial,
+}
+
+impl SelectorMatch {
+    const fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::NotMatched, _) | (_, Self::NotMatched) => Self::NotMatched,
+            (Self::Matched, Self::Matched) => Self::Matched,
+            (Self::Matched | Self::Partial, Self::Matched | Self::Partial) => Self::Partial,
+        }
+    }
+
+    const fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Matched, _) | (_, Self::Matched) => Self::Matched,
+            (Self::Partial, _) | (_, Self::Partial) => Self::Partial,
+            (Self::NotMatched, Self::NotMatched) => Self::NotMatched,
+        }
+    }
+
+    const fn inverted(self) -> Self {
+        match self {
+            Self::Matched => Self::NotMatched,
+            Self::NotMatched => Self::Matched,
+            Self::Partial => Self::Partial,
+        }
     }
 }
 
@@ -1157,8 +1336,36 @@ fn source_binding_specificity(binding: &SourceAddress, candidate: &SourceAddress
     }
 }
 
-fn source_selector_covered(binding: &SourceAddress, candidate: &SourceAddress) -> bool {
-    source_binding_specificity(binding, candidate).is_some()
+fn source_selector_match(binding: &SourceAddress, candidate: &SourceAddress) -> SelectorMatch {
+    let (
+        SourceAddress::Ip {
+            addr: binding_address,
+            prefix: binding_prefix,
+        },
+        SourceAddress::Ip {
+            addr: candidate_address,
+            prefix: candidate_prefix,
+        },
+    ) = (binding, candidate)
+    else {
+        return SelectorMatch::Partial;
+    };
+    if binding_address.is_ipv4() != candidate_address.is_ipv4() {
+        return SelectorMatch::NotMatched;
+    }
+    let binding_prefix = binding_prefix.unwrap_or_else(|| max_prefix(*binding_address));
+    let candidate_prefix = candidate_prefix.unwrap_or_else(|| max_prefix(*candidate_address));
+    if binding_prefix <= candidate_prefix
+        && cidr_contains(*binding_address, binding_prefix, *candidate_address)
+    {
+        SelectorMatch::Matched
+    } else if candidate_prefix < binding_prefix
+        && cidr_contains(*candidate_address, candidate_prefix, *binding_address)
+    {
+        SelectorMatch::Partial
+    } else {
+        SelectorMatch::NotMatched
+    }
 }
 
 const fn max_prefix(address: IpAddr) -> u8 {
@@ -1193,10 +1400,16 @@ fn masked_equal(network: &[u8], candidate: &[u8], prefix: u8) -> bool {
         .is_some_and(|(left, right)| left & mask == right & mask)
 }
 
-fn selector_covers(rule: PortSelector, query: PortSelector) -> bool {
+fn selector_match(rule: PortSelector, query: PortSelector) -> SelectorMatch {
     let (rule_start, rule_end) = selector_bounds(rule);
     let (query_start, query_end) = selector_bounds(query);
-    rule_start <= query_start && query_end <= rule_end
+    if rule_start <= query_start && query_end <= rule_end {
+        SelectorMatch::Matched
+    } else if rule_end < query_start || query_end < rule_start {
+        SelectorMatch::NotMatched
+    } else {
+        SelectorMatch::Partial
+    }
 }
 
 const fn selector_bounds(selector: PortSelector) -> (u16, u16) {

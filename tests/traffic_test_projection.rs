@@ -4,11 +4,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use fwdeck::domain::{
-    CandidateProjector, ConfigurationTarget, EvaluationPlanId, EvaluationSnapshotIdentity,
-    EvaluationTarget, FirewallOperation, FirewallSnapshot, FirewallStatus, LogDenied,
-    MutationIntentId, NetfilterBackend, PolicyDetails, PolicyName, PolicyTarget, PortSpec,
-    RichRule, Scoped, ServiceDefinition, ServiceName, UnsupportedOperationReason, ZoneDetails,
-    ZoneName, ZoneTarget,
+    ActiveZone, CandidateProjector, ConfigurationTarget, EvaluationContext, EvaluationPhase,
+    EvaluationPlanId, EvaluationSnapshotIdentity, EvaluationTarget, FirewallDecision,
+    FirewallOperation, FirewallSnapshot, FirewallStatus, InterfaceName, LogDenied,
+    MutationIntentId, NetfilterBackend, PolicyDetails, PolicyName, PolicySetName, PolicyTarget,
+    PortSelector, PortSpec, RichRule, Scoped, ServiceDefinition, ServiceName, SourceAddress,
+    TrafficConnectionState, TrafficDestination, TrafficDirection, TrafficEvaluationIndex,
+    TrafficExpectation, TrafficScenario, TrafficScenarioId, TrafficSeverity, TrafficSuiteId,
+    TrafficSuiteRevision, TrafficTestRunId, TrafficTransport, UnsupportedOperationReason,
+    ZoneDetails, ZoneName, ZoneTarget, evaluate_scenario,
 };
 
 fn identity() -> EvaluationSnapshotIdentity {
@@ -71,6 +75,45 @@ fn snapshot() -> FirewallSnapshot {
         direct_rules: Vec::new(),
         degraded: Vec::new(),
     }
+}
+
+fn runtime_decision(snapshot: Arc<FirewallSnapshot>, id: &str) -> FirewallDecision {
+    let index = TrafficEvaluationIndex::new(snapshot, EvaluationTarget::Runtime);
+    let scenario = TrafficScenario {
+        id: TrafficScenarioId::parse(id).unwrap(),
+        name: id.to_owned(),
+        enabled: true,
+        direction: TrafficDirection::ToHost,
+        source: SourceAddress::parse("192.0.2.10").unwrap(),
+        ingress_interface: None,
+        ingress_zone: Some(public()),
+        destination: TrafficDestination::LocalHost,
+        egress_interface: None,
+        egress_zone: None,
+        transport: TrafficTransport::Tcp,
+        destination_port: Some("22".parse::<PortSelector>().unwrap()),
+        source_port: None,
+        connection_state: TrafficConnectionState::New,
+        expectation: TrafficExpectation::Block,
+        severity: TrafficSeverity::Critical,
+        required_safety_gate: true,
+        note: None,
+    };
+    let context = EvaluationContext {
+        run_id: TrafficTestRunId::new(1).unwrap(),
+        suite_id: TrafficSuiteId::parse("projection-activity").unwrap(),
+        suite_revision: TrafficSuiteRevision::new(1).unwrap(),
+        phase: EvaluationPhase::Current,
+        target: EvaluationTarget::Runtime,
+        authoritative_snapshot: identity(),
+        base_snapshot: None,
+        mutation_intent_id: None,
+        plan_id: None,
+        candidate_identity: None,
+    };
+    evaluate_scenario(&index, &scenario, &context)
+        .unwrap()
+        .decision()
 }
 
 #[test]
@@ -903,4 +946,171 @@ fn exact_zone_operations_propagate_missing_zone_without_mutating_authority() {
         ));
         assert_eq!(*base, before);
     }
+}
+
+#[test]
+fn runtime_binding_mutations_reconcile_policy_activity_and_verdicts() {
+    let policy_name = PolicyName::parse("public-to-host").unwrap();
+    let mut policy = PolicyDetails::empty(policy_name.clone());
+    policy.priority = -100;
+    policy.target = PolicyTarget::Drop;
+    policy.ingress_zones = vec!["public".to_owned()];
+    policy.egress_zones = vec!["HOST".to_owned()];
+
+    let mut unbound = snapshot();
+    unbound.runtime.get_mut(&public()).unwrap().services.clear();
+    unbound.runtime.get_mut(&public()).unwrap().target = ZoneTarget::Accept;
+    unbound
+        .policies
+        .runtime
+        .insert(policy_name.clone(), policy.clone());
+    let unbound = Arc::new(unbound);
+    assert_eq!(
+        runtime_decision(Arc::clone(&unbound), "before-runtime-binding"),
+        FirewallDecision::Allow
+    );
+
+    for (id, operation) in [
+        (
+            "after-interface-binding",
+            FirewallOperation::AddInterface {
+                zone: public(),
+                interface: InterfaceName::parse("eth9").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            },
+        ),
+        (
+            "after-source-binding",
+            FirewallOperation::AddSource {
+                zone: public(),
+                source: SourceAddress::parse("198.51.100.0/24").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            },
+        ),
+    ] {
+        let candidate = project(&unbound, EvaluationTarget::Runtime, &[operation]);
+        assert!(candidate.snapshot().policies.runtime[&policy_name].active);
+        assert_eq!(
+            runtime_decision(Arc::clone(candidate.snapshot_arc()), id),
+            FirewallDecision::Block
+        );
+    }
+
+    for (id, interface, source, operation) in [
+        (
+            "after-interface-removal",
+            Some(InterfaceName::parse("eth9").unwrap()),
+            None,
+            FirewallOperation::RemoveInterface {
+                zone: public(),
+                interface: InterfaceName::parse("eth9").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            },
+        ),
+        (
+            "after-source-removal",
+            None,
+            Some(SourceAddress::parse("198.51.100.0/24").unwrap()),
+            FirewallOperation::RemoveSource {
+                zone: public(),
+                source: SourceAddress::parse("198.51.100.0/24").unwrap(),
+                target: ConfigurationTarget::Runtime,
+            },
+        ),
+    ] {
+        let mut bound = snapshot();
+        bound.runtime.get_mut(&public()).unwrap().services.clear();
+        bound.runtime.get_mut(&public()).unwrap().target = ZoneTarget::Accept;
+        bound.runtime.get_mut(&public()).unwrap().interfaces =
+            interface.clone().into_iter().collect();
+        bound.runtime.get_mut(&public()).unwrap().sources = source.clone().into_iter().collect();
+        bound.active.insert(
+            public(),
+            ActiveZone {
+                interfaces: interface.into_iter().collect(),
+                sources: source.into_iter().collect(),
+            },
+        );
+        policy.active = true;
+        bound
+            .policies
+            .runtime
+            .insert(policy_name.clone(), policy.clone());
+        let candidate = project(&Arc::new(bound), EvaluationTarget::Runtime, &[operation]);
+        assert!(!candidate.snapshot().policies.runtime[&policy_name].active);
+        assert_eq!(
+            runtime_decision(Arc::clone(candidate.snapshot_arc()), id),
+            FirewallDecision::Allow
+        );
+    }
+}
+
+#[test]
+fn runtime_policy_set_enablement_reconciles_disabled_and_active_state() {
+    let policy_name = PolicyName::parse("gateway-world-to-HOST").unwrap();
+    let mut policy = PolicyDetails::empty(policy_name.clone());
+    policy.active = false;
+    policy.disabled = true;
+    policy.priority = -100;
+    policy.target = PolicyTarget::Drop;
+    policy.ingress_zones = vec!["public".to_owned()];
+    policy.egress_zones = vec!["HOST".to_owned()];
+
+    let mut observed = snapshot();
+    let interface = InterfaceName::parse("eth9").unwrap();
+    observed
+        .runtime
+        .get_mut(&public())
+        .unwrap()
+        .services
+        .clear();
+    observed.runtime.get_mut(&public()).unwrap().target = ZoneTarget::Accept;
+    observed.runtime.get_mut(&public()).unwrap().interfaces = vec![interface.clone()];
+    observed.active.insert(
+        public(),
+        ActiveZone {
+            interfaces: vec![interface],
+            sources: Vec::new(),
+        },
+    );
+    observed
+        .policies
+        .runtime
+        .insert(policy_name.clone(), policy);
+    let base = Arc::new(observed);
+
+    let enabled = project(
+        &base,
+        EvaluationTarget::Runtime,
+        &[FirewallOperation::SetPolicySetEnabled {
+            policy_set: PolicySetName::parse("gateway").unwrap(),
+            enabled: true,
+            target: ConfigurationTarget::Runtime,
+        }],
+    );
+    assert!(!enabled.snapshot().policies.runtime[&policy_name].disabled);
+    assert!(enabled.snapshot().policies.runtime[&policy_name].active);
+    assert_eq!(
+        runtime_decision(Arc::clone(enabled.snapshot_arc()), "enabled-runtime-policy"),
+        FirewallDecision::Block
+    );
+
+    let disabled = project(
+        enabled.snapshot_arc(),
+        EvaluationTarget::Runtime,
+        &[FirewallOperation::SetPolicySetEnabled {
+            policy_set: PolicySetName::parse("gateway").unwrap(),
+            enabled: false,
+            target: ConfigurationTarget::Runtime,
+        }],
+    );
+    assert!(disabled.snapshot().policies.runtime[&policy_name].disabled);
+    assert!(!disabled.snapshot().policies.runtime[&policy_name].active);
+    assert_eq!(
+        runtime_decision(
+            Arc::clone(disabled.snapshot_arc()),
+            "disabled-runtime-policy"
+        ),
+        FirewallDecision::Allow
+    );
 }

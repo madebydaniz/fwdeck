@@ -890,3 +890,389 @@ fn permanent_policy_evaluation_ignores_the_runtime_active_marker() {
     assert_eq!(result.decision(), FirewallDecision::Allow);
     assert_eq!(result.status(), TrafficTestStatus::Pass);
 }
+
+#[test]
+fn partial_rich_selectors_and_source_zone_bindings_are_unknown() {
+    let mut observed = snapshot("default");
+    observed.runtime.get_mut(&public_zone()).unwrap().target = ZoneTarget::Accept;
+    observed.runtime.get_mut(&public_zone()).unwrap().rich_rules =
+        vec![RichRule::parse(r#"rule family="ipv4" source address="192.0.2.0/25" drop"#).unwrap()];
+    let mut partial_source = basic_scenario("partial-rich-source");
+    partial_source.source = SourceAddress::parse("192.0.2.0/24").unwrap();
+    assert_eq!(
+        evaluate_with(observed.clone(), &partial_source).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    observed.runtime.get_mut(&public_zone()).unwrap().rich_rules = vec![
+        RichRule::parse(r#"rule family="ipv4" source invert="true" address="192.0.2.0/25" drop"#)
+            .unwrap(),
+    ];
+    partial_source.id = TrafficScenarioId::parse("partial-inverted-rich-source").unwrap();
+    assert_eq!(
+        evaluate_with(observed, &partial_source).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let mut observed = snapshot("default");
+    observed.runtime.get_mut(&public_zone()).unwrap().target = ZoneTarget::Accept;
+    observed.runtime.get_mut(&public_zone()).unwrap().rich_rules = vec![
+        RichRule::parse(r#"rule family="ipv4" destination address="198.51.100.0/25" drop"#)
+            .unwrap(),
+    ];
+    let mut partial_destination = basic_scenario("partial-rich-destination");
+    partial_destination.destination =
+        TrafficDestination::Address(SourceAddress::parse("198.51.100.0/24").unwrap());
+    assert_eq!(
+        evaluate_with(observed, &partial_destination).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let mut binding_snapshot = snapshot("default");
+    binding_snapshot
+        .runtime
+        .get_mut(&public_zone())
+        .unwrap()
+        .target = ZoneTarget::Accept;
+    let mut subset = zone("source-subset", -20, ZoneTarget::Drop);
+    subset.sources = vec![SourceAddress::parse("192.0.2.0/25").unwrap()];
+    binding_snapshot.runtime.insert(subset.name.clone(), subset);
+    let mut partial_binding = basic_scenario("partial-source-zone-binding");
+    partial_binding.ingress_zone = None;
+    partial_binding.source = SourceAddress::parse("192.0.2.0/24").unwrap();
+    assert_eq!(
+        evaluate_with(binding_snapshot, &partial_binding).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+}
+
+#[test]
+fn partial_and_missing_port_evidence_is_unknown() {
+    let mut observed = snapshot("default");
+    let public = observed.runtime.get_mut(&public_zone()).unwrap();
+    public.target = ZoneTarget::Accept;
+    public.rich_rules =
+        vec![RichRule::parse(r#"rule port port="22" protocol="tcp" drop"#).unwrap()];
+    let mut partial = basic_scenario("partial-rich-port");
+    partial.destination_port = Some("22-23".parse().unwrap());
+    assert_eq!(
+        evaluate_with(observed.clone(), &partial).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let public = observed.runtime.get_mut(&public_zone()).unwrap();
+    public.rich_rules.clear();
+    public.ports = vec!["22/tcp".parse().unwrap()];
+    partial.id = TrafficScenarioId::parse("partial-zone-port").unwrap();
+    assert_eq!(
+        evaluate_with(observed.clone(), &partial).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let public = observed.runtime.get_mut(&public_zone()).unwrap();
+    public.ports.clear();
+    public.source_ports = vec!["45000/tcp".parse().unwrap()];
+    let missing_source_port = basic_scenario("missing-zone-source-port");
+    assert_eq!(
+        evaluate_with(observed.clone(), &missing_source_port).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let public = observed.runtime.get_mut(&public_zone()).unwrap();
+    public.source_ports.clear();
+    public.rich_rules = vec![RichRule::parse(
+        r#"rule family="ipv4" source address="192.0.2.0/24" source-port port="45000" protocol="tcp" drop"#,
+    )
+    .unwrap()];
+    let missing_rich_source_port = basic_scenario("missing-rich-source-port");
+    assert_eq!(
+        evaluate_with(observed, &missing_rich_source_port).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+}
+
+#[test]
+fn included_service_definitions_keep_ports_bound_to_their_destinations() {
+    let root = ServiceName::parse("root-service").unwrap();
+    let included = ServiceName::parse("included-service").unwrap();
+    let mut observed = snapshot("default");
+    observed.runtime.get_mut(&public_zone()).unwrap().services = vec![root.clone()];
+    observed.service_definitions.insert(
+        root.clone(),
+        ServiceDefinition {
+            ports: vec!["80/tcp".parse().unwrap()],
+            destinations: vec![ServiceDestination {
+                family: AddressFamily::Ipv4,
+                address: SourceAddress::parse("192.0.2.10").unwrap(),
+            }],
+            includes: vec![included.clone()],
+            ..ServiceDefinition::default()
+        },
+    );
+    observed.service_definitions.insert(
+        included,
+        ServiceDefinition {
+            ports: vec!["443/tcp".parse().unwrap()],
+            destinations: vec![ServiceDestination {
+                family: AddressFamily::Ipv4,
+                address: SourceAddress::parse("192.0.2.20").unwrap(),
+            }],
+            ..ServiceDefinition::default()
+        },
+    );
+    let mut scenario = basic_scenario("included-service-destination-association");
+    scenario.destination_port = Some("80".parse().unwrap());
+    scenario.destination = TrafficDestination::Address(SourceAddress::parse("192.0.2.20").unwrap());
+
+    assert_eq!(
+        evaluate_with(observed, &scenario).decision(),
+        FirewallDecision::Block
+    );
+}
+
+#[test]
+fn service_destinations_do_not_disappear_when_the_scenario_family_differs() {
+    let mut scenario = basic_scenario("service-destination-family-mismatch");
+    scenario.source = SourceAddress::parse("2001:db8::10").unwrap();
+    scenario.destination =
+        TrafficDestination::Address(SourceAddress::parse("2001:db8::20").unwrap());
+    scenario.destination_port = Some("8443".parse().unwrap());
+
+    assert_eq!(
+        evaluate_with(snapshot("default"), &scenario).decision(),
+        FirewallDecision::Block
+    );
+}
+
+#[test]
+fn service_port_source_port_and_destination_uncertainty_is_preserved() {
+    let service = ServiceName::parse("bounded-service").unwrap();
+    let mut observed = snapshot("default");
+    let public = observed.runtime.get_mut(&public_zone()).unwrap();
+    public.target = ZoneTarget::Accept;
+    public.ports.clear();
+    public.source_ports.clear();
+    public.protocols.clear();
+    public.services = vec![service.clone()];
+    observed.service_definitions.insert(
+        service.clone(),
+        ServiceDefinition {
+            ports: vec!["22/tcp".parse().unwrap()],
+            ..ServiceDefinition::default()
+        },
+    );
+    let mut partial_port = basic_scenario("partial-service-port");
+    partial_port.destination_port = Some("22-23".parse().unwrap());
+    assert_eq!(
+        evaluate_with(observed.clone(), &partial_port).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    observed.service_definitions.insert(
+        service.clone(),
+        ServiceDefinition {
+            source_ports: vec!["45000/tcp".parse().unwrap()],
+            ..ServiceDefinition::default()
+        },
+    );
+    let missing_source_port = basic_scenario("missing-service-source-port");
+    assert_eq!(
+        evaluate_with(observed.clone(), &missing_source_port).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    observed.service_definitions.insert(
+        service,
+        ServiceDefinition {
+            ports: vec!["65000/tcp".parse().unwrap()],
+            destinations: vec![ServiceDestination {
+                family: AddressFamily::Ipv4,
+                address: SourceAddress::parse("198.51.100.0/25").unwrap(),
+            }],
+            ..ServiceDefinition::default()
+        },
+    );
+    let mut partial_destination = basic_scenario("partial-service-destination");
+    partial_destination.destination =
+        TrafficDestination::Address(SourceAddress::parse("198.51.100.0/24").unwrap());
+    assert_eq!(
+        evaluate_with(observed, &partial_destination).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+}
+
+#[test]
+fn relevant_zone_forward_ports_are_unknown_but_disjoint_ports_continue() {
+    let mut observed = snapshot("default");
+    let public = observed.runtime.get_mut(&public_zone()).unwrap();
+    public.target = ZoneTarget::Drop;
+    public.forward_ports = vec!["port=22:proto=tcp:toport=2222".parse().unwrap()];
+
+    let mut relevant = basic_scenario("relevant-zone-forward-port");
+    relevant.destination_port = Some("22".parse().unwrap());
+    assert_eq!(
+        evaluate_with(observed.clone(), &relevant).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let mut disjoint = basic_scenario("disjoint-zone-forward-port");
+    disjoint.destination_port = Some("23".parse().unwrap());
+    assert_eq!(
+        evaluate_with(observed, &disjoint).decision(),
+        FirewallDecision::Block
+    );
+}
+
+#[test]
+fn mac_zone_bindings_require_verified_ingress_evidence() {
+    let mut observed = snapshot("default");
+    observed.runtime.get_mut(&public_zone()).unwrap().target = ZoneTarget::Accept;
+    let mut mac_zone = zone("mac-drop", -20, ZoneTarget::Drop);
+    mac_zone.sources = vec![SourceAddress::parse("aa:bb:cc:dd:ee:ff").unwrap()];
+    observed.runtime.insert(mac_zone.name.clone(), mac_zone);
+    let mut scenario = basic_scenario("mac-binding-without-evidence");
+    scenario.ingress_zone = None;
+
+    assert_eq!(
+        evaluate_with(observed, &scenario).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+}
+
+#[test]
+fn protocol_primitives_cover_transport_families_and_numeric_ids() {
+    let mut zone_protocol = snapshot("default");
+    let public = zone_protocol.runtime.get_mut(&public_zone()).unwrap();
+    public.target = ZoneTarget::Drop;
+    public.protocols = vec![IpProtocol::parse("tcp").unwrap()];
+    let mut tcp = basic_scenario("zone-tcp-protocol");
+    tcp.destination_port = Some("22".parse().unwrap());
+    assert_eq!(
+        evaluate_with(zone_protocol, &tcp).decision(),
+        FirewallDecision::Allow
+    );
+
+    let mut policy_protocol = snapshot("default");
+    let mut policy = policy("numeric-tcp", -100, PolicyTarget::Continue);
+    policy.protocols = vec![IpProtocol::parse("6").unwrap()];
+    add_runtime_policy(&mut policy_protocol, policy);
+    assert_eq!(
+        evaluate_with(policy_protocol, &tcp).decision(),
+        FirewallDecision::Allow
+    );
+
+    let service = ServiceName::parse("udp-protocol-service").unwrap();
+    let mut service_protocol = snapshot("default");
+    service_protocol
+        .runtime
+        .get_mut(&public_zone())
+        .unwrap()
+        .services = vec![service.clone()];
+    service_protocol
+        .runtime
+        .get_mut(&public_zone())
+        .unwrap()
+        .source_ports
+        .clear();
+    service_protocol.service_definitions.insert(
+        service,
+        ServiceDefinition {
+            protocols: vec![IpProtocol::parse("17").unwrap()],
+            ..ServiceDefinition::default()
+        },
+    );
+    let mut udp = basic_scenario("service-udp-protocol");
+    udp.transport = TrafficTransport::Udp;
+    udp.destination_port = Some("53".parse().unwrap());
+    assert_eq!(
+        evaluate_with(service_protocol, &udp).decision(),
+        FirewallDecision::Allow
+    );
+
+    let mut rich_protocol = snapshot("default");
+    rich_protocol
+        .runtime
+        .get_mut(&public_zone())
+        .unwrap()
+        .rich_rules = vec![RichRule::parse(r#"rule protocol value="58" accept"#).unwrap()];
+    rich_protocol
+        .runtime
+        .get_mut(&public_zone())
+        .unwrap()
+        .icmp_blocks
+        .clear();
+    let mut icmpv6 = basic_scenario("rich-numeric-icmpv6-protocol");
+    icmpv6.source = SourceAddress::parse("2001:db8::10").unwrap();
+    icmpv6.transport = TrafficTransport::Icmp {
+        icmp_type: IcmpType::parse("echo-request").unwrap(),
+    };
+    icmpv6.destination_port = None;
+    assert_eq!(
+        evaluate_with(rich_protocol, &icmpv6).decision(),
+        FirewallDecision::Allow
+    );
+
+    let mut unknown_alias = snapshot("default");
+    unknown_alias
+        .runtime
+        .get_mut(&public_zone())
+        .unwrap()
+        .protocols = vec![IpProtocol::parse("site-protocol").unwrap()];
+    assert_eq!(
+        evaluate_with(unknown_alias, &tcp).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+}
+
+#[test]
+fn raw_transport_aliases_needing_subtype_evidence_are_unknown() {
+    let mut forward = snapshot("default");
+    forward
+        .runtime
+        .get_mut(&public_zone())
+        .unwrap()
+        .forward_ports = vec!["port=22:proto=tcp:toport=2222".parse().unwrap()];
+    let mut raw_tcp = basic_scenario("raw-tcp-forward-port");
+    raw_tcp.transport = TrafficTransport::RawProtocol {
+        protocol: IpProtocol::parse("6").unwrap(),
+    };
+    raw_tcp.destination_port = None;
+    assert_eq!(
+        evaluate_with(forward, &raw_tcp).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let mut raw_icmp = basic_scenario("raw-icmp-without-type");
+    raw_icmp.transport = TrafficTransport::RawProtocol {
+        protocol: IpProtocol::parse("icmp").unwrap(),
+    };
+    raw_icmp.destination_port = None;
+    assert_eq!(
+        evaluate_with(snapshot("default"), &raw_icmp).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let mut unresolved = basic_scenario("raw-unresolved-alias");
+    unresolved.transport = TrafficTransport::RawProtocol {
+        protocol: IpProtocol::parse("site-protocol").unwrap(),
+    };
+    unresolved.destination_port = None;
+    assert_eq!(
+        evaluate_with(snapshot("default"), &unresolved).unknown_reason(),
+        Some(UnknownReason::CapabilityUnavailable)
+    );
+
+    let mut gre = basic_scenario("raw-gre-remains-supported");
+    gre.transport = TrafficTransport::RawProtocol {
+        protocol: IpProtocol::parse("gre").unwrap(),
+    };
+    gre.destination_port = None;
+    assert_eq!(
+        evaluate_with(snapshot("default"), &gre).decision(),
+        FirewallDecision::Allow
+    );
+}
+
+fn public_zone() -> ZoneName {
+    ZoneName::parse("public").unwrap()
+}
