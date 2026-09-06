@@ -68,6 +68,16 @@ fn zone_for_iface(snapshot: &FirewallSnapshot, iface: Option<&str>) -> Option<Zo
 }
 
 pub(super) fn activate_row(state: &mut UiState) {
+    if state.view == ViewId::TrafficTests {
+        if let Some(row) = state.visible_rows().get(state.view_state().selected)
+            && let RowId::TrafficScenario(id) = &row.id
+            && let Some(content) = state.traffic.details(id)
+        {
+            state.overlay_scroll = 0;
+            state.overlays.push(Overlay::Details(content));
+        }
+        return;
+    }
     if state.view == ViewId::Zones {
         let rows = state.visible_rows();
         let Some(RowId::Zone(zone)) = rows
@@ -121,9 +131,11 @@ fn row_zone(id: &RowId) -> Option<&ZoneName> {
         | RowId::RichRule { zone, .. }
         | RowId::Interface { zone, .. }
         | RowId::Source { zone, .. } => Some(zone),
-        RowId::IpSet { .. } | RowId::Policy { .. } | RowId::Direct { .. } | RowId::Log { .. } => {
-            None
-        }
+        RowId::TrafficScenario(_)
+        | RowId::IpSet { .. }
+        | RowId::Policy { .. }
+        | RowId::Direct { .. }
+        | RowId::Log { .. } => None,
     }
 }
 

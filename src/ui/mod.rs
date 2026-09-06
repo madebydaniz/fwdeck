@@ -16,6 +16,8 @@ pub mod rich_builder;
 pub mod search;
 pub mod state;
 pub mod theme;
+mod traffic_shell;
+pub mod traffic_tests;
 pub mod update;
 pub mod views;
 
@@ -36,10 +38,12 @@ use std::ops::ControlFlow;
 
 use crate::domain::LogEntry;
 
+use crate::infrastructure::traffic_test_storage::DefaultTrafficSuiteStorage;
 use action::{Effect, UiAction};
 use outbox::{EngineEffectDisposition, EngineOutbox, OutboxEnqueueError};
 use state::UiState;
 use theme::Theme;
+use traffic_shell::TrafficShell;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -91,13 +95,20 @@ async fn event_loop(
     let mut logs_alive = true;
     let mut log_batch: Vec<LogEntry> = Vec::new();
     let mut outbox = EngineOutbox::new();
+    let storage = crate::config::default_path().and_then(|path| {
+        path.parent()
+            .map(|directory| std::sync::Arc::new(DefaultTrafficSuiteStorage::new(directory)))
+    });
+    let mut traffic = TrafficShell::new(storage);
     let mut published_priority = RefreshPriority::default();
     publish_refresh_priority(&engine, &state, &mut published_priority);
 
-    loop {
-        terminal.draw(|f| render::render(f, &mut state, &theme))?;
+    let result = loop {
+        if let Err(error) = terminal.draw(|f| render::render(f, &mut state, &theme)) {
+            break Err(AppError::Terminal(error));
+        }
 
-        let action = next_event_loop_action(
+        let action = next_event_loop_action_with_traffic(
             ctrl_c.as_mut(),
             &mut engine,
             &mut outbox,
@@ -109,15 +120,21 @@ async fn event_loop(
             &mut logs,
             &mut logs_alive,
             &mut log_batch,
+            &mut traffic,
         )
-        .await?;
+        .await;
+        let action = match action {
+            Ok(action) => action,
+            Err(error) => break Err(error),
+        };
 
         let Some(action) = action else { continue };
-        let control = process_action_worklist(
+        let control = process_action_worklist_with_traffic(
             &mut state,
             &mut outbox,
             std::collections::VecDeque::from([action]),
             config.retention,
+            &mut traffic,
         )
         .await;
         publish_refresh_priority(&engine, &state, &mut published_priority);
@@ -125,16 +142,20 @@ async fn event_loop(
             // A clean quit must not abandon armed rollbacks: fire the inverses
             // and wait (bounded) for the engine to run them. Crash/SIGKILL/
             // connection-loss is covered by the out-of-process watchdog.
-            drain_rollbacks_on_exit(&mut state, &mut outbox, &mut engine).await;
-            return Ok(());
+            break Ok(());
         }
+    };
+    drain_rollbacks_on_exit(&mut state, &mut outbox, &mut engine).await;
+    if let Err(error) = traffic.shutdown().await {
+        tracing::error!(%error, "traffic service shutdown failed");
     }
+    result
 }
 
 /// Polls one fair turn of the production event loop. Keeping the engine
 /// dispatcher as one branch means a blocked sender never owns the shell.
 #[allow(clippy::too_many_arguments)] // Explicitly borrows the independently-owned loop sources.
-async fn next_event_loop_action<C, I>(
+async fn next_event_loop_action_with_traffic<C, I, S: crate::application::TrafficSuiteStorage>(
     mut ctrl_c: Pin<&mut C>,
     engine: &mut EngineHandle,
     outbox: &mut EngineOutbox,
@@ -146,6 +167,7 @@ async fn next_event_loop_action<C, I>(
     logs: &mut mpsc::Receiver<LogEntry>,
     logs_alive: &mut bool,
     log_batch: &mut Vec<LogEntry>,
+    traffic: &mut TrafficShell<S>,
 ) -> Result<Option<UiAction>, AppError>
 where
     C: Future<Output = std::io::Result<()>>,
@@ -153,6 +175,7 @@ where
 {
     let can_dispatch = outbox.has_dispatchable();
     let action = tokio::select! {
+        action = traffic.next_action(), if traffic.armed() => action,
         // SIGINT is the emergency exit — never gate it behind a modal.
         _ = &mut ctrl_c => Some(UiAction::QuitConfirmed),
         dispatch = outbox.dispatch_one(
@@ -206,6 +229,59 @@ fn observe_engine_event(outbox: &mut EngineOutbox, event: &EngineEvent) {
     {
         outbox.complete_rollback(id);
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn next_event_loop_action<C, I>(
+    ctrl_c: Pin<&mut C>,
+    engine: &mut EngineHandle,
+    outbox: &mut EngineOutbox,
+    tick: &mut tokio::time::Interval,
+    events: &mut I,
+    state: &UiState,
+    engine_alive: &mut bool,
+    specific_engine_error: &mut Option<FirewallError>,
+    logs: &mut mpsc::Receiver<LogEntry>,
+    logs_alive: &mut bool,
+    log_batch: &mut Vec<LogEntry>,
+) -> Result<Option<UiAction>, AppError>
+where
+    C: Future<Output = std::io::Result<()>>,
+    I: Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    next_event_loop_action_with_traffic(
+        ctrl_c,
+        engine,
+        outbox,
+        tick,
+        events,
+        state,
+        engine_alive,
+        specific_engine_error,
+        logs,
+        logs_alive,
+        log_batch,
+        &mut TrafficShell::<DefaultTrafficSuiteStorage>::new(None),
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn process_action_worklist(
+    state: &mut UiState,
+    outbox: &mut EngineOutbox,
+    pending: std::collections::VecDeque<UiAction>,
+    retention: crate::config::RetentionConfig,
+) -> ControlFlow<()> {
+    process_action_worklist_with_traffic(
+        state,
+        outbox,
+        pending,
+        retention,
+        &mut TrafficShell::<DefaultTrafficSuiteStorage>::new(None),
+    )
+    .await
 }
 
 /// Maps an engine event to the UI action that handles it.
@@ -263,14 +339,19 @@ fn publish_refresh_priority(
 /// Runs reducer follow-up actions without awaiting engine capacity. Engine-bound
 /// effects move synchronously into the bounded shell outbox; only non-engine
 /// effects are executed inline.
-async fn process_action_worklist(
+async fn process_action_worklist_with_traffic<S: crate::application::TrafficSuiteStorage>(
     state: &mut state::UiState,
     outbox: &mut EngineOutbox,
     mut pending: std::collections::VecDeque<UiAction>,
     retention: crate::config::RetentionConfig,
+    traffic: &mut TrafficShell<S>,
 ) -> ControlFlow<()> {
     while let Some(action) = pending.pop_front() {
         for effect in update::update(state, action) {
+            if let Some(action) = traffic.route(&effect, state) {
+                pending.push_back(action);
+                continue;
+            }
             let before = (outbox.normal_pending(), outbox.rollback_pending());
             match outbox::enqueue_engine_effect(outbox, effect) {
                 Ok(EngineEffectDisposition::Queued) => {
@@ -333,6 +414,10 @@ async fn execute_effect(
     retention: crate::config::RetentionConfig,
 ) -> ControlFlow<()> {
     match effect {
+        Effect::TrafficLoad
+        | Effect::TrafficEvaluate
+        | Effect::TrafficTarget(_)
+        | Effect::TrafficObserve(_) => {}
         Effect::Quit => return ControlFlow::Break(()),
         Effect::Refresh
         | Effect::Apply(_)

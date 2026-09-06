@@ -13,7 +13,7 @@ use crate::domain::{
 };
 
 /// Number of views; sizes the per-view state array in `UiState`.
-pub const VIEW_COUNT: usize = 11;
+pub const VIEW_COUNT: usize = 12;
 
 /// Stable, typed identity and mutation payload for one table row.
 ///
@@ -24,6 +24,8 @@ pub const VIEW_COUNT: usize = 11;
 /// values.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RowId {
+    /// Non-mutating configuration-evaluation scenario.
+    TrafficScenario(crate::domain::TrafficScenarioId),
     /// A firewalld zone.
     Zone(ZoneName),
     /// A zone service.
@@ -216,6 +218,8 @@ pub enum ViewId {
     Logs,
     /// Policy objects governing traffic between zones.
     Policies,
+    /// Opt-in native configuration evaluation.
+    TrafficTests,
 }
 
 impl ViewId {
@@ -246,6 +250,7 @@ impl ViewId {
             Self::Direct => "Direct",
             Self::Logs => "Logs",
             Self::Policies => "Policies",
+            Self::TrafficTests => "Traffic Tests",
         }
     }
 
@@ -264,6 +269,7 @@ impl ViewId {
             Self::Direct => "8",
             Self::Logs => "9",
             Self::Policies => "p",
+            Self::TrafficTests => ":",
         }
     }
 
@@ -271,6 +277,15 @@ impl ViewId {
     #[must_use]
     pub const fn columns(self) -> &'static [&'static str] {
         match self {
+            Self::TrafficTests => &[
+                "NAME",
+                "DIRECTION",
+                "EXPECTED",
+                "ACTUAL",
+                "STATUS",
+                "SEVERITY",
+                "TARGET",
+            ],
             Self::Zones => &[
                 "NAME",
                 "≠",
@@ -309,6 +324,15 @@ impl ViewId {
     #[must_use]
     pub fn widths(self) -> Vec<Constraint> {
         match self {
+            Self::TrafficTests => vec![
+                Constraint::Min(20),
+                Constraint::Length(9),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(20),
+                Constraint::Length(9),
+                Constraint::Length(9),
+            ],
             Self::Zones => vec![
                 Constraint::Min(10),
                 Constraint::Length(4),
@@ -500,7 +524,8 @@ pub fn rows(
         ViewId::Policies => policies_rows(snap, config),
         // Logs rows come from the UI's ring buffer (`UiState::all_rows`). The
         // zone-backed arms returned above through `zone_rows_from_parts`.
-        ViewId::Logs
+        ViewId::TrafficTests
+        | ViewId::Logs
         | ViewId::Zones
         | ViewId::Ports
         | ViewId::Forwarding
@@ -562,9 +587,12 @@ fn zone_rows_from_parts(
         ViewId::RichRules => Some(rich_rules_rows(runtime, permanent, zone)),
         ViewId::Interfaces => Some(interfaces_rows(active, permanent, config)),
         ViewId::Sources => Some(sources_rows(active, permanent, config)),
-        ViewId::Services | ViewId::IpSets | ViewId::Direct | ViewId::Logs | ViewId::Policies => {
-            None
-        }
+        ViewId::TrafficTests
+        | ViewId::Services
+        | ViewId::IpSets
+        | ViewId::Direct
+        | ViewId::Logs
+        | ViewId::Policies => None,
     }
 }
 

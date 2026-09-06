@@ -783,6 +783,39 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
         ),
     ];
 
+    if state.view == ViewId::TrafficTests {
+        for (action, title, description) in [
+            (
+                UiAction::TrafficReload,
+                "Reload default traffic suite",
+                "Read local suite without refreshing firewalld",
+            ),
+            (
+                UiAction::TrafficEvaluate,
+                "Evaluate traffic tests",
+                "Configuration evaluation only; no packet probes",
+            ),
+            (
+                UiAction::TrafficToggleTarget,
+                "Toggle traffic evaluation target",
+                "Runtime or permanent; offline remains permanent",
+            ),
+            (
+                UiAction::ActivateRow,
+                "Traffic scenario details",
+                "Inspect selected scenario and evaluation identity",
+            ),
+        ] {
+            commands.push(cmd(
+                action,
+                title,
+                description,
+                &["traffic", "tests"],
+                Category::App,
+                Availability::Enabled,
+            ));
+        }
+    }
     for view in ViewId::iter() {
         commands.push(cmd(
             UiAction::SwitchView(view),
@@ -818,6 +851,63 @@ pub fn filtered(state: &UiState) -> Vec<PaletteCommand> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    #[test]
+    fn traffic_context_catalog_offers_local_commands() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        state.view = ViewId::TrafficTests;
+        let commands = catalog(&state);
+        for action in [
+            UiAction::TrafficReload,
+            UiAction::TrafficEvaluate,
+            UiAction::TrafficToggleTarget,
+        ] {
+            assert!(
+                commands.iter().any(|command| command.action == action),
+                "missing traffic command {action:?}"
+            );
+        }
+    }
+    #[test]
+    fn traffic_entry_requests_only_one_explicit_load() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        assert!(crate::ui::update::update(&mut state, UiAction::Tick).is_empty());
+        let effects =
+            crate::ui::update::update(&mut state, UiAction::SwitchView(ViewId::TrafficTests));
+        assert_eq!(effects.len(), 1, "explicit entry must request suite load");
+        assert!(
+            crate::ui::update::update(&mut state, UiAction::SwitchView(ViewId::TrafficTests))
+                .is_empty()
+        );
+    }
+    #[test]
+    fn traffic_tests_entry_is_opt_in_and_available_without_firewall() {
+        for offline in [false, true] {
+            let config = crate::config::Config {
+                offline,
+                ..Default::default()
+            };
+            let mut state = super::UiState::new(&config, "test".into(), false, None);
+            state.read_only = true;
+            let commands = super::catalog(&state);
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.title.contains("Traffic Tests")
+                        && command.availability == super::Availability::Enabled)
+            );
+            assert_eq!(super::ViewId::from_digit(0), Some(super::ViewId::Zones));
+            assert_eq!(super::ViewId::from_digit(9), Some(super::ViewId::Logs));
+            for character in ' '..='~' {
+                let action = crate::ui::keymap::translate(
+                    &state,
+                    crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char(character)),
+                );
+                assert!(
+                    !matches!(action, Some(super::UiAction::SwitchView(view)) if view.title() == "Traffic Tests")
+                );
+            }
+        }
+    }
     use super::*;
     use crate::config::Config;
     use crate::ui::overlays::Overlay;

@@ -7,6 +7,16 @@ mod observation;
 pub mod ports;
 mod refresh_scheduler;
 mod traffic_test;
+mod traffic_test_service;
+mod traffic_test_storage;
+mod traffic_test_workspace;
+pub use traffic_test_service::{
+    TrafficSaveState, TrafficServiceError, TrafficServiceEvent, TrafficServiceRequestStatus,
+    TrafficServiceShutdownError, TrafficTestService,
+};
+pub use traffic_test_storage::{
+    LoadedTrafficSuite, TrafficSaveExpectation, TrafficStorageError, TrafficSuiteStorage,
+};
 
 pub use api::{
     EngineEvent, EngineHandle, EngineRequest, ManualRefreshRequest, MutationPlan, MutationRequest,
@@ -26,4 +36,8 @@ pub use traffic_test::{
     TrafficTestCancellationReason, TrafficTestCoordinator, TrafficTestEvaluationRequest,
     TrafficTestEvent, TrafficTestFailureReason, TrafficTestRequestError, TrafficTestShutdownError,
     TrafficTestSubmissionError,
+};
+pub use traffic_test_workspace::{
+    EvaluationState, PreparedTrafficEvaluation, SuiteLoadFailure, SuiteLoadOutcome, SuiteLoadToken,
+    SuiteState, TrafficTestWorkspace, WorkspaceError, WorkspaceEventError, WorkspaceFailure,
 };

@@ -136,6 +136,10 @@ pub struct RefreshOverviewState {
 // would obscure, not clarify.
 #[allow(clippy::struct_excessive_bools)]
 pub struct UiState {
+    /// Immutable traffic evaluation presentation; never owns executable work.
+    pub traffic: super::traffic_tests::TrafficPresentation,
+    /// Exact accepted authoritative envelope, sharing the snapshot allocation.
+    pub traffic_observation: Option<crate::application::ObservedSnapshot>,
     /// The view the main table currently shows.
     pub view: ViewId,
     /// Zone explicitly selected by the operator, if any.
@@ -253,6 +257,8 @@ impl UiState {
             .and_then(|z| ZoneName::parse(z).ok());
         Self {
             view: ViewId::Zones,
+            traffic: super::traffic_tests::TrafficPresentation::new(offline),
+            traffic_observation: None,
             selected_zone,
             views: std::array::from_fn(|_| ViewState::default()),
             mode: InputMode::Normal,
@@ -381,7 +387,8 @@ impl UiState {
             | RowId::Source { .. }
             | RowId::IpSet { .. }
             | RowId::Direct { .. }
-            | RowId::Log { .. } => {}
+            | RowId::Log { .. }
+            | RowId::TrafficScenario(_) => {}
         }
         priority
     }
@@ -391,6 +398,9 @@ impl UiState {
     // zones) makes this free — add caching only if profiling ever disagrees.
     #[must_use]
     pub fn all_rows(&self, view: ViewId) -> Vec<ViewRow> {
+        if view == ViewId::TrafficTests {
+            return self.traffic.rows();
+        }
         if view == ViewId::Logs {
             // Newest first: tailing UX without chasing the scroll position.
             return self
