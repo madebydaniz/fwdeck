@@ -7,7 +7,16 @@ mod observation;
 pub mod ports;
 mod refresh_scheduler;
 mod traffic_test;
+mod traffic_test_service;
+mod traffic_test_storage;
 mod traffic_test_workspace;
+pub use traffic_test_service::{
+    TrafficSaveState, TrafficServiceError, TrafficServiceEvent, TrafficServiceRequestStatus,
+    TrafficServiceShutdownError, TrafficTestService,
+};
+pub use traffic_test_storage::{
+    LoadedTrafficSuite, TrafficSaveExpectation, TrafficStorageError, TrafficSuiteStorage,
+};
 
 pub use api::{
     EngineEvent, EngineHandle, EngineRequest, ManualRefreshRequest, MutationPlan, MutationRequest,
