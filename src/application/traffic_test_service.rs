@@ -278,7 +278,8 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
         });
         Ok(())
     }
-    /// Cancellation-safe polling. `None` means both lanes are permanently exhausted.
+    /// Cancellation-safe polling. `None` means the coordinator is closed and no job is active.
+    /// After a subsequent load or save is accepted, the caller must resume polling.
     pub async fn next_event(&mut self) -> Option<TrafficServiceEvent> {
         if self.job.is_none() && self.coordinator_closed {
             return None;

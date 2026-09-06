@@ -64,6 +64,8 @@ enum Action {
 #[derive(Default)]
 struct MemoryStorage {
     loaded: Mutex<Option<Arc<TrafficSuite>>>,
+    fingerprint: std::sync::atomic::AtomicU64,
+    expectations: Mutex<Vec<TrafficSaveExpectation<u64>>>,
     loads: AtomicUsize,
     saves: AtomicUsize,
     load_actions: Mutex<VecDeque<Action>>,
@@ -73,6 +75,7 @@ impl MemoryStorage {
     fn available(suite: Arc<TrafficSuite>) -> Self {
         Self {
             loaded: Mutex::new(Some(suite)),
+            fingerprint: std::sync::atomic::AtomicU64::new(41),
             ..Self::default()
         }
     }
@@ -108,12 +111,17 @@ impl TrafficSuiteStorage for MemoryStorage {
             .map_or(LoadedTrafficSuite::Missing, |suite| {
                 LoadedTrafficSuite::Available {
                     suite,
-                    fingerprint: 42,
+                    fingerprint: self.fingerprint.load(Ordering::SeqCst),
                 }
             }))
     }
-    fn save_default(&self, suite: &TrafficSuite, _: TrafficSaveExpectation<u64>) -> Response {
+    fn save_default(
+        &self,
+        suite: &TrafficSuite,
+        expected: TrafficSaveExpectation<u64>,
+    ) -> Response {
         self.saves.fetch_add(1, Ordering::SeqCst);
+        self.expectations.lock().unwrap().push(expected);
         let action = self.save_actions.lock().unwrap().pop_front();
         if let Some(action) = action {
             return Self::action(action);
@@ -122,7 +130,7 @@ impl TrafficSuiteStorage for MemoryStorage {
         *self.loaded.lock().unwrap() = Some(Arc::clone(&suite));
         Ok(LoadedTrafficSuite::Available {
             suite,
-            fingerprint: 42,
+            fingerprint: self.fingerprint.fetch_add(1, Ordering::SeqCst) + 1,
         })
     }
 }
@@ -133,6 +141,50 @@ fn suite(revision: u64) -> Arc<TrafficSuite> {
         revision: TrafficSuiteRevision::new(revision).unwrap(),
         scenarios: vec![],
     })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn exact_storage_version_flows_through_create_update_and_reload() {
+    let storage = Arc::new(MemoryStorage::default());
+    let mut service = TrafficTestService::new(false, Arc::clone(&storage));
+    load(&mut service).await;
+    service.try_save(suite(1)).unwrap();
+    service.next_event().await.unwrap();
+    assert_eq!(storage.fingerprint.load(Ordering::SeqCst), 1);
+
+    load(&mut service).await;
+    service.try_save(suite(1)).unwrap();
+    service.next_event().await.unwrap();
+    assert_eq!(storage.fingerprint.load(Ordering::SeqCst), 2);
+
+    service.try_save(suite(2)).unwrap();
+    service.next_event().await.unwrap();
+    assert_eq!(storage.fingerprint.load(Ordering::SeqCst), 3);
+
+    storage.fingerprint.store(99, Ordering::SeqCst);
+    load(&mut service).await;
+    service.try_save(suite(3)).unwrap();
+    service.next_event().await.unwrap();
+    assert_eq!(storage.fingerprint.load(Ordering::SeqCst), 100);
+
+    let recorded: Vec<_> = storage
+        .expectations
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|expected| match expected {
+            TrafficSaveExpectation::Missing => None,
+            TrafficSaveExpectation::Existing {
+                revision,
+                fingerprint,
+            } => Some((revision.get(), *fingerprint)),
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![None, Some((1, 1)), Some((2, 2)), Some((3, 99))]
+    );
+    service.shutdown().await.unwrap();
 }
 async fn load(service: &mut TrafficTestService<MemoryStorage>) {
     service.try_load().unwrap();
