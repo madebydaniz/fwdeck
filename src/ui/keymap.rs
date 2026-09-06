@@ -104,6 +104,14 @@ fn overlay_key(overlay: &Overlay, code: KeyCode) -> Option<UiAction> {
 
 /// Normal-mode translation: special-cased keys first, then the `HELP` table.
 fn normal_key(state: &UiState, code: KeyCode) -> Option<UiAction> {
+    if state.view == ViewId::TrafficTests {
+        match code {
+            KeyCode::Char('e') => return Some(UiAction::TrafficEvaluate),
+            KeyCode::Char('r') => return Some(UiAction::TrafficReload),
+            KeyCode::Char('t') => return Some(UiAction::TrafficToggleTarget),
+            _ => {}
+        }
+    }
     match code {
         // Special cases a static table cannot express: the action is
         // computed from the digit / gated on view state.

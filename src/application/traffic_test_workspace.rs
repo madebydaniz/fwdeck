@@ -82,7 +82,7 @@ pub enum WorkspaceFailure {
     WorkerFailed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Current evaluation lifecycle plus at most one stale completed report.
 pub enum EvaluationState {
     /// No evaluation is current.

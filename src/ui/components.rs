@@ -297,6 +297,10 @@ fn value_cell<'a>(text: String, theme: &Theme) -> Cell<'a> {
 /// The main table for the current view, or a placeholder when there is no
 /// data / no matching rows. Mutates only the view's scroll offset.
 pub fn render_table(f: &mut Frame, area: Rect, state: &mut UiState, theme: &Theme) {
+    if state.view == ViewId::TrafficTests {
+        super::traffic_tests::render::render(f, area, state, theme);
+        return;
+    }
     let view = state.view;
     let rows_data = state.visible_rows();
     let filter = state.view_state().filter.clone();
@@ -436,7 +440,7 @@ const fn add_hint(view: ViewId) -> Option<&'static str> {
         ViewId::IpSets => Some("+ add entry / create ipset (a)"),
         ViewId::Policies => Some("+ add service / create policy (a)"),
         ViewId::Direct => Some("+ migrate eligible rule (a)"),
-        ViewId::Logs => None,
+        ViewId::Logs | ViewId::TrafficTests => None,
     }
 }
 
@@ -446,6 +450,7 @@ fn empty_message(view: ViewId, state: &UiState) -> String {
         .effective_zone()
         .map_or_else(|| "-".to_owned(), |z| z.to_string());
     match view {
+        ViewId::TrafficTests => "Traffic Tests".to_owned(),
         ViewId::Zones => "no zones reported".to_owned(),
         ViewId::Services => format!("no services in zone `{zone}`"),
         ViewId::Ports => format!("no ports in zone `{zone}`"),

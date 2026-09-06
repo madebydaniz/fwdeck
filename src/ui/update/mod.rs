@@ -5,6 +5,7 @@ mod forms;
 mod lifecycle;
 mod plans;
 mod rows;
+mod traffic_tests;
 
 use crate::application::MutationRequest;
 use crate::domain::{
@@ -39,7 +40,31 @@ const MAX_INTERACTIVE_INPUT_BYTES: usize = 4096;
 /// unit-testable.
 #[allow(clippy::too_many_lines)] // one arm per action; splitting hurts readability
 pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
+    let mut effects = reduce(state, action);
+    if (state.traffic_observation.is_some() || state.traffic.load_requested)
+        && !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::TrafficObserve(None)))
+        && effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::Apply(_) | Effect::ApplyPlan(_) | Effect::ApplyRollback { .. }
+            )
+        })
+    {
+        state.traffic_observation = None;
+        effects.insert(0, Effect::TrafficObserve(None));
+    }
+    effects
+}
+
+#[allow(clippy::too_many_lines)]
+fn reduce(state: &mut UiState, action: UiAction) -> Vec<Effect> {
     match action {
+        UiAction::TrafficReload
+        | UiAction::TrafficEvaluate
+        | UiAction::TrafficToggleTarget
+        | UiAction::TrafficPresented(_) => return traffic_tests::update(state, action),
         UiAction::Quit => {
             // Quit is instant in the common case; it asks only when leaving
             // has a consequence the operator may not expect (matching the
@@ -87,6 +112,9 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             state.views[view.index()].filter.clear();
             state.views[view.index()].marked.clear();
             clamp_selection(state);
+            if view == ViewId::TrafficTests && !state.traffic.load_requested {
+                return traffic_tests::update(state, UiAction::TrafficReload);
+            }
         }
         UiAction::MoveSelection(delta) => move_selection(state, delta),
         UiAction::Page(direction) => move_selection(state, direction * PAGE_JUMP),
@@ -457,6 +485,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             reconcile_selection(state, selected);
         }
         UiAction::AddEntry => match state.view {
+            ViewId::TrafficTests => {}
             ViewId::Services => return update(state, UiAction::OpenForm(FormKind::AddService)),
             ViewId::Ports => return update(state, UiAction::OpenForm(FormKind::AddPort)),
             ViewId::Forwarding => {
@@ -699,6 +728,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             state.last_refresh = Some(observation);
             match result {
                 Ok(snapshot) => {
+                    state.traffic_observation = Some(snapshot.clone());
                     let snapshot_identity = snapshot.identity();
                     let snapshot = snapshot.into_snapshot();
                     state.backend_error = None;
@@ -740,9 +770,13 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 }
                 // Keep the stale snapshot: outdated data plus a visible error
                 // beats an empty screen.
-                Err(error) => state.backend_error = Some(error),
+                Err(error) => {
+                    state.backend_error = Some(error);
+                    state.traffic_observation = None;
+                }
             }
             reconcile_selection(state, selected);
+            return vec![Effect::TrafficObserve(state.traffic_observation.clone())];
         }
         UiAction::RefreshCancelled { schedule, .. } => {
             if state.active_refresh == Some(schedule.id) {
@@ -776,6 +810,8 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             state.active_refresh = None;
             state.refresh_overview = None;
             state.backend_error = Some(error);
+            state.traffic_observation = None;
+            return vec![Effect::TrafficObserve(None)];
         }
     }
     Vec::new()
