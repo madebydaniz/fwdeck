@@ -438,6 +438,43 @@ fn report_must_match_enabled_scenarios_in_order_id_and_expectation() {
             Err(WorkspaceEventError::MalformedReport)
         );
     }
+
+    let mut reordered_suite = suite().as_ref().clone();
+    reordered_suite
+        .scenarios
+        .push(scenario("enabled-second", true, TrafficExpectation::Block));
+    let mut workspace = TrafficTestWorkspace::new(false);
+    workspace.replace_suite(Arc::new(reordered_suite)).unwrap();
+    workspace.observe(observation(1));
+    let context = workspace.prepare_evaluation().unwrap().context().clone();
+    workspace
+        .ingest_event(TrafficTestEvent::EvaluationStarted {
+            context: context.clone(),
+        })
+        .unwrap();
+    let reversed = report(
+        context,
+        vec![
+            result(
+                "enabled-second",
+                TrafficExpectation::Block,
+                FirewallDecision::Block,
+            ),
+            result(
+                "enabled",
+                TrafficExpectation::Allow,
+                FirewallDecision::Allow,
+            ),
+        ],
+    );
+    assert_eq!(
+        workspace.ingest_event(TrafficTestEvent::EvaluationFinished { report: reversed }),
+        Err(WorkspaceEventError::MalformedReport)
+    );
+    assert!(matches!(
+        workspace.evaluation_state(),
+        EvaluationState::Running(_)
+    ));
 }
 
 #[test]
@@ -482,16 +519,17 @@ fn completed_report_becomes_single_stale_report_after_invalidation_and_fresh_run
             context: context.clone(),
         })
         .unwrap();
+    let old_report = report(
+        context,
+        vec![result(
+            "enabled",
+            TrafficExpectation::Allow,
+            FirewallDecision::Allow,
+        )],
+    );
     workspace
         .ingest_event(TrafficTestEvent::EvaluationFinished {
-            report: report(
-                context,
-                vec![result(
-                    "enabled",
-                    TrafficExpectation::Allow,
-                    FirewallDecision::Allow,
-                )],
-            ),
+            report: Arc::clone(&old_report),
         })
         .unwrap();
     workspace.observe(observation(2));
@@ -501,8 +539,48 @@ fn completed_report_becomes_single_stale_report_after_invalidation_and_fresh_run
     ));
     assert!(workspace.stale_report().is_some());
     let fresh = workspace.prepare_evaluation().unwrap();
+    let fresh_context = fresh.context().clone();
     assert!(workspace.stale_report().is_some());
     assert_eq!(workspace.active_context(), Some(fresh.context()));
+    assert_eq!(
+        workspace.ingest_event(TrafficTestEvent::EvaluationFinished {
+            report: Arc::clone(&old_report),
+        }),
+        Err(WorkspaceEventError::InvalidTransition)
+    );
+    assert!(matches!(
+        workspace.evaluation_state(),
+        EvaluationState::Queued(active) if active == &fresh_context
+    ));
+    workspace
+        .ingest_event(TrafficTestEvent::EvaluationStarted {
+            context: fresh_context.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        workspace.ingest_event(TrafficTestEvent::EvaluationFinished { report: old_report }),
+        Err(WorkspaceEventError::ContextMismatch)
+    );
+    assert!(matches!(
+        workspace.evaluation_state(),
+        EvaluationState::Running(active) if active == &fresh_context
+    ));
+    workspace
+        .ingest_event(TrafficTestEvent::EvaluationFinished {
+            report: report(
+                fresh_context.clone(),
+                vec![result(
+                    "enabled",
+                    TrafficExpectation::Allow,
+                    FirewallDecision::Allow,
+                )],
+            ),
+        })
+        .unwrap();
+    assert!(matches!(
+        workspace.evaluation_state(),
+        EvaluationState::Completed(report) if report.context() == &fresh_context
+    ));
 }
 
 #[test]
