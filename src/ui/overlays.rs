@@ -195,7 +195,7 @@ pub struct Confirmation {
 pub fn render(f: &mut Frame, state: &mut UiState, theme: &Theme, screen: Rect) {
     let scroll = state.overlay_scroll;
     let clamped = match state.overlays.last() {
-        Some(Overlay::Help) => Some(render_help(f, theme, screen, scroll)),
+        Some(Overlay::Help) => Some(render_help(f, theme, screen, scroll, state.view)),
         Some(Overlay::About) => Some(render_about(f, theme, screen, scroll)),
         Some(Overlay::Palette(palette_state)) => {
             render_palette(f, state, palette_state, theme, screen);
@@ -388,7 +388,13 @@ fn help_entry_rows(keys: &str, description: &str, inner_width: usize) -> Vec<(St
         .collect()
 }
 
-fn render_help(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
+fn render_help(
+    f: &mut Frame,
+    theme: &Theme,
+    screen: Rect,
+    scroll: u16,
+    view: super::views::ViewId,
+) -> u16 {
     let width = text_modal_width(screen);
     let inner_width = usize::from(width.saturating_sub(2));
     let mut lines = Vec::new();
@@ -399,14 +405,18 @@ fn render_help(f: &mut Frame, theme: &Theme, screen: Rect, scroll: u16) -> u16 {
         )));
         for entry in *entries {
             lines.extend(
-                help_entry_rows(entry.keys, entry.desc, inner_width)
-                    .into_iter()
-                    .map(|(keys, description)| {
-                        Line::from(vec![
-                            Span::styled(keys, theme.hotkey()),
-                            Span::styled(description, theme.text()),
-                        ])
-                    }),
+                help_entry_rows(
+                    entry.keys,
+                    keymap::help_description(view, entry),
+                    inner_width,
+                )
+                .into_iter()
+                .map(|(keys, description)| {
+                    Line::from(vec![
+                        Span::styled(keys, theme.hotkey()),
+                        Span::styled(description, theme.text()),
+                    ])
+                }),
             );
         }
         lines.push(Line::default());
@@ -909,7 +919,13 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                render_help(frame, &theme, frame.area(), 0);
+                render_help(
+                    frame,
+                    &theme,
+                    frame.area(),
+                    0,
+                    super::super::views::ViewId::Zones,
+                );
             })
             .unwrap();
 

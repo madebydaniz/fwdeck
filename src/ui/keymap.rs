@@ -146,6 +146,26 @@ pub struct HelpEntry {
     pub action: Option<UiAction>,
 }
 
+/// Contextual short label for the normal-mode reload key.
+#[must_use]
+pub const fn reload_hint(view: ViewId) -> &'static str {
+    if matches!(view, ViewId::TrafficTests) {
+        "reload suite"
+    } else {
+        "refresh"
+    }
+}
+
+/// Description of the binding actually active in this view.
+#[must_use]
+pub fn help_description(view: ViewId, entry: &HelpEntry) -> &'static str {
+    if view == ViewId::TrafficTests && matches!(entry.action, Some(UiAction::RefreshRequested)) {
+        "reload default traffic suite"
+    } else {
+        entry.desc
+    }
+}
+
 /// Grouped catalog of key bindings: the single source of truth for both the
 /// normal-mode key translation and the help overlay.
 pub const HELP: &[(&str, &[HelpEntry])] = &[

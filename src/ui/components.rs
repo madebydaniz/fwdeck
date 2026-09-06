@@ -22,7 +22,7 @@ pub fn render_header(f: &mut Frame, area: Rect, state: &UiState, theme: &Theme) 
 
     render_context_block(f, context, state, theme);
     if state.show_help_bar {
-        render_key_hints(f, keys, theme);
+        render_key_hints(f, keys, state.view, theme);
     }
     render_brand_block(f, brand, state, theme);
 }
@@ -114,12 +114,12 @@ fn hint(key: &'static str, desc: &'static str, theme: &Theme) -> Vec<Span<'stati
     ]
 }
 
-fn render_key_hints(f: &mut Frame, area: Rect, theme: &Theme) {
+fn render_key_hints(f: &mut Frame, area: Rect, view: ViewId, theme: &Theme) {
     let pairs: [[(&str, &str); 2]; 5] = [
         [("0-9", "view"), ("j/k", "move")],
         [(":", "command"), ("g/G", "first/last")],
         [("/", "filter"), ("enter", "select")],
-        [("?", "help"), ("r", "refresh")],
+        [("?", "help"), ("r", super::keymap::reload_hint(view))],
         [("q", "quit"), ("esc", "back")],
     ];
     let lines: Vec<Line> = pairs

@@ -16,6 +16,8 @@ pub struct TrafficPresentation {
     pub stale_report: Option<Arc<TrafficTestReport>>,
     pub target: EvaluationTarget,
     pub authoritative: bool,
+    /// Identity of the currently accepted observation, independent of any run.
+    pub current_snapshot: Option<crate::application::SnapshotIdentity>,
     pub error: Option<String>,
     pub load_requested: bool,
 }
@@ -82,6 +84,16 @@ impl TrafficPresentation {
                 format!("{} revision {}", suite.id, suite.revision.get()),
             ),
         ];
+        if let Some(identity) = self.current_snapshot {
+            lines.push((
+                "Current authoritative snapshot".into(),
+                format!(
+                    "refresh {} / generation {}",
+                    identity.refresh_id().get(),
+                    identity.generation().get()
+                ),
+            ));
+        }
         let context = match &self.evaluation {
             EvaluationState::Completed(report) => Some(("Current context", report.context())),
             EvaluationState::Stale(report) => Some((
@@ -222,6 +234,9 @@ impl TrafficPresentation {
             stale_report: workspace.stale_report().cloned(),
             target: workspace.target(),
             authoritative: workspace.observation().is_some(),
+            current_snapshot: workspace
+                .observation()
+                .map(crate::application::ObservedSnapshot::identity),
             error: None,
             load_requested: !matches!(workspace.suite_state(), SuiteState::NotLoaded),
         }
