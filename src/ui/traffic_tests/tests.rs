@@ -35,7 +35,7 @@ fn suite() -> Arc<TrafficSuite> {
     })
 }
 
-fn state() -> UiState {
+pub(super) fn state() -> UiState {
     let mut state = UiState::new(&Config::default(), "test".into(), false, None);
     state.view = ViewId::TrafficTests;
     state.traffic.suite = SuiteState::Available(suite());
@@ -84,13 +84,9 @@ fn pre_run_details_show_current_snapshot_identity_separately_from_history() {
             .any(|(label, value)| label == "Current authoritative snapshot"
                 && value == "refresh 42 / generation 2")
     );
-    assert!(
-        details
-            .lines
-            .iter()
-            .any(|(label, value)| label.contains("Historical context")
-                && value.contains("generation: 1"))
-    );
+    assert!(details.lines.iter().any(
+        |(label, value)| label.contains("Historical context") && value.contains("generation 1")
+    ));
 }
 
 #[test]
@@ -153,7 +149,7 @@ fn shared_header_and_help_describe_the_contextual_reload_key() {
     }
 }
 
-fn completed_workspace() -> TrafficTestWorkspace {
+pub(super) fn completed_workspace() -> TrafficTestWorkspace {
     use crate::application::{
         ObservedSnapshot, RefreshId, SnapshotGeneration, SnapshotIdentity, TrafficTestEvent,
     };
