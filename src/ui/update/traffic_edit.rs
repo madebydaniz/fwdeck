@@ -16,9 +16,8 @@ use crate::{
 use std::sync::Arc;
 
 pub(super) fn guard(state: &mut UiState, action: &UiAction) -> Option<Vec<Effect>> {
-    let Some(Overlay::TrafficForm(editor)) = state.overlays.last_mut() else {
-        return None;
-    };
+    let index = editor_index(state)?;
+    let covered = index + 1 < state.overlays.len();
     if matches!(
         action,
         UiAction::QuitConfirmed
@@ -39,10 +38,19 @@ pub(super) fn guard(state: &mut UiState, action: &UiAction) -> Option<Vec<Effect
     ) {
         return None;
     }
+    if covered && matches!(action, UiAction::CloseOverlay | UiAction::ScrollOverlay(_)) {
+        return None;
+    }
+    let Some(Overlay::TrafficForm(editor)) = state.overlays.get_mut(index) else {
+        return None;
+    };
     if editor.stage == Stage::Pending {
         return Some(Vec::new());
     }
     if matches!(action, UiAction::TrafficEdit(_)) {
+        if covered && !matches!(action, UiAction::TrafficEdit(A::Keep | A::Discard)) {
+            return Some(Vec::new());
+        }
         return None;
     }
     if matches!(
@@ -62,8 +70,14 @@ pub(super) fn guard(state: &mut UiState, action: &UiAction) -> Option<Vec<Effect
             editor.scroll = 0;
         } else if editor.dirty || editor.stage == Stage::Failed {
             editor.discard = Some(Box::new(action.clone()));
+            if covered {
+                state.toast(
+                    crate::ui::state::ToastKind::Info,
+                    "Local draft retained; close result details to review discard.",
+                );
+            }
         } else {
-            state.overlays.pop();
+            state.overlays.remove(index);
             if *action != UiAction::CloseOverlay {
                 return Some(super::update(state, action.clone()));
             }
@@ -90,7 +104,10 @@ pub(super) fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         return Vec::new();
     }
-    let Some(Overlay::TrafficForm(editor)) = state.overlays.last_mut() else {
+    let Some(index) = editor_index(state) else {
+        return Vec::new();
+    };
+    let Some(Overlay::TrafficForm(editor)) = state.overlays.get_mut(index) else {
         return Vec::new();
     };
     if editor.discard.is_some() {
@@ -98,7 +115,7 @@ pub(super) fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             A::Keep | A::Cancel => editor.discard = None,
             A::Discard => {
                 let next = editor.discard.take();
-                state.overlays.pop();
+                state.overlays.remove(index);
                 if let Some(next) = next
                     && *next != UiAction::CloseOverlay
                 {
@@ -166,7 +183,8 @@ pub(super) fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
 
 fn reject(state: &mut UiState, candidate: &Arc<TrafficSuite>, error: &str) {
     state.traffic.error = Some(error.to_owned());
-    if let Some(Overlay::TrafficForm(editor)) = state.overlays.last_mut()
+    if let Some(index) = editor_index(state)
+        && let Some(Overlay::TrafficForm(editor)) = state.overlays.get_mut(index)
         && editor.stage == Stage::Pending
         && editor
             .candidate
@@ -267,7 +285,10 @@ pub(super) fn reconcile(
     presentation: &crate::ui::traffic_tests::TrafficPresentation,
 ) {
     use crate::application::TrafficSaveState as S;
-    let Some(Overlay::TrafficForm(editor)) = state.overlays.last_mut() else {
+    let Some(index) = editor_index(state) else {
+        return;
+    };
+    let Some(Overlay::TrafficForm(editor)) = state.overlays.get_mut(index) else {
         return;
     };
     if editor.stage != Stage::Pending {
@@ -297,12 +318,19 @@ pub(super) fn reconcile(
             {
                 expected.revision = revision;
                 if **saved == expected {
-                    state.overlays.pop();
+                    state.overlays.remove(index);
                 }
             }
         }
         _ => {}
     }
+}
+
+fn editor_index(state: &UiState) -> Option<usize> {
+    state
+        .overlays
+        .iter()
+        .rposition(|overlay| matches!(overlay, Overlay::TrafficForm(_)))
 }
 
 #[cfg(test)]

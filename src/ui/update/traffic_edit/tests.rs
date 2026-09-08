@@ -360,3 +360,264 @@ fn traffic_edit_creation_completion_uses_original_save_context_not_unrelated_sui
         "matching creation completion must use captured save context"
     );
 }
+
+fn retained(state: &UiState) -> &Editor {
+    state
+        .overlays
+        .iter()
+        .find_map(|overlay| match overlay {
+            Overlay::TrafficForm(editor) => Some(editor.as_ref()),
+            _ => None,
+        })
+        .unwrap()
+}
+
+fn cover_with_operation_result(state: &mut UiState, kind: usize) -> Overlay {
+    use crate::application::{
+        api::OperationResult,
+        ports::{OperationOutcome, RollbackGuardId},
+    };
+    let operation = FirewallOperation::Reload;
+    let outcome = match kind {
+        0 => OperationOutcome::Failed {
+            operation,
+            steps: Vec::new(),
+        },
+        1 => OperationOutcome::PartiallyApplied {
+            operation,
+            steps: Vec::new(),
+            rollback_hint: None,
+        },
+        _ => OperationOutcome::Indeterminate {
+            operation,
+            steps: Vec::new(),
+        },
+    };
+    let effects = crate::ui::update::update(
+        state,
+        UiAction::OperationFinished(Box::new(OperationResult {
+            op_id: 99,
+            outcome,
+            rollback: None,
+            guard_warning: None,
+            completed_rollback: Some(RollbackGuardId::new(99)),
+        })),
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::RecordAudit { op_id: 99, .. }]
+    ));
+    assert_eq!(state.overlays.len(), 2);
+    let details = state.overlays.last().unwrap().clone();
+    assert!(matches!(details, Overlay::Details(_)));
+    details
+}
+
+fn conflicting_actions(state: &UiState) -> Vec<UiAction> {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut actions = vec![
+        UiAction::Quit,
+        UiAction::SwitchView(ViewId::Zones),
+        UiAction::TrafficReload,
+    ];
+    for key in ['r', 'f'] {
+        actions.push(
+            crate::ui::keymap::translate(
+                state,
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+            )
+            .unwrap(),
+        );
+    }
+    actions
+}
+
+#[test]
+fn traffic_edit_covered_dirty_draft_guards_real_background_outcomes() {
+    for kind in 0..3 {
+        let mut state = state();
+        valid_editor(&mut state);
+        let draft = editor(&state).draft.clone();
+        let details = cover_with_operation_result(&mut state, kind);
+        for action in conflicting_actions(&state) {
+            assert!(
+                crate::ui::update::update(&mut state, action).is_empty(),
+                "covered dirty editor allowed conflicting effect"
+            );
+            assert!(
+                retained(&state).discard.is_some(),
+                "covered dirty editor must request explicit discard"
+            );
+            assert_eq!(retained(&state).draft, draft);
+            assert_eq!(state.overlays.last(), Some(&details));
+            act(&mut state, A::Keep);
+            assert!(retained(&state).discard.is_none());
+        }
+        assert!(crate::ui::update::update(&mut state, UiAction::CloseOverlay).is_empty());
+        assert_eq!(editor(&state).draft, draft);
+    }
+}
+
+#[test]
+fn traffic_edit_covered_pending_blocks_conflicts_but_allows_details_and_emergency_exit() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    for kind in 0..3 {
+        let mut state = state();
+        valid_editor(&mut state);
+        act(&mut state, A::Review);
+        act(&mut state, A::Save);
+        let pending = editor(&state).clone();
+        let details = cover_with_operation_result(&mut state, kind);
+        for action in conflicting_actions(&state) {
+            assert!(
+                crate::ui::update::update(&mut state, action).is_empty(),
+                "covered pending editor allowed conflicting effect"
+            );
+            assert_eq!(retained(&state), &pending);
+            assert_eq!(state.overlays.last(), Some(&details));
+        }
+        crate::ui::update::update(&mut state, UiAction::ScrollOverlay(1));
+        assert_eq!(state.overlay_scroll, 1);
+        let emergency = crate::ui::keymap::translate(
+            &state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::ui::update::update(&mut state, emergency),
+            vec![Effect::Quit]
+        );
+        crate::ui::update::update(&mut state, UiAction::CloseOverlay);
+        assert_eq!(editor(&state), &pending);
+    }
+}
+
+#[test]
+fn traffic_edit_covered_save_completion_removes_only_owner_or_retains_exact_failure() {
+    use crate::application::{TrafficSaveState as S, TrafficStorageError};
+    for kind in 0..3 {
+        for fail in [false, true] {
+            let mut state = state();
+            valid_editor(&mut state);
+            act(&mut state, A::Review);
+            act(&mut state, A::Save);
+            let pending = editor(&state).clone();
+            let candidate = pending.candidate.clone().unwrap();
+            let details = cover_with_operation_result(&mut state, kind);
+            let mut presentation = state.traffic.clone();
+            presentation.save = S::Saving(Arc::clone(&candidate));
+            crate::ui::update::update(&mut state, UiAction::TrafficPresented(presentation.clone()));
+            assert!(
+                retained(&state).accepted,
+                "covered Saving must reach its owner"
+            );
+            let mut unrelated = (*candidate).clone();
+            unrelated.name = "unrelated".into();
+            presentation.save = S::Saved(Arc::new(unrelated));
+            crate::ui::update::update(&mut state, UiAction::TrafficPresented(presentation.clone()));
+            assert_eq!(retained(&state).stage, Stage::Pending);
+            presentation.save = if fail {
+                S::Failed {
+                    draft: Arc::clone(&candidate),
+                    error: TrafficStorageError::Conflict,
+                }
+            } else {
+                S::Saved(candidate.clone())
+            };
+            crate::ui::update::update(&mut state, UiAction::TrafficPresented(presentation));
+            assert_eq!(
+                state.overlays.last(),
+                Some(&details),
+                "completion must preserve unrelated Details"
+            );
+            if fail {
+                let editor = retained(&state);
+                assert_eq!(
+                    editor.stage,
+                    Stage::Failed,
+                    "covered failed save remained pending"
+                );
+                assert_eq!(editor.draft, pending.draft);
+                assert!(Arc::ptr_eq(editor.candidate.as_ref().unwrap(), &candidate));
+                assert!(editor.error.as_deref().unwrap().contains("reload"));
+            } else {
+                assert_eq!(
+                    state.overlays,
+                    vec![details],
+                    "success must remove only the matching covered editor"
+                );
+            }
+            crate::ui::update::update(&mut state, UiAction::CloseOverlay);
+            assert!(state.overlays.iter().all(|overlay| !matches!(overlay, Overlay::TrafficForm(editor) if editor.stage == Stage::Pending)), "Details dismissal exposed permanently Pending editor");
+        }
+    }
+}
+
+#[test]
+fn traffic_edit_covered_rejection_and_discard_target_only_editor() {
+    let mut state = state();
+    valid_editor(&mut state);
+    act(&mut state, A::Review);
+    act(&mut state, A::Save);
+    let pending = editor(&state).clone();
+    let candidate = pending.candidate.clone().unwrap();
+    let details = cover_with_operation_result(&mut state, 0);
+    crate::ui::update::update(
+        &mut state,
+        UiAction::TrafficSaveRejected(candidate.clone(), "service busy".into()),
+    );
+    assert_eq!(
+        retained(&state).stage,
+        Stage::Failed,
+        "covered rejection must reach exact pending editor"
+    );
+    assert_eq!(retained(&state).draft, pending.draft);
+    assert!(Arc::ptr_eq(
+        retained(&state).candidate.as_ref().unwrap(),
+        &candidate
+    ));
+    assert!(
+        retained(&state)
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("service busy")
+    );
+    assert!(crate::ui::update::update(&mut state, UiAction::TrafficReload).is_empty());
+    assert!(retained(&state).discard.is_some());
+    assert_eq!(act(&mut state, A::Discard), vec![Effect::TrafficLoad]);
+    assert_eq!(
+        state.overlays,
+        vec![details],
+        "discard must not remove unrelated Details"
+    );
+}
+
+#[test]
+fn traffic_edit_covered_editor_does_not_interrupt_existing_rollback_tick() {
+    use crate::{application::ports::RollbackGuardId, ui::state::PendingRollback};
+    let mut state = state();
+    valid_editor(&mut state);
+    act(&mut state, A::Review);
+    act(&mut state, A::Save);
+    let pending = editor(&state).clone();
+    let details = cover_with_operation_result(&mut state, 2);
+    let id = RollbackGuardId::new(100);
+    state.pending_rollback.push(PendingRollback {
+        id,
+        forward: FirewallOperation::Reload,
+        inverse: FirewallOperation::Reload,
+        deadline_tick: state.tick + 1,
+        description: "Existing rollback".into(),
+        watchdog_unit: None,
+    });
+    let effects = crate::ui::update::update(&mut state, UiAction::Tick);
+    assert!(
+        effects.iter().any(
+            |effect| matches!(effect, Effect::ApplyRollback { id: actual, .. } if *actual == id)
+        )
+    );
+    assert!(state.pending_rollback.is_empty());
+    assert_eq!(retained(&state), &pending);
+    assert_eq!(state.overlays.last(), Some(&details));
+}
