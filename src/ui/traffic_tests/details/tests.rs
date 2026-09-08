@@ -400,7 +400,13 @@ fn every_stage_outcome_and_object_has_readable_ordered_evidence() {
         .iter()
         .filter(|(key, _)| key.starts_with("Trace "))
         .collect();
-    for (i, (_, value)) in trace.iter().enumerate() {
+    assert_eq!(
+        trace.len(),
+        stages.len(),
+        "every stage must retain its trace"
+    );
+    for (i, (label, value)) in trace.iter().enumerate() {
+        assert_eq!(label, &format!("Trace {}", i + 1));
         assert_eq!(
             value,
             &format!(
