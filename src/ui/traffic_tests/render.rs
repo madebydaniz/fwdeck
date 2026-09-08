@@ -20,7 +20,7 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
         Constraint::Min(1),
     ])
     .areas(inner);
-    frame.render_widget(Paragraph::new("Configuration evaluation\nLive connectivity: NOT VERIFIED\nRequired safety gates: not enforced in Phase 2\ne evaluate · r reload · t target · Enter details").wrap(Wrap { trim: false }), header);
+    frame.render_widget(Paragraph::new("Configuration evaluation\nLive connectivity: NOT VERIFIED\nRequired safety gates: not enforced in Phase 2\ne run  r reload  t target  a new  E edit  d del  Space toggle").wrap(Wrap { trim: false }), header);
     if let Some(error) = &state.traffic.error {
         frame.render_widget(
             Paragraph::new(error.as_str())

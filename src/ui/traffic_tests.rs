@@ -11,6 +11,7 @@ mod tests;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrafficPresentation {
+    pub save: crate::application::TrafficSaveState,
     pub suite: SuiteState,
     pub evaluation: EvaluationState,
     pub stale_report: Option<Arc<TrafficTestReport>>,
@@ -214,7 +215,7 @@ impl TrafficPresentation {
         match &self.suite {
             SuiteState::NotLoaded => "Not loaded. Enter Traffic Tests to load the default suite.".into(),
             SuiteState::Loading(_) => "Loading default suite…".into(),
-            SuiteState::Missing => "No default suite exists. No file was created. Place traffic-tests/default.toml in the application config directory, then reload (r).".into(),
+            SuiteState::Missing => "No default suite exists. No file was created. Use a new scenario (a), or choose a template from the palette (:). Review, then explicitly Save to create the local default suite.".into(),
             SuiteState::UnsupportedSchema(version) => format!("Unsupported future schema {version}. Suite preserved; use a compatible FWDeck version."),
             SuiteState::Failed(reason) => format!("Default suite unavailable: {reason:?}. Check the suite, then reload (r)."),
             SuiteState::Available(_) => String::new(),
@@ -229,6 +230,7 @@ impl TrafficPresentation {
     #[must_use]
     pub fn from_workspace(workspace: &TrafficTestWorkspace) -> Self {
         Self {
+            save: crate::application::TrafficSaveState::Idle,
             suite: workspace.suite_state().clone(),
             evaluation: workspace.evaluation_state().clone(),
             stale_report: workspace.stale_report().cloned(),

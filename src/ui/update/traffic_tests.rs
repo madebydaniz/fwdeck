@@ -21,6 +21,7 @@ pub(super) fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
             },
         )],
         UiAction::TrafficPresented(presentation) => {
+            super::traffic_edit::reconcile(state, &presentation);
             state.traffic = presentation;
             super::clamp_selection(state);
             Vec::new()

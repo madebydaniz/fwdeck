@@ -3,6 +3,182 @@ use crate::{application::*, config::Config, domain::TrafficSuite};
 use futures_util::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+static EDIT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+struct EditRoot(std::path::PathBuf);
+impl EditRoot {
+    fn new() -> Self {
+        Self(std::env::temp_dir().join(format!(
+            "fwdeck-p24-shell-{}-{}",
+            std::process::id(),
+            EDIT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+}
+impl Drop for EditRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn local_candidate(state: &mut UiState, edit: bool) -> Effect {
+    use crate::ui::{
+        overlays::Overlay,
+        traffic_test_form::{EditAction as A, Template},
+    };
+    state.view = crate::ui::views::ViewId::TrafficTests;
+    crate::ui::update::update(
+        state,
+        UiAction::TrafficEdit(if edit { A::Edit } else { A::New(Template::Ssh) }),
+    );
+    let Some(Overlay::TrafficForm(editor)) = state.overlays.last_mut() else {
+        panic!("editor missing")
+    };
+    editor.draft.source = "203.0.113.8".into();
+    if edit {
+        editor.draft.name = "Edited SSH scenario".into();
+    }
+    crate::ui::update::update(state, UiAction::TrafficEdit(A::Review));
+    let effects = crate::ui::update::update(state, UiAction::TrafficEdit(A::Save));
+    assert!(matches!(effects.as_slice(), [Effect::TrafficSave(_)]));
+    effects.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn traffic_shell_reviewed_create_edit_reload_uses_service_revision() {
+    use crate::infrastructure::traffic_test_storage::DefaultTrafficSuiteStorage;
+    let root = EditRoot::new();
+    assert!(!root.0.exists());
+    let storage = Arc::new(DefaultTrafficSuiteStorage::new(&root.0));
+    let mut shell = TrafficShell::new(Some(storage));
+    let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+    state.read_only = true;
+    let action = shell.route(&Effect::TrafficLoad, &state).unwrap();
+    crate::ui::update::update(&mut state, action);
+    let action = shell.next_action().await.unwrap();
+    crate::ui::update::update(&mut state, action);
+    assert!(!root.0.exists(), "load must not create suite files");
+    for (edit, revision) in [(false, 1), (true, 2)] {
+        let effect = local_candidate(&mut state, edit);
+        let Effect::TrafficSave(candidate) = &effect else {
+            unreachable!()
+        };
+        assert_eq!(candidate.revision.get(), 1);
+        let routed = shell.route(&effect, &state);
+        assert!(
+            routed.is_some(),
+            "reviewed save must route through the shell"
+        );
+        crate::ui::update::update(&mut state, routed.unwrap());
+        let action = shell.next_action().await.unwrap();
+        crate::ui::update::update(&mut state, action);
+        assert!(state.overlays.is_empty());
+        let SuiteState::Available(saved) = &state.traffic.suite else {
+            panic!("saved suite unavailable")
+        };
+        let mut expected = (**candidate).clone();
+        expected.revision = crate::domain::TrafficSuiteRevision::new(revision).unwrap();
+        assert_eq!(**saved, expected);
+        let action = shell.route(&Effect::TrafficLoad, &state).unwrap();
+        crate::ui::update::update(&mut state, action);
+        let action = shell.next_action().await.unwrap();
+        crate::ui::update::update(&mut state, action);
+        assert!(
+            matches!(&state.traffic.suite, SuiteState::Available(suite) if **suite == expected)
+        );
+    }
+    shell.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn traffic_shell_conflict_retains_candidate_and_requires_explicit_discard_reload() {
+    use crate::{
+        infrastructure::traffic_test_storage::DefaultTrafficSuiteStorage,
+        ui::{
+            overlays::Overlay,
+            traffic_test_form::{EditAction as A, Stage},
+        },
+    };
+    let root = EditRoot::new();
+    let storage = Arc::new(DefaultTrafficSuiteStorage::new(&root.0));
+    let mut shell = TrafficShell::new(Some(Arc::clone(&storage)));
+    let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+    shell.route(&Effect::TrafficLoad, &state).unwrap();
+    let action = shell.next_action().await.unwrap();
+    crate::ui::update::update(&mut state, action);
+    let effect = local_candidate(&mut state, false);
+    let Effect::TrafficSave(candidate) = &effect else {
+        unreachable!()
+    };
+    storage
+        .save_default(candidate, TrafficSaveExpectation::Missing)
+        .unwrap();
+    let routed = shell.route(&effect, &state);
+    assert!(routed.is_some(), "reviewed save must route");
+    let action = routed.unwrap();
+    crate::ui::update::update(&mut state, action);
+    let action = shell.next_action().await.unwrap();
+    crate::ui::update::update(&mut state, action);
+    let Some(Overlay::TrafficForm(editor)) = state.overlays.last() else {
+        panic!("failed draft lost")
+    };
+    assert_eq!(editor.stage, Stage::Failed);
+    assert!(Arc::ptr_eq(editor.candidate.as_ref().unwrap(), candidate));
+    assert!(crate::ui::update::update(&mut state, UiAction::TrafficEdit(A::Save)).is_empty());
+    let rejection = shell.route(&effect, &state).unwrap();
+    assert!(
+        matches!(rejection, UiAction::TrafficSaveRejected(_, ref error) if error.contains("unavailable"))
+    );
+    assert!(crate::ui::update::update(&mut state, UiAction::TrafficReload).is_empty());
+    let effects = crate::ui::update::update(&mut state, UiAction::TrafficEdit(A::Discard));
+    assert_eq!(effects, vec![Effect::TrafficLoad]);
+    let action = shell.route(&effects[0], &state).unwrap();
+    crate::ui::update::update(&mut state, action);
+    let action = shell.next_action().await.unwrap();
+    crate::ui::update::update(&mut state, action);
+    assert!(matches!(state.traffic.suite, SuiteState::Available(_)));
+    shell.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn traffic_shell_save_busy_is_visible_and_accepted_save_rearms_closed_lane() {
+    use crate::infrastructure::traffic_test_storage::DefaultTrafficSuiteStorage;
+    let root = EditRoot::new();
+    let storage = Arc::new(DefaultTrafficSuiteStorage::new(&root.0));
+    let mut coordinator = TrafficTestCoordinator::spawn();
+    coordinator.shutdown().await.unwrap();
+    let mut shell = TrafficShell::new(Some(Arc::clone(&storage)));
+    shell.service = Some(TrafficTestService::with_coordinator(
+        false,
+        storage,
+        coordinator,
+    ));
+    let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+    shell.route(&Effect::TrafficLoad, &state).unwrap();
+    for _ in 0..2 {
+        let action = shell.next_action().await.unwrap();
+        crate::ui::update::update(&mut state, action);
+    }
+    assert!(shell.next_action().await.is_none());
+    assert!(!shell.armed());
+    let effect = local_candidate(&mut state, false);
+    let routed = shell.route(&effect, &state);
+    assert!(
+        routed.is_some(),
+        "save must be routed even after the event lane closes"
+    );
+    let action = routed.unwrap();
+    crate::ui::update::update(&mut state, action);
+    assert!(shell.armed(), "accepted save must rearm event polling");
+    let rejection = shell.route(&effect, &state).unwrap();
+    assert!(
+        matches!(rejection, UiAction::TrafficSaveRejected(_, ref error) if error.contains("busy"))
+    );
+    let action = shell.next_action().await.unwrap();
+    crate::ui::update::update(&mut state, action);
+    assert!(state.overlays.is_empty());
+    shell.shutdown().await.unwrap();
+}
+
 #[derive(Default)]
 struct Storage {
     loads: AtomicUsize,

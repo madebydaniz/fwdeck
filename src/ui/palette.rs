@@ -784,6 +784,60 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
     ];
 
     if state.view == ViewId::TrafficTests {
+        use super::traffic_test_form::{EditAction as A, Template};
+        let editable = matches!(
+            state.traffic.suite,
+            crate::application::SuiteState::Available(_) | crate::application::SuiteState::Missing
+        ) && !matches!(
+            state.traffic.save,
+            crate::application::TrafficSaveState::Failed { .. }
+        ) && !state
+            .overlays
+            .iter()
+            .any(|overlay| matches!(overlay, super::overlays::Overlay::TrafficForm(_)));
+        let can_add = editable
+            && !matches!(&state.traffic.suite, crate::application::SuiteState::Available(suite) if suite.scenarios.len() >= crate::domain::MAX_SCENARIOS_PER_SUITE);
+        for (template, title) in [
+            (Template::Ssh, "Keep SSH access"),
+            (Template::AllowService, "Allow service exposure"),
+            (Template::BlockAccess, "Block unwanted access"),
+            (Template::Custom, "Custom host traffic"),
+        ] {
+            commands.push(cmd(
+                UiAction::TrafficEdit(A::New(template)),
+                title,
+                "Unsaved local scenario; explicit source and review required",
+                &["traffic", "new", "scenario"],
+                Category::App,
+                if can_add {
+                    Availability::Enabled
+                } else {
+                    Availability::Disabled("Load a supported suite with room for another scenario")
+                },
+            ));
+        }
+        let selected = state
+            .visible_rows()
+            .get(state.view_state().selected)
+            .is_some_and(|row| matches!(row.id, RowId::TrafficScenario(_)));
+        for (action, title) in [
+            (A::Edit, "Edit traffic scenario"),
+            (A::Delete, "Delete traffic scenario"),
+            (A::Toggle, "Enable or disable traffic scenario"),
+        ] {
+            commands.push(cmd(
+                UiAction::TrafficEdit(action),
+                title,
+                "Review a local-file-only change",
+                &["traffic", "scenario"],
+                Category::App,
+                if editable && selected {
+                    Availability::Enabled
+                } else {
+                    Availability::Disabled("Load a supported suite and select a scenario")
+                },
+            ));
+        }
         for (action, title, description) in [
             (
                 UiAction::TrafficReload,

@@ -16,6 +16,8 @@ use super::theme::Theme;
 /// One entry of the overlay stack; the topmost is the one rendered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
+    /// Reviewed local scenario draft, retained through save completion.
+    TrafficForm(Box<super::traffic_test_form::Editor>),
     /// Keybinding reference.
     Help,
     /// About screen: version, description, developer, and links.
@@ -193,6 +195,10 @@ pub struct Confirmation {
 /// so the scrollable modals (Help / Details) can write their clamped scroll
 /// offset back into state after measuring against the real screen height.
 pub fn render(f: &mut Frame, state: &mut UiState, theme: &Theme, screen: Rect) {
+    if let Some(Overlay::TrafficForm(editor)) = state.overlays.last_mut() {
+        super::traffic_test_form::render::render(f, editor, theme, screen);
+        return;
+    }
     let scroll = state.overlay_scroll;
     let clamped = match state.overlays.last() {
         Some(Overlay::Help) => Some(render_help(f, theme, screen, scroll, state.view)),
@@ -218,7 +224,7 @@ pub fn render(f: &mut Frame, state: &mut UiState, theme: &Theme, screen: Rect) {
             render_rich_builder(f, builder, theme, screen);
             None
         }
-        None => None,
+        Some(Overlay::TrafficForm(_)) | None => None,
     };
     if let Some(clamped) = clamped {
         state.overlay_scroll = clamped;

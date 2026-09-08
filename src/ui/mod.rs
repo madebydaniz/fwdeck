@@ -17,6 +17,7 @@ pub mod search;
 pub mod state;
 pub mod theme;
 mod traffic_shell;
+pub mod traffic_test_form;
 pub mod traffic_tests;
 pub mod update;
 pub mod views;
@@ -414,7 +415,8 @@ async fn execute_effect(
     retention: crate::config::RetentionConfig,
 ) -> ControlFlow<()> {
     match effect {
-        Effect::TrafficLoad
+        Effect::TrafficSave(_)
+        | Effect::TrafficLoad
         | Effect::TrafficEvaluate
         | Effect::TrafficTarget(_)
         | Effect::TrafficObserve(_) => {}

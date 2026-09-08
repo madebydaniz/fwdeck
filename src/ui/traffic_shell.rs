@@ -28,6 +28,7 @@ impl<S: TrafficSuiteStorage> TrafficShell<S> {
         if !matches!(
             effect,
             Effect::TrafficLoad
+                | Effect::TrafficSave(_)
                 | Effect::TrafficEvaluate
                 | Effect::TrafficTarget(_)
                 | Effect::TrafficObserve(_)
@@ -35,6 +36,13 @@ impl<S: TrafficSuiteStorage> TrafficShell<S> {
             return None;
         }
         if self.service.is_none() {
+            if let Effect::TrafficSave(candidate) = effect {
+                return Some(UiAction::TrafficSaveRejected(
+                    Arc::clone(candidate),
+                    "Traffic test service unavailable; reload the default suite before saving"
+                        .into(),
+                ));
+            }
             if !matches!(effect, Effect::TrafficLoad) {
                 return None;
             }
@@ -52,6 +60,16 @@ impl<S: TrafficSuiteStorage> TrafficShell<S> {
         }
         let service = self.service.as_mut()?;
         let result = match effect {
+            Effect::TrafficSave(candidate) => {
+                if let Err(error) = service.try_save(Arc::clone(candidate)) {
+                    return Some(UiAction::TrafficSaveRejected(
+                        Arc::clone(candidate),
+                        error.to_string(),
+                    ));
+                }
+                self.armed = true;
+                Ok(())
+            }
             Effect::TrafficLoad => service.try_load().and_then(|accepted| {
                 self.armed = true;
                 accepted.cancellation_error.map_or(Ok(()), Err)
@@ -63,6 +81,7 @@ impl<S: TrafficSuiteStorage> TrafficShell<S> {
             _ => return None,
         };
         let mut presentation = TrafficPresentation::from_workspace(service.workspace());
+        presentation.save = service.save_state().clone();
         presentation.error = result.err().map(|error| error.to_string());
         Some(UiAction::TrafficPresented(presentation))
     }
@@ -78,9 +97,17 @@ impl<S: TrafficSuiteStorage> TrafficShell<S> {
             return None;
         };
         let mut presentation = TrafficPresentation::from_workspace(service.workspace());
+        presentation.save = service.save_state().clone();
         presentation.error = match event {
-            TrafficServiceEvent::Loaded(Err(error)) => Some(error.to_string()),
-            TrafficServiceEvent::EvaluationSubmitted(Err(error)) => Some(error.to_string()),
+            TrafficServiceEvent::Loaded(Err(error))
+            | TrafficServiceEvent::Saved {
+                result: Err(error), ..
+            } => Some(error.to_string()),
+            TrafficServiceEvent::EvaluationSubmitted(Err(error))
+            | TrafficServiceEvent::Saved {
+                cancellation_error: Some(error),
+                ..
+            } => Some(error.to_string()),
             TrafficServiceEvent::CoordinatorClosed => Some("Traffic test service is closed".into()),
             _ => None,
         };

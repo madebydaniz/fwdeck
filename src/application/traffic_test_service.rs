@@ -41,7 +41,7 @@ pub struct TrafficServiceRequestStatus {
 }
 
 /// Save presentation never publishes an unpersisted edit as the loaded suite.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrafficSaveState {
     /// No save requested since the last load.
     Idle,

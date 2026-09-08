@@ -5,6 +5,7 @@ mod forms;
 mod lifecycle;
 mod plans;
 mod rows;
+mod traffic_edit;
 mod traffic_tests;
 
 use crate::application::MutationRequest;
@@ -60,7 +61,13 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
 
 #[allow(clippy::too_many_lines)]
 fn reduce(state: &mut UiState, action: UiAction) -> Vec<Effect> {
+    if let Some(effects) = traffic_edit::guard(state, &action) {
+        return effects;
+    }
     match action {
+        UiAction::TrafficEdit(_) | UiAction::TrafficSaveRejected(_, _) => {
+            return traffic_edit::update(state, action);
+        }
         UiAction::TrafficReload
         | UiAction::TrafficEvaluate
         | UiAction::TrafficToggleTarget
