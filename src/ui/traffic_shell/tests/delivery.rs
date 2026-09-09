@@ -107,6 +107,7 @@ async fn real_shell_delivers_reviewed_reload_evaluation_staleness_and_audit_work
         unreachable!()
     };
     let scenario_id = candidate.scenarios[0].id.clone();
+    let scenario_name = candidate.scenarios[0].name.clone();
     let action = shell.route(&effect, &state).unwrap();
     dispatch(&mut shell, &mut state, action);
     wait_until(&mut shell, &mut state, |state| {
@@ -114,6 +115,34 @@ async fn real_shell_delivers_reviewed_reload_evaluation_staleness_and_audit_work
     })
     .await;
     assert!(suite_path.is_file());
+    assert_eq!(
+        state.visible_rows().len(),
+        1,
+        "saved scenario must appear before reload"
+    );
+    assert_eq!(state.visible_rows()[0].cells()[0], scenario_name);
+    assert!(
+        !state
+            .overlays
+            .iter()
+            .any(|overlay| matches!(overlay, Overlay::TrafficForm(_)))
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+    let theme = crate::ui::theme::Theme::detect(crate::ui::theme::Variant::Mono, false);
+    terminal
+        .draw(|frame| crate::ui::render::render(frame, &mut state, &theme))
+        .unwrap();
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(
+        rendered.contains(&scenario_name),
+        "saved test must be visible in the list"
+    );
     dispatch(&mut shell, &mut state, UiAction::TrafficReload);
     wait_until(&mut shell, &mut state, |state| {
         matches!(state.traffic.suite, SuiteState::Available(_))

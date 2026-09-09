@@ -1,16 +1,27 @@
 //! Adaptive configuration-evaluation rows with a variable-height viewport.
 
-use crate::ui::{state::UiState, theme::Theme, views::ViewId};
+use crate::{
+    application::SuiteState,
+    ui::{state::UiState, theme::Theme, views::ViewId},
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    text::{Line, Text},
-    widgets::{Block, Cell, Paragraph, Row, Table, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, BorderType, Cell, Paragraph, Row, Table, Wrap},
 };
 
 pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, theme: &Theme) {
+    let count = match &state.traffic.suite {
+        SuiteState::Available(suite) => suite.scenarios.len(),
+        _ => 0,
+    };
     let block = Block::bordered()
-        .title(" Traffic Tests ")
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            format!(" Traffic Tests({count}) "),
+            theme.info(),
+        ))
         .border_style(theme.border_focused());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -24,14 +35,16 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
                 "Traffic audit backlog full; evaluation paused until persistence progresses".into()
             })
         });
-    let header_text = "Configuration evaluation (configuration-only)\nLive connectivity: NOT VERIFIED\nRequired safety gates: not enforced in Phase 2\ne run · r reload · t target · a templates\nE edit · d delete · Space toggle";
-    let header_lines = wrap(header_text, usize::from(inner.width));
-    let header_height = u16::try_from(header_lines.len()).unwrap_or(u16::MAX);
-    let [header, audit_area, error_area, body] = Layout::vertical([
-        Constraint::Length(header_height),
+    let footer_lines = wrap(
+        "a templates · e run · r reload · t target\nE edit · d delete · Space toggle · Enter details",
+        usize::from(inner.width),
+    );
+    let footer_height = u16::try_from(footer_lines.len()).unwrap_or(u16::MAX);
+    let [audit_area, error_area, body, footer] = Layout::vertical([
         Constraint::Length(u16::from(audit_error.is_some())),
         Constraint::Length(u16::from(state.traffic.error.is_some())),
         Constraint::Min(1),
+        Constraint::Length(footer_height),
     ])
     .areas(inner);
     if let Some(error) = audit_error {
@@ -42,7 +55,7 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
             audit_area,
         );
     }
-    frame.render_widget(Paragraph::new(header_lines), header);
+    frame.render_widget(Paragraph::new(footer_lines).style(theme.muted()), footer);
     if let Some(error) = &state.traffic.error {
         frame.render_widget(
             Paragraph::new(error.as_str())
@@ -53,17 +66,8 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
     }
     let rows = state.visible_rows();
     if rows.is_empty() {
-        let message = if state.view_state().filter.is_empty() {
-            state.traffic.message()
-        } else {
-            "No matching scenarios. Clear filter (Esc).".to_owned()
-        };
         frame.render_widget(
-            Paragraph::new(format!(
-                "{message}\n{}",
-                state.traffic.error.as_deref().unwrap_or("")
-            ))
-            .wrap(Wrap { trim: false }),
+            Paragraph::new(empty_message(state)).wrap(Wrap { trim: false }),
             body,
         );
         return;
@@ -98,14 +102,25 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
     });
     let mut table = Table::new(rendered, widths.iter().copied().map(Constraint::Length))
         .column_spacing(u16::from(wide))
-        .row_highlight_style(theme.info())
-        .highlight_symbol("> ");
+        .row_highlight_style(theme.selected())
+        .highlight_symbol("▸ ");
     if wide {
-        table = table.header(Row::new(ViewId::TrafficTests.columns().iter().copied()));
+        table = table
+            .header(Row::new(ViewId::TrafficTests.columns().iter().copied()).style(theme.header()));
     }
     let selected = state.view_state().selected;
     state.view_state_mut().table.select(Some(selected));
     frame.render_stateful_widget(table, body, &mut state.view_state_mut().table);
+}
+
+fn empty_message(state: &UiState) -> String {
+    if !state.view_state().filter.is_empty() {
+        return "No matching scenarios. Clear filter (Esc).".to_owned();
+    }
+    match state.traffic.suite {
+        SuiteState::Missing | SuiteState::Available(_) => "No traffic tests".to_owned(),
+        _ => state.traffic.message(),
+    }
 }
 
 fn wrap(text: &str, width: usize) -> Vec<Line<'static>> {

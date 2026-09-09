@@ -243,7 +243,7 @@ fn request_errors_are_visible_with_an_available_suite() {
 }
 
 #[test]
-fn traffic_header_and_selected_row_remain_visible_at_supported_sizes() {
+fn traffic_list_has_no_intro_and_keeps_shortcuts_in_footer() {
     let theme = crate::ui::theme::Theme::detect(crate::ui::theme::Variant::Mono, false);
     for (width, height) in [(80, 24), (120, 40), (160, 50)] {
         let mut state = state();
@@ -253,17 +253,34 @@ fn traffic_header_and_selected_row_remain_visible_at_supported_sizes() {
         terminal
             .draw(|frame| crate::ui::render::render(frame, &mut state, &theme))
             .unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
             .collect();
-        for expected in ["NOT VERIFIED", "not enforced", "a templates", "Case 02"] {
+        let text = lines.join("\n");
+        for removed in ["Configuration evaluation", "NOT VERIFIED", "not enforced"] {
             assert!(
-                text.contains(expected),
-                "missing {expected} at {width}x{height}"
+                !text.contains(removed),
+                "unexpected intro {removed}: {text}"
+            );
+        }
+        assert!(
+            text.contains("Case 02"),
+            "selected scenario missing: {text}"
+        );
+        let footer = lines[usize::from(height.saturating_sub(7))..].join("\n");
+        for expected in [
+            "a templates",
+            "e run",
+            "r reload",
+            "t target",
+            "E edit",
+            "d delete",
+            "Space toggle",
+        ] {
+            assert!(
+                footer.contains(expected),
+                "missing footer key {expected} at {width}x{height}: {text}"
             );
         }
     }
@@ -275,7 +292,7 @@ fn missing_loading_future_malformed_and_unavailable_are_readable() {
     let token = workspace.begin_load().unwrap();
     let cases = [
         (SuiteState::Loading(token), "Loading default suite"),
-        (SuiteState::Missing, "No file was created"),
+        (SuiteState::Missing, "No traffic tests"),
         (SuiteState::UnsupportedSchema(99), "future schema 99"),
         (
             SuiteState::Failed(crate::application::SuiteLoadFailure::InvalidSuite),
@@ -469,7 +486,7 @@ fn assert_selected_card(buffer: &ratatui::buffer::Buffer, state: &UiState) {
         .collect();
     let start = lines
         .iter()
-        .position(|line| line.starts_with("> "))
+        .position(|line| line.starts_with("▸ "))
         .unwrap_or_else(|| panic!("selected marker missing inside traffic body"));
     let end = lines
         .iter()
@@ -572,8 +589,9 @@ fn projection_uses_real_suite_before_firewall_snapshot() {
 }
 
 #[test]
-fn render_always_discloses_configuration_only_without_firewall() {
+fn details_disclose_configuration_only_without_firewall() {
     let mut state = state();
+    crate::ui::update::update(&mut state, crate::ui::action::UiAction::ActivateRow);
     let theme = crate::ui::theme::Theme::detect(crate::ui::theme::Variant::Mono, false);
     for (width, height) in [(80, 24), (120, 40), (160, 50)] {
         let mut terminal =
@@ -588,8 +606,8 @@ fn render_always_discloses_configuration_only_without_firewall() {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
-        assert!(text.contains("Configuration evaluation"));
-        assert!(text.contains("Live connectivity: NOT VERIFIED"));
-        assert!(text.contains("not enforced in Phase 2"));
+        assert!(text.contains("Configuration only;"), "{text}");
+        assert!(text.contains("connectivity: NOT"), "{text}");
+        assert!(text.contains("VERIFIED"), "{text}");
     }
 }
