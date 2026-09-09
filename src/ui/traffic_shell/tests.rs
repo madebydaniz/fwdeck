@@ -4,6 +4,113 @@ use futures_util::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static EDIT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+#[tokio::test]
+async fn traffic_shell_audit_failure_survives_unrelated_presentation_and_success() {
+    use crate::application::traffic_test_audit::*;
+    struct FailOnce(AtomicUsize);
+    impl TrafficAuditSink for FailOnce {
+        fn append(&self, _: &TrafficAuditSummary) -> Result<(), TrafficAuditError> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(TrafficAuditError::Persistence)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let sink = Arc::new(FailOnce(AtomicUsize::new(0)));
+    let mut shell = TrafficShell::with_audit(
+        Some(Arc::new(Storage {
+            available: true,
+            ..Default::default()
+        })),
+        sink.clone(),
+    );
+    let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+    observe(&mut state);
+    shell.route(&Effect::TrafficLoad, &state).unwrap();
+    let action = shell.next_action().await.unwrap();
+    crate::ui::update::update(&mut state, action);
+    for _ in 0..2 {
+        let before = sink.0.load(Ordering::Relaxed);
+        shell.route(&Effect::TrafficEvaluate, &state).unwrap();
+        loop {
+            let action = shell.next_action().await.unwrap();
+            crate::ui::update::update(&mut state, action);
+            if sink.0.load(Ordering::Relaxed) > before
+                && shell
+                    .service
+                    .as_ref()
+                    .unwrap()
+                    .audit_status()
+                    .failure
+                    .is_some()
+                && shell
+                    .service
+                    .as_ref()
+                    .unwrap()
+                    .workspace()
+                    .active_context()
+                    .is_none()
+            {
+                break;
+            }
+        }
+        let action = shell
+            .route(
+                &Effect::TrafficTarget(crate::domain::EvaluationTarget::Permanent),
+                &state,
+            )
+            .unwrap();
+        crate::ui::update::update(&mut state, action);
+        assert_eq!(
+            state.traffic.audit.failure,
+            Some(TrafficAuditError::Persistence)
+        );
+    }
+    assert_eq!(
+        shell.shutdown().await,
+        Err(TrafficServiceShutdownError::AuditFailed)
+    );
+}
+#[tokio::test]
+async fn traffic_shell_injected_audit_is_lazy_and_records_evaluation() {
+    use crate::infrastructure::{
+        audit::traffic::FileTrafficAuditSink, traffic_test_storage::DefaultTrafficSuiteStorage,
+    };
+    let root = EditRoot::new();
+    let audit_root = root.0.join("state");
+    let storage = Arc::new(DefaultTrafficSuiteStorage::new(&root.0.join("config")));
+    let sink = Arc::new(FileTrafficAuditSink::new(
+        Some(audit_root.clone()),
+        Config::default().retention.audit,
+    ));
+    let mut shell = TrafficShell::with_audit(Some(storage), sink);
+    let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+    assert!(!audit_root.exists());
+    shell.route(&Effect::TrafficLoad, &state).unwrap();
+    let action = shell.next_action().await.unwrap();
+    crate::ui::update::update(&mut state, action);
+    assert!(!audit_root.exists());
+    let effect = local_candidate(&mut state, false);
+    let action = shell.route(&effect, &state).unwrap();
+    crate::ui::update::update(&mut state, action);
+    let action = shell.next_action().await.unwrap();
+    crate::ui::update::update(&mut state, action);
+    assert!(!audit_root.exists());
+    let observed = ObservedSnapshot::new(
+        SnapshotIdentity::new(
+            RefreshId::new(1),
+            SnapshotGeneration::new(std::num::NonZeroU64::MIN),
+        ),
+        Arc::new(crate::domain::mock::sample().unwrap()),
+    );
+    shell
+        .route(&Effect::TrafficObserve(Some(observed)), &state)
+        .unwrap();
+    shell.route(&Effect::TrafficEvaluate, &state).unwrap();
+    shell.shutdown().await.unwrap();
+    assert!(audit_root.join("traffic-audit/audit.jsonl").is_file());
+}
 struct EditRoot(std::path::PathBuf);
 impl EditRoot {
     fn new() -> Self {

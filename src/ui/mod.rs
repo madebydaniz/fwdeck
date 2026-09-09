@@ -100,7 +100,15 @@ async fn event_loop(
         path.parent()
             .map(|directory| std::sync::Arc::new(DefaultTrafficSuiteStorage::new(directory)))
     });
-    let mut traffic = TrafficShell::new(storage);
+    let mut traffic = TrafficShell::with_audit(
+        storage,
+        std::sync::Arc::new(
+            crate::infrastructure::audit::traffic::FileTrafficAuditSink::new(
+                crate::bootstrap::state_dir(),
+                config.retention.audit,
+            ),
+        ),
+    );
     let mut published_priority = RefreshPriority::default();
     publish_refresh_priority(&engine, &state, &mut published_priority);
 
@@ -148,7 +156,7 @@ async fn event_loop(
     };
     drain_rollbacks_on_exit(&mut state, &mut outbox, &mut engine).await;
     if let Err(error) = traffic.shutdown().await {
-        tracing::error!(%error, "traffic service shutdown failed");
+        return Err(AppError::TrafficShutdown(error));
     }
     result
 }

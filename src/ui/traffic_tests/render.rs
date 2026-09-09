@@ -14,12 +14,31 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
         .border_style(theme.border_focused());
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [header, error_area, body] = Layout::vertical([
+    let audit_error = state
+        .traffic
+        .audit
+        .failure
+        .map(|error| error.to_string())
+        .or_else(|| {
+            state.traffic.audit.backpressure.then(|| {
+                "Traffic audit backlog full; evaluation paused until persistence progresses".into()
+            })
+        });
+    let [header, audit_area, error_area, body] = Layout::vertical([
         Constraint::Length(4),
+        Constraint::Length(u16::from(audit_error.is_some())),
         Constraint::Length(u16::from(state.traffic.error.is_some())),
         Constraint::Min(1),
     ])
     .areas(inner);
+    if let Some(error) = audit_error {
+        frame.render_widget(
+            Paragraph::new(error)
+                .style(theme.danger())
+                .wrap(Wrap { trim: false }),
+            audit_area,
+        );
+    }
     frame.render_widget(Paragraph::new("Configuration evaluation\nLive connectivity: NOT VERIFIED\nRequired safety gates: not enforced in Phase 2\ne run  r reload  t target  a new  E edit  d del  Space toggle").wrap(Wrap { trim: false }), header);
     if let Some(error) = &state.traffic.error {
         frame.render_widget(

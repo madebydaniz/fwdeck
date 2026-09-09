@@ -7,6 +7,7 @@ mod observation;
 pub mod ports;
 mod refresh_scheduler;
 mod traffic_test;
+pub mod traffic_test_audit;
 mod traffic_test_service;
 mod traffic_test_storage;
 mod traffic_test_workspace;

@@ -7,6 +7,9 @@ use crate::domain::ValidationError;
 /// Top-level application error, produced at the application boundary.
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    /// Owned traffic work ended with a stable, privacy-safe failure.
+    #[error("traffic service shutdown failed: {0}")]
+    TrafficShutdown(crate::application::TrafficServiceShutdownError),
     /// Terminal setup/teardown or other I/O failed.
     #[error("terminal error: {0}")]
     Terminal(#[from] std::io::Error),

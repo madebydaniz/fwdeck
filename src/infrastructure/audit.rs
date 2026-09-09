@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::application::ports::OperationOutcome;
 use crate::config::AuditRetentionConfig;
+pub mod traffic;
 
 /// Appends one JSON line describing `outcome` (id, timestamp, actor uid, host,
 /// version, operation, status, per-step invocations) to `audit.jsonl`.

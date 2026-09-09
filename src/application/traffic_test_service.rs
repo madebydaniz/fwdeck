@@ -1,5 +1,6 @@
 //! Owned asynchronous default-suite and evaluation lifecycle.
 
+use super::traffic_test_audit::{TrafficAuditError, TrafficAuditOutcome, TrafficAuditStatus};
 use super::{
     LoadedTrafficSuite, ObservedSnapshot, SuiteLoadFailure, SuiteLoadOutcome, SuiteLoadToken,
     TRAFFIC_TEST_SHUTDOWN_DEADLINE, TrafficSaveExpectation, TrafficStorageError,
@@ -16,6 +17,9 @@ use tokio::task::JoinHandle;
 /// Immediate request rejection. Rejected slot requests never change workspace state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TrafficServiceError {
+    /// No guaranteed terminal-summary reservation is available.
+    #[error("traffic audit backlog is full; retry evaluation after persistence progresses")]
+    AuditBackpressure,
     #[error("traffic test service is busy")]
     /// The single blocking slot or coordinator request lane is occupied.
     Busy,
@@ -61,6 +65,8 @@ pub enum TrafficSaveState {
 /// One bounded update produced by polling the owner.
 #[derive(Debug)]
 pub enum TrafficServiceEvent {
+    /// One owned audit write completed; persistent health is available separately.
+    Audit(Result<(), TrafficAuditError>),
     /// Load finished and its matching outcome was applied.
     Loaded(Result<(), TrafficStorageError>),
     /// Save finished; accepted content may separately require cancellation.
@@ -83,6 +89,9 @@ pub enum TrafficServiceEvent {
 /// Explicit shutdown retains unfinished ownership on deadline expiry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TrafficServiceShutdownError {
+    /// At least one accepted summary could not be durably persisted.
+    #[error("traffic audit persistence failed; accepted history may be incomplete")]
+    AuditFailed,
     #[error("traffic test service shutdown deadline exceeded")]
     /// Retain this service and retry shutdown; a write may still complete.
     DeadlineExceeded,
@@ -123,10 +132,12 @@ pub struct TrafficTestService<S: TrafficSuiteStorage> {
     coordinator_closed: bool,
     coordinator_shutdown: Option<Result<(), TrafficServiceShutdownError>>,
     worker_failed: bool,
+    audit: super::traffic_test_audit::writer::AuditWriter,
 }
 
 impl<S: TrafficSuiteStorage> TrafficTestService<S> {
-    /// Creates an inert service with the native bounded coordinator.
+    /// Creates an inert, non-audited library/test service with the native coordinator.
+    /// Production callers must use `with_audit_sink`.
     #[must_use]
     pub fn new(offline: bool, storage: Arc<S>) -> Self {
         Self::with_coordinator(offline, storage, TrafficTestCoordinator::spawn())
@@ -149,7 +160,19 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
             coordinator_closed: false,
             coordinator_shutdown: None,
             worker_failed: false,
+            audit: super::traffic_test_audit::writer::AuditWriter::new(None),
         }
+    }
+    /// Explicitly injects durability; existing non-writing constructors are for library/test use.
+    #[must_use]
+    pub fn with_audit_sink(
+        offline: bool,
+        storage: Arc<S>,
+        sink: Arc<dyn super::traffic_test_audit::TrafficAuditSink>,
+    ) -> Self {
+        let mut service = Self::new(offline, storage);
+        service.audit = super::traffic_test_audit::writer::AuditWriter::new(Some(sink));
+        service
     }
     /// Returns immutable presentation state.
     #[must_use]
@@ -160,6 +183,11 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
     #[must_use]
     pub const fn save_state(&self) -> &TrafficSaveState {
         &self.save
+    }
+    /// Persistent, privacy-safe audit health, not cleared by unrelated events.
+    #[must_use]
+    pub fn audit_status(&self) -> TrafficAuditStatus {
+        self.audit.status()
     }
 
     /// Accepts strictly newer evidence immediately, even while storage is busy.
@@ -254,11 +282,23 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
         if self.coordinator_closed {
             return Err(TrafficServiceError::Closed);
         }
+        if !self.audit.admit() {
+            return Err(TrafficServiceError::AuditBackpressure);
+        }
         let prepared = self
             .workspace
             .prepare_evaluation()
             .map_err(|error| map_workspace(&error))?;
         let context = prepared.context().clone();
+        self.audit.accept(
+            context.clone(),
+            prepared
+                .suite()
+                .scenarios
+                .iter()
+                .filter(|scenario| scenario.enabled)
+                .count(),
+        );
         self.job = Some(Job {
             kind: JobKind::Index(context),
             task: tokio::task::spawn_blocking(move || {
@@ -281,10 +321,11 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
     /// Cancellation-safe polling. `None` means the coordinator is closed and no job is active.
     /// After a subsequent load or save is accepted, the caller must resume polling.
     pub async fn next_event(&mut self) -> Option<TrafficServiceEvent> {
-        if self.job.is_none() && self.coordinator_closed {
+        if self.job.is_none() && self.coordinator_closed && !self.audit.has_work() {
             return None;
         }
         tokio::select! {
+            result = self.audit.next_event(), if self.audit.has_work() => Some(TrafficServiceEvent::Audit(result)),
             output = async { match self.job.as_mut() { Some(job) => (&mut job.task).await, None => std::future::pending().await } }, if self.job.is_some() => {
                 let job = self.job.take()?;
                 Some(self.finish_job(job.kind, output))
@@ -298,9 +339,11 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
     /// On deadline expiry all unfinished handles remain available for retry.
     pub async fn shutdown(&mut self) -> Result<(), TrafficServiceShutdownError> {
         self.closing = true;
+        self.audit.cancel(TrafficAuditOutcome::Shutdown);
         let deadline = tokio::time::Instant::now() + TRAFFIC_TEST_SHUTDOWN_DEADLINE;
-        while self.job.is_some() || self.coordinator_shutdown.is_none() {
+        while self.job.is_some() || self.coordinator_shutdown.is_none() || self.audit.has_work() {
             tokio::select! {
+                _ = self.audit.next_event(), if self.audit.has_work() => {},
                 output = async { match self.job.as_mut() { Some(job) => (&mut job.task).await, None => std::future::pending().await } }, if self.job.is_some() => {
                     if let Some(job) = self.job.take() { self.finish_job(job.kind, output); }
                 }
@@ -315,7 +358,9 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
                 () = tokio::time::sleep_until(deadline) => return Err(TrafficServiceShutdownError::DeadlineExceeded),
             }
         }
-        if self.worker_failed {
+        if self.audit.status().failure.is_some() {
+            Err(TrafficServiceShutdownError::AuditFailed)
+        } else if self.worker_failed {
             Err(TrafficServiceShutdownError::WorkerFailed)
         } else {
             Ok(())
@@ -336,7 +381,11 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
             Ok(())
         }
     }
-    fn cancel(&self, old: Option<EvaluationContext>) -> Result<(), TrafficServiceError> {
+    fn cancel(&mut self, old: Option<EvaluationContext>) -> Result<(), TrafficServiceError> {
+        if let Some(context) = &old {
+            self.audit
+                .finish(context, TrafficAuditOutcome::StaleContext, None);
+        }
         old.map_or(Ok(()), |context| {
             self.coordinator
                 .try_invalidate(context)
@@ -345,13 +394,53 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
     }
     fn ingest(&mut self, event: TrafficTestEvent) -> TrafficServiceEvent {
         let context = event.context().clone();
+        let (outcome, report) = match &event {
+            TrafficTestEvent::EvaluationStarted { .. } => (None, None),
+            TrafficTestEvent::EvaluationFinished { report } => (
+                Some(TrafficAuditOutcome::Completed),
+                Some(Arc::clone(report)),
+            ),
+            TrafficTestEvent::EvaluationCancelled { reason, .. } => (
+                Some(match reason {
+                    super::TrafficTestCancellationReason::Superseded => {
+                        TrafficAuditOutcome::Superseded
+                    }
+                    super::TrafficTestCancellationReason::StaleContext => {
+                        TrafficAuditOutcome::StaleContext
+                    }
+                    super::TrafficTestCancellationReason::Shutdown => TrafficAuditOutcome::Shutdown,
+                }),
+                None,
+            ),
+            TrafficTestEvent::EvaluationFailed { reason, .. } => (
+                Some(match reason {
+                    TrafficTestFailureReason::Busy => TrafficAuditOutcome::Busy,
+                    TrafficTestFailureReason::EvaluationLimitExceeded => {
+                        TrafficAuditOutcome::EvaluationLimitExceeded
+                    }
+                    TrafficTestFailureReason::EvaluationFailed(_) => {
+                        TrafficAuditOutcome::EvaluationFailed
+                    }
+                    TrafficTestFailureReason::WorkerFailed => TrafficAuditOutcome::WorkerFailed,
+                }),
+                None,
+            ),
+        };
         let result = self.workspace.ingest_event(event);
         if result == Err(WorkspaceEventError::MalformedReport) {
+            self.audit
+                .finish(&context, TrafficAuditOutcome::MalformedReport, None);
             self.fail_worker(context);
+        } else if result.is_ok()
+            && let Some(outcome) = outcome
+        {
+            self.audit.finish(&context, outcome, report.as_deref());
         }
         TrafficServiceEvent::Evaluation(result)
     }
     fn fail_worker(&mut self, context: EvaluationContext) {
+        self.audit
+            .finish(&context, TrafficAuditOutcome::WorkerFailed, None);
         let _ = self
             .workspace
             .ingest_event(TrafficTestEvent::EvaluationFailed {
@@ -361,6 +450,7 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
     }
     fn close_coordinator(&mut self) {
         self.coordinator_closed = true;
+        self.audit.cancel(TrafficAuditOutcome::Closed);
         if let Some(context) = self.workspace.active_context().cloned()
             && self
                 .workspace

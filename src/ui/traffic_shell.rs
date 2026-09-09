@@ -14,6 +14,7 @@ pub(super) struct TrafficShell<S: TrafficSuiteStorage> {
     service: Option<TrafficTestService<S>>,
     storage: Option<Arc<S>>,
     armed: bool,
+    audit_sink: Option<Arc<dyn crate::application::traffic_test_audit::TrafficAuditSink>>,
 }
 
 impl<S: TrafficSuiteStorage> TrafficShell<S> {
@@ -22,7 +23,16 @@ impl<S: TrafficSuiteStorage> TrafficShell<S> {
             service: None,
             storage,
             armed: false,
+            audit_sink: None,
         }
+    }
+    pub(super) fn with_audit(
+        storage: Option<Arc<S>>,
+        sink: Arc<dyn crate::application::traffic_test_audit::TrafficAuditSink>,
+    ) -> Self {
+        let mut shell = Self::new(storage);
+        shell.audit_sink = Some(sink);
+        shell
     }
     pub(super) fn route(&mut self, effect: &Effect, state: &UiState) -> Option<UiAction> {
         if !matches!(
@@ -52,7 +62,14 @@ impl<S: TrafficSuiteStorage> TrafficShell<S> {
                 presentation.error = Some("Application config directory unavailable; no default suite path can be resolved.".into());
                 return Some(UiAction::TrafficPresented(presentation));
             };
-            let mut service = TrafficTestService::new(state.offline, Arc::clone(storage));
+            let mut service = match &self.audit_sink {
+                Some(sink) => TrafficTestService::with_audit_sink(
+                    state.offline,
+                    Arc::clone(storage),
+                    Arc::clone(sink),
+                ),
+                None => TrafficTestService::new(state.offline, Arc::clone(storage)),
+            };
             if let Some(observed) = &state.traffic_observation {
                 let _ = service.observe(observed.clone());
             }
@@ -82,6 +99,7 @@ impl<S: TrafficSuiteStorage> TrafficShell<S> {
         };
         let mut presentation = TrafficPresentation::from_workspace(service.workspace());
         presentation.save = service.save_state().clone();
+        presentation.audit = service.audit_status();
         presentation.error = result.err().map(|error| error.to_string());
         Some(UiAction::TrafficPresented(presentation))
     }
@@ -98,6 +116,7 @@ impl<S: TrafficSuiteStorage> TrafficShell<S> {
         };
         let mut presentation = TrafficPresentation::from_workspace(service.workspace());
         presentation.save = service.save_state().clone();
+        presentation.audit = service.audit_status();
         presentation.error = match event {
             TrafficServiceEvent::Loaded(Err(error))
             | TrafficServiceEvent::Saved {

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "audit_tests.rs"]
+mod audit_tests;
 use crate::application::{SuiteState, traffic_test_storage::*};
 use crate::domain::TrafficSuite;
 use std::sync::{

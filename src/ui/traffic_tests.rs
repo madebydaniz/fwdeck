@@ -12,6 +12,7 @@ mod tests;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrafficPresentation {
+    pub audit: crate::application::traffic_test_audit::TrafficAuditStatus,
     pub save: crate::application::TrafficSaveState,
     pub suite: SuiteState,
     pub evaluation: EvaluationState,
@@ -131,6 +132,7 @@ impl TrafficPresentation {
     #[must_use]
     pub fn from_workspace(workspace: &TrafficTestWorkspace) -> Self {
         Self {
+            audit: crate::application::traffic_test_audit::TrafficAuditStatus::default(),
             save: crate::application::TrafficSaveState::Idle,
             suite: workspace.suite_state().clone(),
             evaluation: workspace.evaluation_state().clone(),

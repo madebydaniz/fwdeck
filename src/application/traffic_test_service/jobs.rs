@@ -34,6 +34,8 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
                     return TrafficServiceEvent::ObsoleteIndex;
                 }
                 if self.closing || self.coordinator_closed {
+                    self.audit
+                        .finish(&context, super::TrafficAuditOutcome::Closed, None);
                     let _ = self
                         .workspace
                         .resolve_submission_failure(context, &TrafficTestSubmissionError::Closed);
@@ -47,6 +49,19 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
                 };
                 let result = self.coordinator.try_evaluate(*request);
                 if let Err(error) = &result {
+                    self.audit.finish(
+                        &context,
+                        match error {
+                            TrafficTestSubmissionError::Busy => super::TrafficAuditOutcome::Busy,
+                            TrafficTestSubmissionError::Closed => {
+                                super::TrafficAuditOutcome::Closed
+                            }
+                            TrafficTestSubmissionError::InvalidContext(_) => {
+                                super::TrafficAuditOutcome::EvaluationFailed
+                            }
+                        },
+                        None,
+                    );
                     let _ = self.workspace.resolve_submission_failure(context, error);
                     if *error == TrafficTestSubmissionError::Closed {
                         self.coordinator_closed = true;
