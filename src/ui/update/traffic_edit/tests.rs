@@ -176,9 +176,12 @@ fn traffic_edit_load_states_block_forms_and_global_actions_cannot_bypass_modal()
 #[test]
 fn traffic_edit_keyboard_and_palette_expose_local_reviewed_actions() {
     use crossterm::event::{KeyCode as K, KeyEvent};
-    let mut state = loaded();
+    let state = loaded();
+    assert_eq!(
+        crate::ui::keymap::translate(&state, KeyEvent::from(K::Char('a'))),
+        Some(UiAction::OpenTrafficTemplates)
+    );
     for (key, action) in [
-        (K::Char('a'), A::New(Template::Custom)),
         (K::Char('E'), A::Edit),
         (K::Char('d'), A::Delete),
         (K::Char(' '), A::Toggle),
@@ -199,6 +202,26 @@ fn traffic_edit_keyboard_and_palette_expose_local_reviewed_actions() {
             == UiAction::TrafficEdit(A::New(template))
             && command.availability == crate::ui::palette::Availability::Enabled));
     }
+
+    for (selected, expected_name) in [(0, "Keep SSH access"), (3, "")] {
+        let mut picker_state = loaded();
+        let suite_before = picker_state.traffic.suite.clone();
+        assert!(
+            crate::ui::update::update(&mut picker_state, UiAction::OpenTrafficTemplates).is_empty()
+        );
+        assert!(
+            crate::ui::update::update(&mut picker_state, UiAction::PaletteMove(selected))
+                .is_empty()
+        );
+        assert!(
+            crate::ui::update::update(&mut picker_state, UiAction::PaletteExecute).is_empty(),
+            "template selection must only open an unsaved draft"
+        );
+        assert_eq!(editor(&picker_state).draft.name, expected_name);
+        assert_eq!(picker_state.traffic.suite, suite_before);
+    }
+
+    let mut state = loaded();
     valid_editor(&mut state);
     for (key, action) in [
         (K::Tab, A::Move(1)),
@@ -206,6 +229,7 @@ fn traffic_edit_keyboard_and_palette_expose_local_reviewed_actions() {
         (K::Right, A::Cycle(1)),
         (K::Enter, A::Review),
         (K::Char('y'), A::Input('y')),
+        (K::Char('T'), A::Input('T')),
     ] {
         assert_eq!(
             crate::ui::keymap::translate(&state, KeyEvent::from(key)),
@@ -320,7 +344,7 @@ fn traffic_edit_failed_save_cannot_be_reopened_without_reload() {
 fn traffic_edit_missing_suite_has_actionable_create_hint() {
     let state = state();
     assert!(
-        state.traffic.message().contains("a new"),
+        state.traffic.message().contains("Open templates (a)"),
         "missing suite must advertise unsaved creation"
     );
 }

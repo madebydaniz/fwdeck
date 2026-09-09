@@ -675,15 +675,29 @@ fn render_palette(
                 .map(|row| Line::from(Span::styled(format!(" {row}"), theme.info()))),
         );
     }
+    let scoped_templates = palette_state.scope == super::palette::PaletteScope::TrafficTemplates;
     lines.push(Line::from(Span::styled(
-        " enter run · esc close",
+        if scoped_templates {
+            " enter select · esc close"
+        } else {
+            " enter run · esc close"
+        },
         theme.muted(),
     )));
     let height = u16::try_from(lines.len() + 2)
         .unwrap_or(u16::MAX)
         .min(screen.height);
     let area = centered(screen, width, height);
-    let block = modal(f, theme, area, "Commands");
+    let block = modal(
+        f,
+        theme,
+        area,
+        if scoped_templates {
+            "Traffic test templates"
+        } else {
+            "Commands"
+        },
+    );
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(Paragraph::new(lines), inner);
@@ -700,10 +714,20 @@ fn render_details(
     let inner_width = usize::from(width.saturating_sub(2));
     let mut lines = Vec::new();
     for (key, value) in &content.lines {
+        let inline = !key.is_empty() && key.chars().count() <= 12;
+        if !key.is_empty() && !inline {
+            lines.extend(
+                wrap_text(&format!(" {key}:"), inner_width)
+                    .into_iter()
+                    .map(|row| Line::from(Span::styled(row, theme.muted()))),
+            );
+        }
         let prefix = if key.is_empty() {
-            "   ".to_owned()
+            " ".to_owned()
+        } else if inline {
+            format!(" {key}: ")
         } else {
-            format!(" {key:<12}")
+            "   ".to_owned()
         };
         lines.extend(prefixed_rows(&prefix, value, inner_width).into_iter().map(
             |(prefix, row)| {
@@ -716,18 +740,14 @@ fn render_details(
     }
     lines.push(Line::default());
     lines.extend(
-        prefixed_rows(
-            " ",
-            "esc close  ·  : for actions on this object",
-            inner_width,
-        )
-        .into_iter()
-        .map(|(prefix, row)| {
-            Line::from(vec![
-                Span::styled(prefix, theme.muted()),
-                Span::styled(row, theme.muted()),
-            ])
-        }),
+        prefixed_rows(" ", "esc close", inner_width)
+            .into_iter()
+            .map(|(prefix, row)| {
+                Line::from(vec![
+                    Span::styled(prefix, theme.muted()),
+                    Span::styled(row, theme.muted()),
+                ])
+            }),
     );
 
     let height = u16::try_from(lines.len() + 2)
@@ -974,6 +994,7 @@ mod tests {
         let palette_state = PaletteState {
             query: "temporary service".to_owned(),
             selected: 0,
+            ..PaletteState::default()
         };
         state.overlays.push(Overlay::Palette(palette_state.clone()));
 
@@ -1004,6 +1025,7 @@ mod tests {
             let palette_state = PaletteState {
                 query: String::new(),
                 selected,
+                ..PaletteState::default()
             };
 
             terminal
@@ -1030,6 +1052,7 @@ mod tests {
         let palette_state = PaletteState {
             query: "Migrate selected direct rule".to_owned(),
             selected: 0,
+            ..PaletteState::default()
         };
         state.overlays.push(Overlay::Palette(palette_state.clone()));
 
@@ -1083,8 +1106,34 @@ mod tests {
 
         let content = buffer_text(&terminal);
         assert!(content.contains("stays readable"), "{content}");
-        assert!(content.contains("actions on this"), "{content}");
-        assert!(content.contains("object"), "{content}");
+        assert!(content.contains("esc close"), "{content}");
+    }
+
+    #[test]
+    fn details_keep_labels_and_values_separated_at_all_label_lengths() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let theme = Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+        let details = DetailsContent {
+            title: "Traffic scenario".to_owned(),
+            lines: vec![
+                ("Short".to_owned(), "SHORT_VALUE".to_owned()),
+                ("Twelve chars".to_owned(), "EQUAL_VALUE".to_owned()),
+                (
+                    "A much longer label than twelve".to_owned(),
+                    "LONG_VALUE".to_owned(),
+                ),
+            ],
+        };
+        terminal
+            .draw(|frame| {
+                render_details(frame, &details, &theme, frame.area(), 0);
+            })
+            .unwrap();
+        let content = buffer_text(&terminal);
+        assert!(content.contains("Short: SHORT_VALUE"), "{content}");
+        assert!(content.contains("Twelve chars: EQUAL_VALUE"), "{content}");
+        assert!(!content.contains("twelveLONG_VALUE"), "{content}");
+        assert!(content.contains("LONG_VALUE"), "{content}");
     }
 
     #[test]

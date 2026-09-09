@@ -20,7 +20,9 @@ pub(super) fn build(view: &TrafficPresentation, id: &TrafficScenarioId) -> Optio
         return None;
     };
     let scenario = suite.scenarios.iter().find(|scenario| &scenario.id == id)?;
-    let mut lines = inputs(view, suite, scenario);
+    let mut lines = summary(view, scenario);
+    lines.extend(inputs(scenario));
+    lines.extend(technical(view, suite, scenario));
     current_result(&mut lines, view, scenario);
     let primary_history = match &view.evaluation {
         EvaluationState::Stale(report) => Some(report),
@@ -28,6 +30,11 @@ pub(super) fn build(view: &TrafficPresentation, id: &TrafficScenarioId) -> Optio
         _ => None,
     };
     if let Some(report) = primary_history.or(view.stale_report.as_ref()) {
+        lines.push((String::new(), String::new()));
+        lines.push((
+            "Historical evidence / trace".into(),
+            "Not current evidence".into(),
+        ));
         historical_result(&mut lines, suite, id, report);
     }
     Some(DetailsContent {
@@ -40,31 +47,165 @@ fn optional(value: Option<&impl std::fmt::Display>) -> String {
     value.map_or_else(|| "-".into(), ToString::to_string)
 }
 
-fn inputs(view: &TrafficPresentation, suite: &TrafficSuite, scenario: &TrafficScenario) -> Lines {
+fn summary(view: &TrafficPresentation, scenario: &TrafficScenario) -> Lines {
     let (actual, status) = view.outcome(scenario);
+    let reason = if scenario.enabled {
+        match &view.evaluation {
+            EvaluationState::Completed(report) if view.report_is_current(report) => report
+                .results()
+                .iter()
+                .find(|result| result.scenario_id() == &scenario.id)
+                .map_or_else(
+                    || "No matching current result".into(),
+                    result_summary_reason,
+                ),
+            EvaluationState::Completed(_) | EvaluationState::Stale(_) => {
+                "Captured result is historical, not current evidence".into()
+            }
+            EvaluationState::Failed { reason, .. } => failure_reason(reason).into(),
+            EvaluationState::Cancelled { reason, .. } => cancellation_reason(*reason).into(),
+            EvaluationState::Queued(_) => "Evaluation queued".into(),
+            EvaluationState::Running(_) => "Evaluation running".into(),
+            EvaluationState::NotRun if view.stale_report.is_some() => {
+                "Historical result exists but is not current evidence".into()
+            }
+            EvaluationState::NotRun => "-".into(),
+        }
+    } else {
+        "Scenario disabled; it is not evaluated".into()
+    };
+    let next = if !scenario.enabled {
+        "Enable and explicitly save the scenario before evaluating"
+    } else if status == "Queued" || status == "Running" {
+        "Wait for the captured configuration evaluation to finish"
+    } else if status.starts_with("Failed") || status == "Cancelled" {
+        "Resolve the reason, then evaluate again against current evidence"
+    } else if status == "Stale" {
+        "Evaluate again against the current suite, target and authoritative snapshot"
+    } else if actual == "-" {
+        "Run configuration evaluation when the suite and snapshot are ready"
+    } else {
+        "Review the ordered trace; live connectivity remains NOT VERIFIED"
+    };
+    vec![
+        (
+            "Summary".into(),
+            "Configuration only; live connectivity: NOT VERIFIED".into(),
+        ),
+        ("Status".into(), status),
+        ("Target".into(), format!("{:?}", view.target)),
+        (
+            "Expected outcome".into(),
+            format!("{:?}", scenario.expectation),
+        ),
+        ("Current outcome".into(), actual),
+        ("Reason".into(), reason),
+        ("Next action".into(), next.into()),
+    ]
+}
+
+fn result_summary_reason(result: &TrafficTestResult) -> String {
+    if let Some(reason) = result.unknown_reason() {
+        return unknown(reason).into();
+    }
+    if result.status() == crate::domain::TrafficTestStatus::Fail {
+        return format!(
+            "Expected {:?} but configuration evaluates {:?}",
+            result.expectation(),
+            result.decision()
+        );
+    }
+    "-".into()
+}
+
+fn inputs(scenario: &TrafficScenario) -> Lines {
+    vec![
+        (String::new(), String::new()),
+        (
+            "Scenario inputs".into(),
+            "Current captured scenario inputs".into(),
+        ),
+        ("Name".into(), scenario.name.clone()),
+        (
+            "Enabled".into(),
+            if scenario.enabled { "yes" } else { "no" }.into(),
+        ),
+        (
+            "Direction".into(),
+            match scenario.direction {
+                TrafficDirection::ToHost => "To host",
+                TrafficDirection::FromHost => "From host",
+                TrafficDirection::Forwarded => "Forwarded",
+            }
+            .into(),
+        ),
+        ("Source".into(), scenario.source.to_string()),
+        (
+            "Ingress interface / zone".into(),
+            format!(
+                "{} / {}",
+                optional(scenario.ingress_interface.as_ref()),
+                optional(scenario.ingress_zone.as_ref())
+            ),
+        ),
+        (
+            "Destination".into(),
+            match &scenario.destination {
+                TrafficDestination::LocalHost => "Local host".into(),
+                TrafficDestination::Address(address) => address.to_string(),
+            },
+        ),
+        (
+            "Egress interface / zone".into(),
+            format!(
+                "{} / {}",
+                optional(scenario.egress_interface.as_ref()),
+                optional(scenario.egress_zone.as_ref())
+            ),
+        ),
+        (
+            "Transport".into(),
+            match &scenario.transport {
+                TrafficTransport::Tcp => "TCP".into(),
+                TrafficTransport::Udp => "UDP".into(),
+                TrafficTransport::Icmp { icmp_type } => format!("ICMP: {icmp_type}"),
+                TrafficTransport::RawProtocol { protocol } => format!("IP protocol: {protocol}"),
+            },
+        ),
+        (
+            "Source / destination ports".into(),
+            format!(
+                "{} / {}",
+                optional(scenario.source_port.as_ref()),
+                optional(scenario.destination_port.as_ref())
+            ),
+        ),
+        (
+            "Connection state".into(),
+            format!("{:?}", scenario.connection_state),
+        ),
+        ("Severity".into(), format!("{:?}", scenario.severity)),
+        (
+            "Note".into(),
+            scenario.note.clone().unwrap_or_else(|| "-".into()),
+        ),
+    ]
+}
+
+fn technical(
+    view: &TrafficPresentation,
+    suite: &TrafficSuite,
+    scenario: &TrafficScenario,
+) -> Lines {
     let mut lines = vec![
+        (String::new(), String::new()),
+        ("Technical details".into(), "Identity and safety metadata".into()),
         ("Captured at opening".into(), "Immutable details; not refreshed. Current labels refer only to this captured observation, not live state. Reopen after changes.".into()),
         ("Evaluation".into(), "Configuration evaluation; Live connectivity: NOT VERIFIED".into()),
-        ("Current scenario inputs (captured)".into(), "Separate from historical evidence below".into()),
-        ("Name".into(), scenario.name.clone()),
         ("Scenario ID".into(), scenario.id.to_string()),
-        ("Enabled".into(), if scenario.enabled { "yes" } else { "no" }.into()),
-        ("Direction".into(), match scenario.direction { TrafficDirection::ToHost => "To host", TrafficDirection::FromHost => "From host", TrafficDirection::Forwarded => "Forwarded" }.into()),
-        ("Source".into(), scenario.source.to_string()),
-        ("Ingress interface / zone".into(), format!("{} / {}", optional(scenario.ingress_interface.as_ref()), optional(scenario.ingress_zone.as_ref()))),
-        ("Destination".into(), match &scenario.destination { TrafficDestination::LocalHost => "Local host".into(), TrafficDestination::Address(address) => address.to_string() }),
-        ("Egress interface / zone".into(), format!("{} / {}", optional(scenario.egress_interface.as_ref()), optional(scenario.egress_zone.as_ref()))),
-        ("Transport".into(), match &scenario.transport { TrafficTransport::Tcp => "TCP".into(), TrafficTransport::Udp => "UDP".into(), TrafficTransport::Icmp { icmp_type } => format!("ICMP: {icmp_type}"), TrafficTransport::RawProtocol { protocol } => format!("IP protocol: {protocol}") }),
-        ("Source / destination ports".into(), format!("{} / {}", optional(scenario.source_port.as_ref()), optional(scenario.destination_port.as_ref()))),
-        ("Connection state".into(), format!("{:?}", scenario.connection_state)),
-        ("Expected".into(), format!("{:?}", scenario.expectation)),
-        ("Actual".into(), actual), ("Status".into(), status),
-        ("Target".into(), format!("{:?}", view.target)),
-        ("Severity".into(), format!("{:?}", scenario.severity)),
         ("Required safety gate".into(), format!("{}; not enforced in Phase 2", scenario.required_safety_gate)),
         ("Suite".into(), format!("{} revision {}", suite.id, suite.revision.get())),
         ("Suite name".into(), suite.name.clone()),
-        ("Note".into(), scenario.note.clone().unwrap_or_else(|| "-".into())),
     ];
     if let Some(identity) = view.current_snapshot {
         lines.push((
@@ -109,26 +250,12 @@ fn current_result(lines: &mut Lines, view: &TrafficPresentation, scenario: &Traf
         _ => {}
     }
     if let EvaluationState::Failed { reason, .. } = &view.evaluation {
-        let reason = match reason {
-            crate::application::WorkspaceFailure::Busy => "Busy",
-            crate::application::WorkspaceFailure::Closed => "Coordinator closed",
-            crate::application::WorkspaceFailure::EvaluationLimitExceeded => {
-                "Evaluation limit exceeded"
-            }
-            crate::application::WorkspaceFailure::EvaluationFailed => "Evaluation failed",
-            crate::application::WorkspaceFailure::WorkerFailed => "Worker failed",
-        };
-        lines.push(("Failure reason".into(), reason.into()));
+        lines.push(("Failure reason".into(), failure_reason(reason).into()));
     }
     if let EvaluationState::Cancelled { reason, .. } = &view.evaluation {
         lines.push((
             "Cancellation reason".into(),
-            match reason {
-                crate::application::TrafficTestCancellationReason::Superseded => "Superseded",
-                crate::application::TrafficTestCancellationReason::StaleContext => "Stale context",
-                crate::application::TrafficTestCancellationReason::Shutdown => "Shutdown",
-            }
-            .into(),
+            cancellation_reason(*reason).into(),
         ));
     }
     lines.push((
@@ -140,6 +267,26 @@ fn current_result(lines: &mut Lines, view: &TrafficPresentation, scenario: &Traf
         }
         .into(),
     ));
+}
+
+fn failure_reason(reason: &crate::application::WorkspaceFailure) -> &'static str {
+    match reason {
+        crate::application::WorkspaceFailure::Busy => "Busy",
+        crate::application::WorkspaceFailure::Closed => "Coordinator closed",
+        crate::application::WorkspaceFailure::EvaluationLimitExceeded => {
+            "Evaluation limit exceeded"
+        }
+        crate::application::WorkspaceFailure::EvaluationFailed => "Evaluation failed",
+        crate::application::WorkspaceFailure::WorkerFailed => "Worker failed",
+    }
+}
+
+fn cancellation_reason(reason: crate::application::TrafficTestCancellationReason) -> &'static str {
+    match reason {
+        crate::application::TrafficTestCancellationReason::Superseded => "Superseded",
+        crate::application::TrafficTestCancellationReason::StaleContext => "Stale context",
+        crate::application::TrafficTestCancellationReason::Shutdown => "Shutdown",
+    }
 }
 
 fn historical_result(

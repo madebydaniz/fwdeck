@@ -135,6 +135,12 @@ fn reduce(state: &mut UiState, action: UiAction) -> Vec<Effect> {
                 .overlays
                 .push(Overlay::Palette(palette::PaletteState::default()));
         }
+        UiAction::OpenTrafficTemplates => {
+            state.overlays.push(Overlay::Palette(palette::PaletteState {
+                scope: palette::PaletteScope::TrafficTemplates,
+                ..palette::PaletteState::default()
+            }));
+        }
         UiAction::PaletteInput(c) => {
             if let Some(Overlay::Palette(palette_state)) = state.overlays.last_mut() {
                 palette_state.query.push(c);

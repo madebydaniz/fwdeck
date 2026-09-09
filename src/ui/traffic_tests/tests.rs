@@ -243,6 +243,33 @@ fn request_errors_are_visible_with_an_available_suite() {
 }
 
 #[test]
+fn traffic_header_and_selected_row_remain_visible_at_supported_sizes() {
+    let theme = crate::ui::theme::Theme::detect(crate::ui::theme::Variant::Mono, false);
+    for (width, height) in [(80, 24), (120, 40), (160, 50)] {
+        let mut state = state();
+        state.view_state_mut().selected = 2;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render::render(frame, &mut state, &theme))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        for expected in ["NOT VERIFIED", "not enforced", "a templates", "Case 02"] {
+            assert!(
+                text.contains(expected),
+                "missing {expected} at {width}x{height}"
+            );
+        }
+    }
+}
+
+#[test]
 fn missing_loading_future_malformed_and_unavailable_are_readable() {
     let mut workspace = TrafficTestWorkspace::new(false);
     let token = workspace.begin_load().unwrap();
@@ -437,7 +464,7 @@ fn assert_selected_card(buffer: &ratatui::buffer::Buffer, state: &UiState) {
     } else {
         1
     };
-    let lines: Vec<String> = (11..buffer.area.height.saturating_sub(2))
+    let lines: Vec<String> = (0..buffer.area.height.saturating_sub(2))
         .map(|y| (left..width - 1).map(|x| buffer[(x, y)].symbol()).collect())
         .collect();
     let start = lines
@@ -453,10 +480,16 @@ fn assert_selected_card(buffer: &ratatui::buffer::Buffer, state: &UiState) {
         })
         .map_or(lines.len(), |(index, _)| index);
     let card = lines[start..end].join("\n");
-    let header: String = (left..width - 1)
-        .map(|x| buffer[(x, 11)].symbol())
-        .collect();
-    let columns = if header.contains("DIRECTION") {
+    let header = lines
+        .iter()
+        .find(|line| line.contains("DIRECTION"))
+        .cloned()
+        .unwrap_or_default();
+    let columns = if ViewId::TrafficTests
+        .columns()
+        .iter()
+        .all(|label| header.contains(label))
+    {
         Some(
             ViewId::TrafficTests
                 .columns()

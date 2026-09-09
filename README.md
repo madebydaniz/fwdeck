@@ -120,7 +120,8 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
 - 🧯 **Offline mode** (`--offline`) — fix the permanent config from rescue/chroot,
   no daemon needed.
 - 🧪 **Traffic Tests** — opt-in, read-only evaluation of reviewed host-ingress
-  expectations against the current runtime or permanent configuration. Results
+  expectations against the current runtime or permanent configuration. Open
+  with `Shift+t`, then press `a` to choose a template and review a scenario. Results
   do not prove live connectivity; a separate private audit stores aggregate
   lifecycle outcomes only, never scenario inputs, names, notes, or traces.
 

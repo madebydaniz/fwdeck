@@ -47,6 +47,8 @@ pub enum UiAction {
     // Command palette (`:`)
     /// Open the command palette overlay.
     OpenPalette,
+    /// Open the palette scoped to unsaved traffic-test templates.
+    OpenTrafficTemplates,
     /// Append a character to the palette query.
     PaletteInput(char),
     /// Delete the last character of the palette query.

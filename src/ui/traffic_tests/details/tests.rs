@@ -62,6 +62,96 @@ fn current_details_preserve_ordered_typed_trace_and_unknown_stage() {
 }
 
 #[test]
+fn summary_precedes_inputs_and_technical_evidence() {
+    let lines = lines(&presentation(vec![]));
+    let summary = lines.iter().position(|(key, _)| key == "Summary").unwrap();
+    let inputs = lines
+        .iter()
+        .position(|(key, _)| key == "Scenario inputs")
+        .unwrap();
+    let technical = lines
+        .iter()
+        .position(|(key, _)| key == "Technical details")
+        .unwrap();
+    assert!(summary < inputs && inputs < technical);
+    assert_eq!(
+        lines[summary].1,
+        "Configuration only; live connectivity: NOT VERIFIED"
+    );
+    for label in [
+        "Status",
+        "Target",
+        "Expected outcome",
+        "Current outcome",
+        "Next action",
+    ] {
+        assert!(lines[summary..inputs].iter().any(|(key, _)| key == label));
+    }
+}
+
+#[test]
+fn current_fail_summary_explains_expectation_mismatch() {
+    let mut view = presentation(vec![]);
+    let EvaluationState::Completed(report) = &view.evaluation else {
+        unreachable!()
+    };
+    let result = TrafficTestResult::new(
+        TrafficScenarioId::parse("case-0").unwrap(),
+        TrafficExpectation::Allow,
+        FirewallDecision::Block,
+        None,
+        vec![],
+    )
+    .unwrap();
+    view.evaluation = EvaluationState::Completed(Arc::new(
+        TrafficTestReport::new(report.context().clone(), vec![result]).unwrap(),
+    ));
+    let text = lines(&view);
+    assert!(text.contains(&(
+        "Reason".into(),
+        "Expected Allow but configuration evaluates Block".into()
+    )));
+}
+
+#[test]
+fn in_progress_and_terminal_errors_have_summary_reasons_and_next_actions() {
+    let base = presentation(vec![]);
+    let EvaluationState::Completed(report) = &base.evaluation else {
+        unreachable!()
+    };
+    let context = report.context().clone();
+    for (evaluation, reason, next) in [
+        (
+            EvaluationState::Queued(context.clone()),
+            "Evaluation queued",
+            "Wait for the captured configuration evaluation to finish",
+        ),
+        (
+            EvaluationState::Failed {
+                context: context.clone(),
+                reason: crate::application::WorkspaceFailure::WorkerFailed,
+            },
+            "Worker failed",
+            "Resolve the reason, then evaluate again against current evidence",
+        ),
+        (
+            EvaluationState::Cancelled {
+                context,
+                reason: crate::application::TrafficTestCancellationReason::StaleContext,
+            },
+            "Stale context",
+            "Resolve the reason, then evaluate again against current evidence",
+        ),
+    ] {
+        let mut view = base.clone();
+        view.evaluation = evaluation;
+        let text = lines(&view);
+        assert!(text.contains(&("Reason".into(), reason.into())));
+        assert!(text.contains(&("Next action".into(), next.into())));
+    }
+}
+
+#[test]
 fn current_inputs_are_complete_and_without_debug_wrappers() {
     let lines = lines(&presentation(vec![]));
     assert!(lines.contains(&("Enabled".into(), "yes".into())));
@@ -139,7 +229,7 @@ fn history_uses_exact_scenario_and_its_own_expectation() {
     suite.revision = TrafficSuiteRevision::new(2).unwrap();
     suite.scenarios[0].expectation = TrafficExpectation::Block;
     let text = lines(&view);
-    assert!(text.contains(&("Expected".into(), "Block".into())));
+    assert!(text.contains(&("Expected outcome".into(), "Block".into())));
     assert!(text.contains(&("Result expectation".into(), "Allow".into())));
     let SuiteState::Available(suite) = &mut view.suite else {
         unreachable!()
@@ -229,9 +319,13 @@ fn open_details_remain_explicitly_capture_scoped_after_presentation_changes() {
     let Some(crate::ui::overlays::Overlay::Details(content)) = state.overlays.last() else {
         panic!("missing details")
     };
-    assert_eq!(content.lines[0].0, "Captured at opening");
-    assert!(content.lines[0].1.contains("not refreshed"));
-    assert!(content.lines[0].1.contains("Current labels"));
+    let captured = content
+        .lines
+        .iter()
+        .find(|(key, _)| key == "Captured at opening")
+        .unwrap();
+    assert!(captured.1.contains("not refreshed"));
+    assert!(captured.1.contains("Current labels"));
 }
 
 #[test]
@@ -448,7 +542,7 @@ fn historical_allow_pass_never_becomes_current_evidence() {
     ));
     let text = lines(&view);
     assert!(text.contains(&("Status".into(), "Stale".into())));
-    assert!(text.contains(&("Actual".into(), "-".into())));
+    assert!(text.contains(&("Current outcome".into(), "-".into())));
     assert!(text.contains(&("Result decision".into(), "Allow".into())));
     assert!(text.contains(&("Result status".into(), "Pass".into())));
     assert!(

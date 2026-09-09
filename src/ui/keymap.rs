@@ -140,9 +140,9 @@ fn overlay_key(overlay: &Overlay, code: KeyCode) -> Option<UiAction> {
 /// Normal-mode translation: special-cased keys first, then the `HELP` table.
 fn normal_key(state: &UiState, code: KeyCode) -> Option<UiAction> {
     if state.view == ViewId::TrafficTests {
-        use super::traffic_test_form::{EditAction as A, Template};
+        use super::traffic_test_form::EditAction as A;
         match code {
-            KeyCode::Char('a') => return Some(UiAction::TrafficEdit(A::New(Template::Custom))),
+            KeyCode::Char('a') => return Some(UiAction::OpenTrafficTemplates),
             KeyCode::Char('E') => return Some(UiAction::TrafficEdit(A::Edit)),
             KeyCode::Char('d') => return Some(UiAction::TrafficEdit(A::Delete)),
             KeyCode::Char(' ') => return Some(UiAction::TrafficEdit(A::Toggle)),
@@ -259,6 +259,12 @@ pub const HELP: &[(&str, &[HelpEntry])] = &[
                 desc: "open policy workspace",
                 codes: &[KeyCode::Char('p')],
                 action: Some(UiAction::SwitchView(ViewId::Policies)),
+            },
+            HelpEntry {
+                keys: "T",
+                desc: "open Traffic Tests",
+                codes: &[KeyCode::Char('T')],
+                action: Some(UiAction::SwitchView(ViewId::TrafficTests)),
             },
         ],
     ),
@@ -442,6 +448,30 @@ mod tests {
         assert_eq!(
             translate(&s, press(KeyCode::Char('p'))),
             Some(UiAction::SwitchView(ViewId::Policies))
+        );
+    }
+
+    #[test]
+    fn uppercase_t_opens_traffic_tests_only_in_normal_navigation() {
+        let mut s = state();
+        assert_eq!(
+            translate(&s, press(KeyCode::Char('T'))),
+            Some(UiAction::SwitchView(ViewId::TrafficTests))
+        );
+        assert_eq!(
+            translate(&s, press(KeyCode::Char('t'))),
+            Some(UiAction::ToggleConfigView)
+        );
+        s.mode = InputMode::Filter;
+        assert_eq!(
+            translate(&s, press(KeyCode::Char('T'))),
+            Some(UiAction::InputChar('T'))
+        );
+        s.mode = InputMode::Normal;
+        s.overlays.push(Overlay::Palette(PaletteState::default()));
+        assert_eq!(
+            translate(&s, press(KeyCode::Char('T'))),
+            Some(UiAction::PaletteInput('T'))
         );
     }
 

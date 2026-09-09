@@ -117,7 +117,7 @@ impl TrafficPresentation {
         match &self.suite {
             SuiteState::NotLoaded => "Not loaded. Enter Traffic Tests to load the default suite.".into(),
             SuiteState::Loading(_) => "Loading default suite…".into(),
-            SuiteState::Missing => "No default suite exists. No file was created. Use a new scenario (a), or choose a template from the palette (:). Review, then explicitly Save to create the local default suite.".into(),
+            SuiteState::Missing => "No default suite exists. No file was created. Open templates (a). Review, then explicitly Save to create the local default suite.".into(),
             SuiteState::UnsupportedSchema(version) => format!("Unsupported future schema {version}. Suite preserved; use a compatible FWDeck version."),
             SuiteState::Failed(reason) => format!("Default suite unavailable: {reason:?}. Check the suite, then reload (r)."),
             SuiteState::Available(_) => String::new(),

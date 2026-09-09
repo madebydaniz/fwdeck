@@ -269,7 +269,7 @@ impl ViewId {
             Self::Direct => "8",
             Self::Logs => "9",
             Self::Policies => "p",
-            Self::TrafficTests => ":",
+            Self::TrafficTests => "T",
         }
     }
 

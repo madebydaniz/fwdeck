@@ -73,6 +73,12 @@ cargo test traffic_shell --lib
 cargo test native_completed_and_malformed_report_records_never_serialize_private_inputs --lib
 ```
 
+For Traffic Tests UI changes, also run the keymap, palette, components,
+overlays and traffic details tests. Check `Shift+t` navigation, the `a`
+template chooser, independent evaluation targets, and current-versus-historical
+evidence. TestBackend coverage at multiple terminal sizes does not replace
+manual acceptance with `make run-offline`.
+
 Changes affecting the optional backend must also pass:
 
 ```bash

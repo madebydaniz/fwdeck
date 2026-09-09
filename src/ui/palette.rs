@@ -25,6 +25,8 @@ pub enum Category {
     Firewall,
     /// Application-level commands (help, filters, snapshots, plans).
     App,
+    /// Unsaved traffic-test scenario templates.
+    Template,
 }
 
 impl Category {
@@ -35,6 +37,7 @@ impl Category {
             Self::Views => "view",
             Self::Firewall => "firewall",
             Self::App => "app",
+            Self::Template => "template",
         }
     }
 }
@@ -67,12 +70,23 @@ pub struct PaletteCommand {
 }
 
 /// Palette overlay state (query + selection into the filtered list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaletteScope {
+    /// Every command available in the ordinary command palette.
+    #[default]
+    All,
+    /// Only traffic-test scenario templates.
+    TrafficTemplates,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PaletteState {
     /// Current fuzzy-search query.
     pub query: String,
     /// Selected index into the filtered command list.
     pub selected: usize,
+    /// Typed catalog boundary retained even when the query is cleared.
+    pub scope: PaletteScope,
 }
 
 /// Positional constructor for a catalog entry.
@@ -805,10 +819,10 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
         ] {
             commands.push(cmd(
                 UiAction::TrafficEdit(A::New(template)),
-                title,
+                format!("Traffic test: {title}"),
                 "Unsaved local scenario; explicit source and review required",
-                &["traffic", "new", "scenario"],
-                Category::App,
+                &["traffic", "template", "new", "scenario"],
+                Category::Template,
                 if can_add {
                     Availability::Enabled
                 } else {
@@ -886,10 +900,13 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
 /// Catalog filtered and ranked against the open palette's query.
 #[must_use]
 pub fn filtered(state: &UiState) -> Vec<PaletteCommand> {
-    let query = state.palette().map_or("", |palette| palette.query.as_str());
+    let palette = state.palette();
+    let query = palette.map_or("", |palette| palette.query.as_str());
+    let scope = palette.map_or(PaletteScope::All, |palette| palette.scope);
     let mut ranked: Vec<(i32, usize, PaletteCommand)> = catalog(state)
         .into_iter()
         .enumerate()
+        .filter(|(_, command)| scope == PaletteScope::All || command.category == Category::Template)
         .filter_map(|(index, command)| {
             let best = std::iter::once(command.title.as_str())
                 .chain(command.keywords.iter().copied())
@@ -956,8 +973,9 @@ mod tests {
                     &state,
                     crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char(character)),
                 );
-                assert!(
-                    !matches!(action, Some(super::UiAction::SwitchView(view)) if view.title() == "Traffic Tests")
+                assert_eq!(
+                    matches!(action, Some(super::UiAction::SwitchView(view)) if view.title() == "Traffic Tests"),
+                    character == 'T'
                 );
             }
         }
@@ -971,6 +989,7 @@ mod tests {
         state.overlays.push(Overlay::Palette(PaletteState {
             query: query.to_owned(),
             selected: 0,
+            ..PaletteState::default()
         }));
         state
     }
@@ -979,6 +998,69 @@ mod tests {
     fn empty_query_lists_the_full_catalog() {
         let state = state_with_palette("");
         assert_eq!(filtered(&state).len(), catalog(&state).len());
+    }
+
+    #[test]
+    fn template_scope_never_leaks_unrelated_commands() {
+        let mut state = state_with_palette("");
+        state.view = ViewId::TrafficTests;
+        state.overlays = vec![Overlay::Palette(PaletteState {
+            scope: PaletteScope::TrafficTemplates,
+            ..PaletteState::default()
+        })];
+        let commands = filtered(&state);
+        assert_eq!(commands.len(), 4);
+        assert!(commands.iter().all(|command| {
+            command.category == Category::Template && command.title.starts_with("Traffic test: ")
+        }));
+    }
+
+    #[test]
+    fn traffic_template_picker_closes_without_changing_suite() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        state.view = ViewId::TrafficTests;
+        let suite_before = state.traffic.suite.clone();
+        crate::ui::update::update(&mut state, UiAction::OpenTrafficTemplates);
+        let palette = state.palette().expect("template picker did not open");
+        assert_eq!(palette.scope, PaletteScope::TrafficTemplates);
+        crate::ui::update::update(&mut state, UiAction::CloseOverlay);
+        assert!(state.overlays.is_empty());
+        assert_eq!(state.traffic.suite, suite_before);
+    }
+
+    #[test]
+    fn template_search_preserves_disabled_reason() {
+        let mut state = state_with_palette("ssh");
+        state.view = ViewId::TrafficTests;
+        state.overlays = vec![Overlay::Palette(PaletteState {
+            query: "ssh".into(),
+            scope: PaletteScope::TrafficTemplates,
+            ..PaletteState::default()
+        })];
+        let command = filtered(&state).into_iter().next().expect("SSH template");
+        assert_eq!(command.title, "Traffic test: Keep SSH access");
+        assert!(matches!(command.availability, Availability::Disabled(_)));
+    }
+
+    #[test]
+    fn ordinary_palette_finds_enabled_template_category() {
+        let mut state = state_with_palette("template");
+        state.view = ViewId::TrafficTests;
+        state.traffic.suite = crate::application::SuiteState::Missing;
+        let commands = filtered(&state);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.category == Category::Template)
+                .count(),
+            4
+        );
+        assert!(
+            commands
+                .iter()
+                .filter(|command| command.category == Category::Template)
+                .all(|command| command.availability == Availability::Enabled)
+        );
     }
 
     #[test]

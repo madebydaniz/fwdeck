@@ -24,8 +24,11 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
                 "Traffic audit backlog full; evaluation paused until persistence progresses".into()
             })
         });
+    let header_text = "Configuration evaluation (configuration-only)\nLive connectivity: NOT VERIFIED\nRequired safety gates: not enforced in Phase 2\ne run · r reload · t target · a templates\nE edit · d delete · Space toggle";
+    let header_lines = wrap(header_text, usize::from(inner.width));
+    let header_height = u16::try_from(header_lines.len()).unwrap_or(u16::MAX);
     let [header, audit_area, error_area, body] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(header_height),
         Constraint::Length(u16::from(audit_error.is_some())),
         Constraint::Length(u16::from(state.traffic.error.is_some())),
         Constraint::Min(1),
@@ -39,7 +42,7 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
             audit_area,
         );
     }
-    frame.render_widget(Paragraph::new("Configuration evaluation\nLive connectivity: NOT VERIFIED\nRequired safety gates: not enforced in Phase 2\ne run  r reload  t target  a new  E edit  d del  Space toggle").wrap(Wrap { trim: false }), header);
+    frame.render_widget(Paragraph::new(header_lines), header);
     if let Some(error) = &state.traffic.error {
         frame.render_widget(
             Paragraph::new(error.as_str())

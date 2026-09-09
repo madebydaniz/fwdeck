@@ -237,10 +237,11 @@ search every view at once.</div>
 runtime-vs-permanent state (<code>synced</code> / <code>different</code>),
 LogDenied, and live counters (zones, active, denied this session).</li>
 <li><strong>Breadcrumb</strong> — where you are: zone › view · scope ·
-<code>[viewing: runtime|permanent]</code> perspective.</li>
-<li><strong>Views sidebar</strong> — eleven shortcut views with row counts;
-switch with <kbd>0</kbd>–<kbd>9</kbd>, and <kbd>p</kbd> for Policies. The opt-in
-<a href="#traffic-tests">Traffic Tests</a> workspace opens from the palette.</li>
+<code>[viewing: runtime|permanent]</code> perspective. Traffic Tests instead shows
+its own runtime/permanent evaluation target.</li>
+<li><strong>Views sidebar</strong> — twelve views with row counts;
+switch with <kbd>0</kbd>–<kbd>9</kbd>, <kbd>p</kbd> for Policies, or
+<kbd>Shift+t</kbd> for <a href="#traffic-tests">Traffic Tests</a>.</li>
 <li><strong>Table</strong> — the current view's rows. Inactive zones are dimmed;
 the <code>≠</code> marker means that row differs between runtime and permanent.</li>
 <li><strong>Status bar</strong> — mutation target and the three always-on
@@ -253,9 +254,9 @@ Details, use <kbd>↑</kbd>/<kbd>↓</kbd> when the title shows a scroll indicat
 
 <section id="views">
 <h2>Views — the complete guide</h2>
-<p>Eleven shortcut views, switched with <kbd>0</kbd>–<kbd>9</kbd> plus
-<kbd>p</kbd> for Policies (or the sidebar), and the palette-only
-<a href="#traffic-tests">Traffic Tests</a> workspace. Each
+<p>Twelve views, switched with <kbd>0</kbd>–<kbd>9</kbd> plus
+<kbd>p</kbd> for Policies and <kbd>Shift+t</kbd> for
+<a href="#traffic-tests">Traffic Tests</a>. Each
 section below shows the view, explains what it is for, and walks through every
 action with a hands-on example. Every mutation opens a confirmation first —
 <kbd>y</kbd> applies, <kbd>s</kbd> stages it for a batch, <kbd>n</kbd> cancels.</p>
@@ -509,10 +510,10 @@ rollback flow. Older or unknown firewalld versions are blocked explicitly.</p>
 not automatically govern the reverse direction. See the
 <a href="https://firewalld.org/documentation/man-pages/firewalld.policies">official firewalld policy model</a>.</p>
 
-<h3>: · Traffic Tests</h3>
+<h3>T · Traffic Tests</h3>
 <p><strong>What you see</strong> — reviewed local traffic expectations compared
 with FWDeck's current runtime or permanent configuration model. This workspace
-is deliberately opt-in and has no digit or letter shortcut; open
+is deliberately opt-in; open it with <kbd>Shift+t</kbd> (uppercase T), or
 <kbd>:</kbd> → <em>Go to Traffic Tests</em>. See the
 <a href="#traffic-tests">operator guide</a> for the workflow, result meanings,
 storage, and audit boundaries.</p>
@@ -528,13 +529,16 @@ service answered, or that routing outside the modeled host path works.</div>
 
 <h3>Open, create, and save a suite</h3>
 <ol>
-<li>Press <kbd>:</kbd>, choose <em>Go to Traffic Tests</em>, and press
-<kbd>enter</kbd>. Merely opening the workspace reads the default local suite; a
+<li>Press <kbd>Shift+t</kbd>, or select <em>Go to Traffic Tests</em> in the
+palette. Merely opening the workspace reads the default local suite; a
 missing suite stays missing and no file is created.</li>
-<li>Press <kbd>a</kbd> for a custom host-ingress scenario, or use the palette
-for <em>Keep SSH access</em>, <em>Allow service exposure</em>, or
-<em>Block unwanted access</em>. Every template is only a draft. Enter an
-explicit source IP/CIDR and review every field.</li>
+<li>Press <kbd>a</kbd> to open the Traffic test templates chooser. Select
+<em>Keep SSH access</em>, <em>Allow service exposure</em>,
+<em>Block unwanted access</em>, or <em>Custom host traffic</em>, then press
+<kbd>enter</kbd>. These commands also appear in the workspace palette with a
+<em>Traffic test:</em> prefix and a <em>template</em> category; search for
+<code>template</code> to find them. Every selection creates only an unsaved
+draft. Enter an explicit source IP/CIDR and review every field.</li>
 <li>In the editor, use <kbd>tab</kbd>/<kbd>shift-tab</kbd> or arrows to move,
 left/right to change choices, and <kbd>enter</kbd> to review. Press <kbd>y</kbd>
 only from the review screen to save; <kbd>esc</kbd> returns without saving.</li>
@@ -558,9 +562,12 @@ Allow or Block; <strong>NotRun</strong> has no matching run (or is disabled);
 snapshot, or phase no longer matches.</li>
 </ul>
 <p>Each run is bound to its run ID, suite ID and revision, runtime/permanent
-target, authoritative snapshot identity, and evaluation phase. Details show
-expected versus actual, the typed Unknown reason where applicable, and the
-ordered evidence trace. A details dialog is immutable once opened: after a
+target, authoritative snapshot identity, and evaluation phase. Details start
+with a summary of the status, target and expected/current outcome, with the
+reason and next step when needed. Scenario inputs come next; technical identity,
+historical evidence and the ordered trace are below. Scroll to inspect the full
+evidence. Historical decisions are not current outcomes, and historical scenario
+inputs are not retained. A details dialog is immutable once opened: after a
 reload, target change, or new authoritative observation, close and reopen it.
 Reload the suite or refresh the firewall as appropriate, then press
 <kbd>e</kbd> to produce a fresh context; a stale Pass is never current proof.</p>
@@ -671,7 +678,7 @@ anything is applied.</p>
 <p>Experiment freely, then <kbd>:</kbd> → <em>Runtime to permanent</em> to
 persist what worked.</p>
 <h3>Evaluate a reviewed traffic expectation</h3>
-<p><kbd>:</kbd> → <em>Go to Traffic Tests</em> → create or reload a reviewed
+<p><kbd>Shift+t</kbd> → <kbd>a</kbd> to choose a template, or reload a reviewed
 suite → choose runtime/permanent with <kbd>t</kbd> → evaluate with <kbd>e</kbd>.
 Treat the result as configuration evidence and follow the
 <a href="#traffic-tests">Traffic Tests operator guide</a> before relying on it.</p>
@@ -797,9 +804,10 @@ all filtering and regain access, then reconcile and restart it.</li>
 <table>
 <tr><th>Key</th><th>Action</th></tr>
 <tr><td><kbd>0</kbd>–<kbd>9</kbd></td><td>switch view (clears filter)</td></tr>
+<tr><td><kbd>p</kbd> / <kbd>Shift+t</kbd></td><td>open Policies / Traffic Tests</td></tr>
 <tr><td><kbd>j</kbd>/<kbd>k</kbd>, arrows, <kbd>g</kbd>/<kbd>G</kbd>, PgUp/PgDn</td><td>navigate rows</td></tr>
 <tr><td><kbd>enter</kbd></td><td>zone overview (Zones) / row details</td></tr>
-<tr><td><kbd>a</kbd></td><td>add entry for the current view</td></tr>
+<tr><td><kbd>a</kbd></td><td>add entry for the current view; choose a template in Traffic Tests</td></tr>
 <tr><td><kbd>d</kbd></td><td>delete selected — or all marked — entries (confirmed)</td></tr>
 <tr><td><kbd>space</kbd></td><td>mark row (multi-select)</td></tr>
 <tr><td><kbd>c</kbd></td><td>clone selected entry into a prefilled form</td></tr>

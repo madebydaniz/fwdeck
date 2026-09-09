@@ -192,14 +192,22 @@ pub fn render_breadcrumb(f: &mut Frame, area: Rect, state: &UiState, theme: &The
     if !filter.is_empty() {
         spans.push(Span::styled(format!("  /{filter}"), theme.warn()));
     }
-    spans.push(Span::styled(
-        format!("  · {}", state.target.label()),
-        theme.muted(),
-    ));
-    if state.config_view == crate::domain::ConfigurationTarget::Permanent {
-        spans.push(Span::styled("  [viewing: permanent]", theme.warn()));
+    if state.view == ViewId::TrafficTests {
+        let target = match state.traffic.target {
+            crate::domain::EvaluationTarget::Runtime => "runtime",
+            crate::domain::EvaluationTarget::Permanent => "permanent",
+        };
+        spans.push(Span::styled(format!("  · {target}"), theme.muted()));
     } else {
-        spans.push(Span::styled("  [viewing: runtime]", theme.muted()));
+        spans.push(Span::styled(
+            format!("  · {}", state.target.label()),
+            theme.muted(),
+        ));
+        if state.config_view == crate::domain::ConfigurationTarget::Permanent {
+            spans.push(Span::styled("  [viewing: permanent]", theme.warn()));
+        } else {
+            spans.push(Span::styled("  [viewing: runtime]", theme.muted()));
+        }
     }
     let marked = state.view_state().marked.len();
     if marked > 0 {
@@ -604,12 +612,12 @@ mod tests {
 
     use crate::application::{RefreshId, RefreshOverview};
     use crate::config::Config;
-    use crate::domain::{Scoped, mock};
+    use crate::domain::{ConfigurationTarget, EvaluationTarget, Scoped, mock};
     use crate::ui::state::{RefreshOverviewState, UiState};
     use crate::ui::theme::{Theme, Variant};
     use crate::ui::views::ViewId;
 
-    use super::{refresh_activity_label, render_table};
+    use super::{refresh_activity_label, render_breadcrumb, render_table};
 
     fn overview() -> Arc<RefreshOverview> {
         let snapshot = mock::sample().unwrap();
@@ -641,6 +649,30 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn traffic_breadcrumb_uses_evaluation_target_without_config_view_chip() {
+        let mut state = UiState::new(&Config::default(), "test".to_owned(), false, None);
+        state.view = ViewId::TrafficTests;
+        state.traffic.target = EvaluationTarget::Permanent;
+        state.target = ConfigurationTarget::Runtime;
+        state.config_view = ConfigurationTarget::Runtime;
+        let mut terminal = Terminal::new(TestBackend::new(120, 3)).unwrap();
+        let theme = Theme::new(Variant::Dracula, true, true);
+        terminal
+            .draw(|frame| render_breadcrumb(frame, frame.area(), &state, &theme))
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(content.contains("Traffic Tests"));
+        assert!(content.contains("permanent"));
+        assert!(!content.contains("viewing:"));
     }
 
     #[test]
