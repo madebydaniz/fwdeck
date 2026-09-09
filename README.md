@@ -119,6 +119,10 @@ cargo install --git https://github.com/madebydaniz/fwdeck --locked
   snapshot/session diffs, pinning, and bounded enterprise retention.
 - 🧯 **Offline mode** (`--offline`) — fix the permanent config from rescue/chroot,
   no daemon needed.
+- 🧪 **Traffic Tests** — opt-in, read-only evaluation of reviewed host-ingress
+  expectations against the current runtime or permanent configuration. Results
+  do not prove live connectivity; a separate private audit stores aggregate
+  lifecycle outcomes only, never scenario inputs, names, notes, or traces.
 
 <details>
 <summary><strong>Full feature list</strong></summary>
@@ -163,6 +167,7 @@ Every release is tested against a **real firewalld daemon** in CI on:
 - [Getting started](https://madebydaniz.github.io/fwdeck/docs/#introduction)
 - [Installation & release verification](https://madebydaniz.github.io/fwdeck/docs/#installation)
 - [The interface & views](https://madebydaniz.github.io/fwdeck/docs/#interface)
+- [Traffic Tests operator guide](https://madebydaniz.github.io/fwdeck/docs/#traffic-tests)
 - [Workflows — multi-step tasks, exact keystrokes](https://madebydaniz.github.io/fwdeck/docs/#workflows)
 - [Safety features](https://madebydaniz.github.io/fwdeck/docs/#safety)
 - [Configuration](https://madebydaniz.github.io/fwdeck/docs/#configuration)

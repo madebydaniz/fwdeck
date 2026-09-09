@@ -3,6 +3,8 @@ use crate::{application::*, config::Config, domain::TrafficSuite};
 use futures_util::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod delivery;
+
 static EDIT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 #[tokio::test]
 async fn traffic_shell_audit_failure_survives_unrelated_presentation_and_success() {

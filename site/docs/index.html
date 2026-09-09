@@ -109,6 +109,7 @@ img.shot{width:100%;border:1px solid var(--line2);border-radius:12px;margin:6px 
   <div class="group">Using FWDeck</div>
   <a href="#interface">The interface</a>
   <a href="#views">Views</a>
+  <a href="#traffic-tests">Traffic Tests</a>
   <a href="#power">Search, diffs &amp; counters</a>
   <a href="#workflows">Workflows</a>
   <a href="#safety">Safety features</a>
@@ -237,8 +238,9 @@ runtime-vs-permanent state (<code>synced</code> / <code>different</code>),
 LogDenied, and live counters (zones, active, denied this session).</li>
 <li><strong>Breadcrumb</strong> — where you are: zone › view · scope ·
 <code>[viewing: runtime|permanent]</code> perspective.</li>
-<li><strong>Views sidebar</strong> — eleven views with row counts; switch with
-<kbd>0</kbd>–<kbd>9</kbd>, and <kbd>p</kbd> for Policies.</li>
+<li><strong>Views sidebar</strong> — eleven shortcut views with row counts;
+switch with <kbd>0</kbd>–<kbd>9</kbd>, and <kbd>p</kbd> for Policies. The opt-in
+<a href="#traffic-tests">Traffic Tests</a> workspace opens from the palette.</li>
 <li><strong>Table</strong> — the current view's rows. Inactive zones are dimmed;
 the <code>≠</code> marker means that row differs between runtime and permanent.</li>
 <li><strong>Status bar</strong> — mutation target and the three always-on
@@ -251,8 +253,9 @@ Details, use <kbd>↑</kbd>/<kbd>↓</kbd> when the title shows a scroll indicat
 
 <section id="views">
 <h2>Views — the complete guide</h2>
-<p>Eleven views, switched with <kbd>0</kbd>–<kbd>9</kbd> plus <kbd>p</kbd> for
-Policies (or the sidebar). Each
+<p>Eleven shortcut views, switched with <kbd>0</kbd>–<kbd>9</kbd> plus
+<kbd>p</kbd> for Policies (or the sidebar), and the palette-only
+<a href="#traffic-tests">Traffic Tests</a> workspace. Each
 section below shows the view, explains what it is for, and walks through every
 action with a hands-on example. Every mutation opens a confirmation first —
 <kbd>y</kbd> applies, <kbd>s</kbd> stages it for a batch, <kbd>n</kbd> cancels.</p>
@@ -505,6 +508,111 @@ rollback flow. Older or unknown firewalld versions are blocked explicitly.</p>
 <p>Policies are stateful and unidirectional: an ingress → egress policy does
 not automatically govern the reverse direction. See the
 <a href="https://firewalld.org/documentation/man-pages/firewalld.policies">official firewalld policy model</a>.</p>
+
+<h3>: · Traffic Tests</h3>
+<p><strong>What you see</strong> — reviewed local traffic expectations compared
+with FWDeck's current runtime or permanent configuration model. This workspace
+is deliberately opt-in and has no digit or letter shortcut; open
+<kbd>:</kbd> → <em>Go to Traffic Tests</em>. See the
+<a href="#traffic-tests">operator guide</a> for the workflow, result meanings,
+storage, and audit boundaries.</p>
+</section>
+
+<section id="traffic-tests">
+<h2>Traffic Tests operator guide</h2>
+<div class="note warn"><strong>Configuration evidence, not a network probe.</strong>
+Traffic Tests evaluate an immutable firewalld snapshot locally. A
+<strong>Pass</strong> means the supported configuration model proves the expected
+decision; it does not prove that packets crossed the network, that a remote
+service answered, or that routing outside the modeled host path works.</div>
+
+<h3>Open, create, and save a suite</h3>
+<ol>
+<li>Press <kbd>:</kbd>, choose <em>Go to Traffic Tests</em>, and press
+<kbd>enter</kbd>. Merely opening the workspace reads the default local suite; a
+missing suite stays missing and no file is created.</li>
+<li>Press <kbd>a</kbd> for a custom host-ingress scenario, or use the palette
+for <em>Keep SSH access</em>, <em>Allow service exposure</em>, or
+<em>Block unwanted access</em>. Every template is only a draft. Enter an
+explicit source IP/CIDR and review every field.</li>
+<li>In the editor, use <kbd>tab</kbd>/<kbd>shift-tab</kbd> or arrows to move,
+left/right to change choices, and <kbd>enter</kbd> to review. Press <kbd>y</kbd>
+only from the review screen to save; <kbd>esc</kbd> returns without saving.</li>
+</ol>
+<p>Inside the workspace, <kbd>E</kbd> edits the selected scenario,
+<kbd>d</kbd> reviews deletion, <kbd>space</kbd> reviews enable/disable,
+<kbd>r</kbd> reloads only the suite file, <kbd>e</kbd> evaluates,
+<kbd>t</kbd> switches runtime/permanent, and <kbd>enter</kbd> opens result
+details. Normal row navigation and filtering still apply. Suite editing and
+evaluation remain available in <code>--read-only</code> mode because they do not
+mutate firewalld.</p>
+
+<h3>Read the result without overstating it</h3>
+<ul>
+<li><strong>Expected</strong> is the operator's Allow/Block declaration;
+<strong>Actual</strong> is the decision proven from the selected configuration.</li>
+<li><strong>Pass</strong> matches a proven decision; <strong>Fail</strong>
+contradicts it; <strong>Indeterminate</strong> means the evaluator cannot prove
+Allow or Block; <strong>NotRun</strong> has no matching run (or is disabled);
+<strong>Stale</strong> is historical evidence whose suite revision, target,
+snapshot, or phase no longer matches.</li>
+</ul>
+<p>Each run is bound to its run ID, suite ID and revision, runtime/permanent
+target, authoritative snapshot identity, and evaluation phase. Details show
+expected versus actual, the typed Unknown reason where applicable, and the
+ordered evidence trace. A details dialog is immutable once opened: after a
+reload, target change, or new authoritative observation, close and reopen it.
+Reload the suite or refresh the firewall as appropriate, then press
+<kbd>e</kbd> to produce a fresh context; a stale Pass is never current proof.</p>
+<p><code>required_safety_gate</code> is metadata only in this phase. Traffic
+Tests do not enforce mutation gates, add a preflight packet probe, or add
+post-apply rollback verification. Normal mutation confirmation and the existing
+watchdog/dead-man's-switch behavior are unchanged. Application
+<code>fwdeck --offline</code> permits permanent evaluation only. Runtime results
+require an available authoritative daemon snapshot; FWDeck does not promise a
+runtime result when the daemon or required data is unavailable.</p>
+
+<h3>Default suite file</h3>
+<p>The single suite is schema&nbsp;1 at
+<code>&lt;resolved-config-dir&gt;/traffic-tests/default.toml</code>. On Linux the
+resolved directory is normally <code>$XDG_CONFIG_HOME/fwdeck</code> (or
+<code>~/.config/fwdeck</code>); other platforms use the existing native FWDeck
+configuration-directory fallback. The file stores at most 1000 scenarios and
+is capped at 1&nbsp;MiB. On Unix, FWDeck creates the directory as
+<code>0700</code> and the file as <code>0600</code>.</p>
+<p>Every accepted save checks both the loaded revision and a fingerprint of the
+exact bytes. If another process or operator changed either, FWDeck keeps the
+draft and requires an explicit discard/reload before another save. Malformed,
+oversized, unsafe, and future-schema files are unavailable for editing and are
+not overwritten; correct or open them with a compatible FWDeck version, then
+reload.</p>
+
+<h3>Traffic evaluation audit</h3>
+<p>Completed, failed, and cancelled evaluation lifecycles append to
+<code>&lt;resolved-state-dir&gt;/traffic-audit/audit.jsonl</code>; rotated files and
+<code>.lock</code> stay in that same private directory. On Linux the state root
+is normally <code>$XDG_STATE_HOME/fwdeck</code> (or
+<code>~/.local/state/fwdeck</code>). Records contain aggregate counts, typed
+Unknown-reason counts, configuration target/phase and bounded opaque lifecycle
+identities. They exclude scenario IDs and inputs, suite/scenario names, notes,
+traces, and raw worker or operating-system errors. <code>elapsed_ms</code> is
+end-to-end evaluation lifecycle time, not CPU time or packet/probe latency.</p>
+<p>Each serialized record is limited to 16&nbsp;KiB. The writer reserves at most
+64 active/queued/in-flight records; saturation rejects a new evaluation without
+changing its identity. Busy, storage, persistence, worker-failure, and
+record-too-large conditions are typed, and the first observed persistence gap
+remains sticky even after a later successful write.</p>
+<p><code>retention.audit.max_file_size_mb</code> rotates this collection and
+<code>retention.audit.max_files</code> bounds it independently, including the
+active <code>audit.jsonl</code>. The traffic writer applies this nested
+retention after writes. <code>fwdeck prune</code> currently manages the separate
+top-level operation-audit collection and does not automatically prune
+<code>traffic-audit/</code>.</p>
+<p>The operation audit remains distinct: it records applied firewall operations
+and exact invocations, and may contain addresses. If shutdown reports a traffic
+audit failure or deadline, the evaluation audit may be incomplete. FWDeck does
+not automatically retry an uncertain durable write, because doing so could
+duplicate a record.</p>
 </section>
 
 <section id="power">
@@ -562,6 +670,11 @@ anything is applied.</p>
 <pre><span class="g">$</span> fwdeck --target runtime   <span class="c"># a reboot reverts everything</span></pre>
 <p>Experiment freely, then <kbd>:</kbd> → <em>Runtime to permanent</em> to
 persist what worked.</p>
+<h3>Evaluate a reviewed traffic expectation</h3>
+<p><kbd>:</kbd> → <em>Go to Traffic Tests</em> → create or reload a reviewed
+suite → choose runtime/permanent with <kbd>t</kbd> → evaluate with <kbd>e</kbd>.
+Treat the result as configuration evidence and follow the
+<a href="#traffic-tests">Traffic Tests operator guide</a> before relying on it.</p>
 <h3>Panic button</h3>
 <p><kbd>:</kbd> → <code>panic</code> → confirm. Drops all traffic; the same
 command turns it off.</p>
@@ -875,10 +988,13 @@ container kernels can't emit netfilter logs at all.</p>
 binding permanent, or set the zone on the NM connection itself.</p>
 <h3>Where are logs, audit, snapshots?</h3>
 <p><code>~/.local/state/fwdeck/</code> — <code>fwdeck.log</code>,
-<code>audit.jsonl</code> plus bounded timestamped archives,
-<code>snapshots/</code>, and versioned <code>exports/</code>. Files are private;
-<code>fwdeck doctor</code> reports recognized file counts, bytes, pin state, and
-how many files the current retention policy would prune.</p>
+the operation <code>audit.jsonl</code> plus bounded timestamped archives, the
+separately retained aggregate Traffic Tests audit under
+<code>traffic-audit/</code>, <code>snapshots/</code>, and versioned
+<code>exports/</code>. Files are private. For recognized top-level collections,
+<code>fwdeck doctor</code> reports file counts, bytes, pin state, and how many
+files the current retention policy would prune; Traffic Tests writer retention
+manages its nested audit collection.</p>
 </section>
 
 <section id="development">

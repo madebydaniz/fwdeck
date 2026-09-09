@@ -2,6 +2,8 @@ use super::*;
 use crate::application::traffic_test_audit::{
     TrafficAuditError, TrafficAuditSink, TrafficAuditSummary,
 };
+use crate::application::{SnapshotGeneration, SnapshotIdentity};
+use crate::domain::{TrafficDestination, TrafficScenarioId, UnknownReason};
 
 #[derive(Default)]
 struct Sink(Mutex<Vec<String>>);
@@ -174,12 +176,28 @@ async fn blocked_audit_reservations_reject_without_identity_change_and_keep_loca
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn native_completed_and_malformed_report_records_never_serialize_private_inputs() {
+    const SUITE_NAME: &str = "private-suite-name-marker";
+    const SCENARIO_ID: &str = "private-scenario-id-marker";
+    const SCENARIO_NAME: &str = "private-scenario-name-marker";
+    const SOURCE: &str = "198.51.100.222";
+    const DESTINATION: &str = "192.0.2.222";
+    const NOTE: &str = "private-note-marker";
+    const TRACE_OBJECT: &str = "private-zone-ref";
     for malformed in [false, true] {
         let sink = Arc::new(Sink::default());
         let mut suite = scenario_suite().as_ref().clone();
-        suite.name = "private-suite-name-marker".into();
-        suite.scenarios[0].name = "private-scenario-name-marker".into();
+        suite.name = SUITE_NAME.into();
+        suite.scenarios[0].id = TrafficScenarioId::parse(SCENARIO_ID).unwrap();
+        suite.scenarios[0].name = SCENARIO_NAME.into();
+        suite.scenarios[0].source = crate::domain::SourceAddress::parse(SOURCE).unwrap();
+        suite.scenarios[0].destination =
+            TrafficDestination::Address(crate::domain::SourceAddress::parse(DESTINATION).unwrap());
+        suite.scenarios[0].ingress_zone =
+            Some(crate::domain::ZoneName::parse(TRACE_OBJECT).unwrap());
+        suite.scenarios[0].note = Some(NOTE.into());
+        suite.validate().unwrap();
         let coordinator = if malformed {
             TrafficTestCoordinator::spawn_with_evaluator(Arc::new(MalformedEvaluator))
         } else {
@@ -193,26 +211,126 @@ async fn native_completed_and_malformed_report_records_never_serialize_private_i
         service.audit =
             crate::application::traffic_test_audit::writer::AuditWriter::new(Some(sink.clone()));
         load(&mut service).await;
-        service.observe(observation(1)).unwrap();
+        let SuiteState::Available(accepted) = service.workspace().suite_state() else {
+            panic!("seeded suite was not accepted")
+        };
+        let accepted_scenario = &accepted.scenarios[0];
+        assert_eq!(accepted.name, SUITE_NAME);
+        assert_eq!(accepted_scenario.id.as_str(), SCENARIO_ID);
+        assert_eq!(accepted_scenario.name, SCENARIO_NAME);
+        assert_eq!(accepted_scenario.source.to_string(), SOURCE);
+        assert!(matches!(
+            &accepted_scenario.destination,
+            TrafficDestination::Address(address) if address.to_string() == DESTINATION
+        ));
+        assert_eq!(accepted_scenario.note.as_deref(), Some(NOTE));
+        assert_eq!(
+            accepted_scenario
+                .ingress_zone
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some(TRACE_OBJECT)
+        );
+        let mut snapshot = crate::domain::mock::sample().unwrap();
+        let marker_zone = crate::domain::ZoneName::parse(TRACE_OBJECT).unwrap();
+        snapshot.runtime.insert(
+            marker_zone.clone(),
+            crate::domain::ZoneDetails::empty(marker_zone),
+        );
+        let observed = ObservedSnapshot::new(
+            SnapshotIdentity::new(
+                RefreshId::new(1),
+                SnapshotGeneration::new(std::num::NonZeroU64::MIN),
+            ),
+            Arc::new(snapshot),
+        );
+        service.observe(observed).unwrap();
         service.try_evaluate().unwrap();
         let context = service.workspace.active_context().unwrap().clone();
         while service.workspace.active_context().is_some() {
             service.next_event().await.unwrap();
         }
+        if malformed {
+            assert!(matches!(
+                service.workspace().evaluation_state(),
+                EvaluationState::Failed {
+                    reason: WorkspaceFailure::WorkerFailed,
+                    ..
+                }
+            ));
+        } else {
+            let EvaluationState::Completed(report) = service.workspace().evaluation_state() else {
+                panic!("native evaluation did not complete")
+            };
+            assert_eq!(report.context(), &context);
+            assert_eq!(report.results().len(), 1);
+            let result = &report.results()[0];
+            assert_eq!(result.scenario_id().as_str(), SCENARIO_ID);
+            assert_eq!(result.decision(), FirewallDecision::Unknown);
+            assert_eq!(
+                result.status(),
+                crate::domain::TrafficTestStatus::Indeterminate
+            );
+            assert_eq!(
+                result.unknown_reason(),
+                Some(UnknownReason::ExternalRulesOutsideModel)
+            );
+            assert!(result.trace().iter().any(|step| {
+                matches!(
+                    step.object(),
+                    Some(crate::domain::TraceObjectRef::Zone(zone))
+                        if zone.as_str() == TRACE_OBJECT
+                )
+            }));
+        }
         service.shutdown().await.unwrap();
         let records = sink.0.lock().unwrap();
         assert_eq!(records.len(), 1);
         for marker in [
-            "private-suite-name-marker",
-            "private-scenario-name-marker",
+            SUITE_NAME,
+            SCENARIO_ID,
+            SCENARIO_NAME,
+            SOURCE,
+            DESTINATION,
+            NOTE,
+            TRACE_OBJECT,
             "scenario_id",
             "trace",
             "source",
             "destination",
+            "private-worker-error-marker",
         ] {
             assert!(!records[0].contains(marker), "forbidden marker {marker}");
         }
         let record: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
+        let keys: std::collections::BTreeSet<_> = record
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut expected_keys: std::collections::BTreeSet<_> = [
+            "schema",
+            "kind",
+            "application_version",
+            "session",
+            "timestamp_unix_ms",
+            "context",
+            "outcome",
+            "elapsed_ms",
+            "known_total",
+            "counts",
+            "unknown_reasons",
+            "configuration_only",
+            "live_connectivity_verified",
+        ]
+        .into_iter()
+        .collect();
+        if malformed {
+            expected_keys.insert("reason");
+        }
+        assert_eq!(keys, expected_keys);
         assert_eq!(record["context"], serde_json::to_value(context).unwrap());
         assert_eq!(
             record["outcome"],
@@ -221,9 +339,30 @@ async fn native_completed_and_malformed_report_records_never_serialize_private_i
         assert_eq!(record["known_total"], 1);
         if malformed {
             assert!(record["counts"].is_null());
+            assert_eq!(record["reason"], "malformed_report");
+            assert_eq!(record["unknown_reasons"], serde_json::json!([]));
         } else {
-            assert_eq!(record["counts"]["total"], 1);
+            assert_eq!(
+                record["counts"],
+                serde_json::json!({
+                    "total": 1,
+                    "passed": 0,
+                    "failed": 0,
+                    "indeterminate": 1,
+                    "not_run": 0,
+                    "stale": 0
+                })
+            );
+            assert_eq!(
+                record["unknown_reasons"],
+                serde_json::json!([{
+                    "reason": "external_rules_outside_model",
+                    "count": 1
+                }])
+            );
         }
+        assert_eq!(record["configuration_only"], true);
+        assert_eq!(record["live_connectivity_verified"], false);
     }
 }
 
