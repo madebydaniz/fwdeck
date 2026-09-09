@@ -35,8 +35,7 @@ impl TrafficAuditSink for FileTrafficAuditSink {
         private_directory(root)?;
         let dir = root.join("traffic-audit");
         private_directory(&dir)?;
-        let lock = open_private(&dir.join(".lock"))?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| TrafficAuditError::Busy)?;
+        let _lock = AuditLock::acquire(&dir.join(".lock"))?;
         let path = dir.join("audit.jsonl");
         validate_leaf(&path)?;
         super::rotate_if_large(
@@ -58,6 +57,23 @@ impl TrafficAuditSink for FileTrafficAuditSink {
             .map_err(|_| TrafficAuditError::Persistence)?;
         crate::infrastructure::retention::prune_audit_root(&dir, self.retention.max_files)
             .map_err(|_| TrafficAuditError::Persistence)
+    }
+}
+
+struct AuditLock(std::fs::File);
+
+impl AuditLock {
+    fn acquire(path: &Path) -> Result<Self, TrafficAuditError> {
+        let file = open_private(path)?;
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|_| TrafficAuditError::Busy)?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for AuditLock {
+    fn drop(&mut self) {
+        // Closing alone can leave a flock held by a duplicated or inherited descriptor.
+        let _ = fs2::FileExt::unlock(&self.0);
     }
 }
 
@@ -231,6 +247,34 @@ mod tests {
         fs2::FileExt::unlock(&lock).unwrap();
         drop(lock);
         sink.append(&record()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_scope_releases_lock_while_a_duplicate_descriptor_remains_open() {
+        let root = Scratch::new();
+        let sink = root.sink(2, 4096);
+        private_directory(&root.0).unwrap();
+        private_directory(&root.0.join("traffic-audit")).unwrap();
+        let lock = AuditLock::acquire(&root.0.join("traffic-audit/.lock")).unwrap();
+        let duplicate = lock.0.try_clone().unwrap();
+        assert_eq!(sink.append(&record()), Err(TrafficAuditError::Busy));
+        assert_eq!(sink.append(&record()), Err(TrafficAuditError::Busy));
+        drop(lock);
+        assert_eq!(sink.append(&record()), Ok(()));
+        assert!(duplicate.metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn failed_append_releases_lock_before_the_next_writer() {
+        let root = Scratch::new();
+        let sink = root.sink(2, 4096);
+        let log = root.0.join("traffic-audit/audit.jsonl");
+        std::fs::create_dir_all(&log).unwrap();
+        assert_eq!(sink.append(&record()), Err(TrafficAuditError::Storage));
+        std::fs::remove_dir(&log).unwrap();
+        assert_eq!(sink.append(&record()), Ok(()));
+        assert_eq!(std::fs::read_to_string(log).unwrap().lines().count(), 1);
     }
 
     #[cfg(unix)]
