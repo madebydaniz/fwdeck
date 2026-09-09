@@ -228,6 +228,7 @@ mod tests {
                 .count(),
             1
         );
+        fs2::FileExt::unlock(&lock).unwrap();
         drop(lock);
         sink.append(&record()).unwrap();
     }
