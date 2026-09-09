@@ -22,6 +22,7 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
             format!(" Traffic Tests({count}) "),
             theme.info(),
         ))
+        .title_bottom(Span::styled(border_hint(area.width), theme.muted()))
         .border_style(theme.border_focused());
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -35,16 +36,10 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
                 "Traffic audit backlog full; evaluation paused until persistence progresses".into()
             })
         });
-    let footer_lines = wrap(
-        "a templates · e run · r reload · t target\nE edit · d delete · Space toggle · Enter details",
-        usize::from(inner.width),
-    );
-    let footer_height = u16::try_from(footer_lines.len()).unwrap_or(u16::MAX);
-    let [audit_area, error_area, body, footer] = Layout::vertical([
+    let [audit_area, error_area, body] = Layout::vertical([
         Constraint::Length(u16::from(audit_error.is_some())),
         Constraint::Length(u16::from(state.traffic.error.is_some())),
         Constraint::Min(1),
-        Constraint::Length(footer_height),
     ])
     .areas(inner);
     if let Some(error) = audit_error {
@@ -55,7 +50,6 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
             audit_area,
         );
     }
-    frame.render_widget(Paragraph::new(footer_lines).style(theme.muted()), footer);
     if let Some(error) = &state.traffic.error {
         frame.render_widget(
             Paragraph::new(error.as_str())
@@ -66,10 +60,7 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
     }
     let rows = state.visible_rows();
     if rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new(empty_message(state)).wrap(Wrap { trim: false }),
-            body,
-        );
+        render_empty(frame, body, state, theme);
         return;
     }
     let wide = body.width >= 105;
@@ -111,6 +102,37 @@ pub(in crate::ui) fn render(frame: &mut Frame, area: Rect, state: &mut UiState, 
     let selected = state.view_state().selected;
     state.view_state_mut().table.select(Some(selected));
     frame.render_stateful_widget(table, body, &mut state.view_state_mut().table);
+}
+
+fn border_hint(width: u16) -> &'static str {
+    let full = " + add test / template (a) · run (e) · reload (r) · target (t) · edit (E) · delete (d) · toggle (Space) ";
+    if Line::from(full).width() <= usize::from(width.saturating_sub(2)) {
+        full
+    } else {
+        " + add test / template (a) · run (e) · : more "
+    }
+}
+
+fn render_empty(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
+    if matches!(
+        state.traffic.suite,
+        SuiteState::Missing | SuiteState::Available(_)
+    ) {
+        super::super::components::render_placeholder(
+            frame,
+            area,
+            Block::default(),
+            empty_message(state),
+            theme.muted(),
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(empty_message(state))
+                .style(theme.muted())
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
 }
 
 fn empty_message(state: &UiState) -> String {

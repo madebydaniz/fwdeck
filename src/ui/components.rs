@@ -415,7 +415,7 @@ pub fn render_table(f: &mut Frame, area: Rect, state: &mut UiState, theme: &Them
     f.render_stateful_widget(table, area, &mut view_state.table);
 }
 
-fn render_placeholder(
+pub(super) fn render_placeholder(
     f: &mut Frame,
     area: Rect,
     block: Block,

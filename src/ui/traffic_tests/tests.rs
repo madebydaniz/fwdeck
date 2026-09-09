@@ -268,21 +268,44 @@ fn traffic_list_has_no_intro_and_keeps_shortcuts_in_footer() {
             text.contains("Case 02"),
             "selected scenario missing: {text}"
         );
-        let footer = lines[usize::from(height.saturating_sub(7))..].join("\n");
-        for expected in [
-            "a templates",
-            "e run",
-            "r reload",
-            "t target",
-            "E edit",
-            "d delete",
-            "Space toggle",
-        ] {
+        let footer = &lines[usize::from(height - 2)];
+        for expected in ["+ add test / template (a)", "run (e)"] {
             assert!(
                 footer.contains(expected),
                 "missing footer key {expected} at {width}x{height}: {text}"
             );
         }
+        assert!(
+            !lines[..usize::from(height - 2)]
+                .iter()
+                .any(|line| line.contains("a templates") || line.contains("Space toggle"))
+        );
+    }
+}
+
+#[test]
+fn traffic_empty_state_matches_logs_placeholder_alignment_and_style() {
+    let theme = crate::ui::theme::Theme::detect(crate::ui::theme::Variant::Mono, false);
+    for (width, height) in [(80, 24), (120, 40), (160, 50)] {
+        let mut state = state();
+        state.traffic.suite = SuiteState::Missing;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| super::render::render(frame, frame.area(), &mut state, &theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let message = "No traffic tests";
+        let x = 1 + (width - 2 - u16::try_from(message.len()).unwrap()) / 2;
+        let rendered: String = (x..x + u16::try_from(message.len()).unwrap())
+            .map(|x| buffer[(x, 3)].symbol())
+            .collect();
+        assert_eq!(rendered, message);
+        assert_eq!(buffer[(x, 3)].fg, theme.muted().fg.unwrap_or_default());
+        let border: String = (0..width)
+            .map(|x| buffer[(x, height - 1)].symbol())
+            .collect();
+        assert!(border.contains("+ add test / template (a)"));
     }
 }
 
