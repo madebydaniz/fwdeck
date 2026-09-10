@@ -35,6 +35,8 @@ pub enum TrafficServiceError {
     #[error("traffic test identity exhausted")]
     /// Revision or evaluation identity cannot advance.
     IdentityExhausted,
+    #[error("{0}")]
+    Preview(super::TrafficPreviewFailure),
 }
 
 /// An accepted request may still have failed to enqueue cancellation of old work.
@@ -107,10 +109,12 @@ enum JobKind {
         persisted: Arc<TrafficSuite>,
     },
     Index(EvaluationContext),
+    PreviewIndex(EvaluationContext),
 }
 enum JobOutput<V> {
     Storage(Result<LoadedTrafficSuite<V>, TrafficStorageError>),
     Index(Result<Box<TrafficTestEvaluationRequest>, super::TrafficTestRequestError>),
+    PreviewIndex(Result<Box<TrafficTestEvaluationRequest>, super::TrafficPreviewFailure>),
 }
 struct Job<V> {
     kind: JobKind,
@@ -123,6 +127,8 @@ struct Job<V> {
 /// saves cannot be aborted safely and may still write. No work starts implicitly.
 pub struct TrafficTestService<S: TrafficSuiteStorage> {
     workspace: TrafficTestWorkspace,
+    preview: super::TrafficPreviewState,
+    preview_batch: Option<preview::PreviewBatch>,
     storage: Arc<S>,
     expected: Option<TrafficSaveExpectation<S::Version>>,
     job: Option<Job<S::Version>>,
@@ -151,6 +157,8 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
     ) -> Self {
         Self {
             workspace: TrafficTestWorkspace::new(offline),
+            preview: super::TrafficPreviewState::Idle,
+            preview_batch: None,
             storage,
             expected: None,
             job: None,
@@ -196,6 +204,7 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
         let old = self.workspace.active_context().cloned();
         let changed = self.workspace.observe(observed);
         if changed {
+            self.invalidate_preview()?;
             self.cancel(old)?;
         }
         Ok(changed)
@@ -205,6 +214,7 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
         self.ensure_open()?;
         let old = self.workspace.active_context().cloned();
         self.workspace.clear_observation();
+        self.invalidate_preview()?;
         self.cancel(old)
     }
     /// Changes target immediately; cancellation failure does not restore it.
@@ -216,6 +226,7 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
             .set_target(target)
             .map_err(|error| map_workspace(&error))?;
         if changed {
+            self.invalidate_preview()?;
             self.cancel(old)?;
         }
         Ok(changed)
@@ -228,9 +239,10 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
             .workspace
             .begin_load()
             .map_err(|error| map_workspace(&error))?;
+        let preview_error = self.invalidate_preview().err();
         self.expected = None;
         self.save = TrafficSaveState::Idle;
-        let cancellation_error = self.cancel(old).err();
+        let cancellation_error = self.cancel(old).err().or(preview_error);
         let storage = Arc::clone(&self.storage);
         self.job = Some(Job {
             kind: JobKind::Load(token),
@@ -264,6 +276,7 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
             }
             TrafficSaveExpectation::Missing => {}
         }
+        let _ = self.invalidate_preview();
         let persisted = Arc::new(persisted);
         self.save = TrafficSaveState::Saving(Arc::clone(&draft));
         let storage = Arc::clone(&self.storage);
@@ -282,13 +295,14 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
         if self.coordinator_closed {
             return Err(TrafficServiceError::Closed);
         }
-        if !self.audit.admit() {
+        if !self.audit.can_reserve_batch(1) {
             return Err(TrafficServiceError::AuditBackpressure);
         }
         let prepared = self
             .workspace
             .prepare_evaluation()
             .map_err(|error| map_workspace(&error))?;
+        let _ = self.invalidate_preview();
         let context = prepared.context().clone();
         self.audit.accept(
             context.clone(),
@@ -339,6 +353,8 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
     /// On deadline expiry all unfinished handles remain available for retry.
     pub async fn shutdown(&mut self) -> Result<(), TrafficServiceShutdownError> {
         self.closing = true;
+        self.stale_preview();
+        self.audit.release_batch();
         self.audit.cancel(TrafficAuditOutcome::Shutdown);
         let deadline = tokio::time::Instant::now() + TRAFFIC_TEST_SHUTDOWN_DEADLINE;
         while self.job.is_some() || self.coordinator_shutdown.is_none() || self.audit.has_work() {
@@ -393,6 +409,13 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
         })
     }
     fn ingest(&mut self, event: TrafficTestEvent) -> TrafficServiceEvent {
+        if self
+            .preview_batch
+            .as_ref()
+            .is_some_and(|batch| batch.context() == event.context())
+        {
+            return self.ingest_preview(event);
+        }
         let context = event.context().clone();
         let (outcome, report) = match &event {
             TrafficTestEvent::EvaluationStarted { .. } => (None, None),
@@ -450,6 +473,7 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
     }
     fn close_coordinator(&mut self) {
         self.coordinator_closed = true;
+        self.fail_preview(super::TrafficPreviewFailure::Worker);
         self.audit.cancel(TrafficAuditOutcome::Closed);
         if let Some(context) = self.workspace.active_context().cloned()
             && self
@@ -487,6 +511,7 @@ fn map_submission(error: &TrafficTestSubmissionError) -> TrafficServiceError {
 }
 
 mod jobs;
+mod preview;
 #[cfg(test)]
 #[path = "traffic_test_service/tests.rs"]
 #[allow(

@@ -1,4 +1,9 @@
 //! Truth and trace contracts shared by native traffic-test phases.
+mod comparison;
+pub use comparison::{
+    TrafficChange, TrafficComparisonCounts, TrafficComparisonError, compare_traffic_reports,
+    traffic_change, validate_preview_report,
+};
 
 use super::{PolicyName, ServiceName, SnapshotSection, ZoneName};
 

@@ -287,6 +287,10 @@ impl TrafficTestWorkspace {
         Ok(true)
     }
 
+    pub(super) const fn is_offline(&self) -> bool {
+        self.offline
+    }
+
     /// Binds immutable current suite and evidence to a never-reused run identity.
     pub fn prepare_evaluation(&mut self) -> Result<PreparedTrafficEvaluation, WorkspaceError> {
         let SuiteState::Available(suite) = &self.suite else {
@@ -296,8 +300,7 @@ impl TrafficTestWorkspace {
             .observation
             .as_ref()
             .ok_or(WorkspaceError::ObservationUnavailable)?;
-        let run_id = TrafficTestRunId::new(allocate(&LAST_RUN_ID)?)
-            .map_err(|_| WorkspaceError::IdentityExhausted)?;
+        let run_id = allocate_run_id()?;
         let context = EvaluationContext {
             run_id,
             suite_id: suite.id.clone(),
@@ -463,3 +466,7 @@ fn map_failure(reason: &TrafficTestFailureReason) -> WorkspaceFailure {
     clippy::unwrap_used
 )]
 mod tests;
+
+pub(super) fn allocate_run_id() -> Result<TrafficTestRunId, WorkspaceError> {
+    TrafficTestRunId::new(allocate(&LAST_RUN_ID)?).map_err(|_| WorkspaceError::IdentityExhausted)
+}

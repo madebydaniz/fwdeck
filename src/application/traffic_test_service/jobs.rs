@@ -15,6 +15,7 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
             self.worker_failed = true;
         }
         match kind {
+            JobKind::PreviewIndex(context) => self.finish_preview_index(&context, output),
             JobKind::Load(token) => {
                 let result = match output {
                     Ok(JobOutput::Storage(result)) => result,

@@ -42,3 +42,9 @@ pub use traffic_test_workspace::{
     EvaluationState, PreparedTrafficEvaluation, SuiteLoadFailure, SuiteLoadOutcome, SuiteLoadToken,
     SuiteState, TrafficTestWorkspace, WorkspaceError, WorkspaceEventError, WorkspaceFailure,
 };
+
+mod traffic_test_preview;
+pub use traffic_test_preview::{
+    TrafficPreviewEvidence, TrafficPreviewFailure, TrafficPreviewPair, TrafficPreviewRequest,
+    TrafficPreviewState,
+};
