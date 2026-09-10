@@ -148,7 +148,7 @@ impl Preview {
     pub fn content(&self) -> DetailsContent {
         let mut lines = vec![
             ("Status".into(), self.status()),
-            ("Safety".into(), "Live connectivity: NOT VERIFIED. Informational; apply requires the existing confirmation. Read-only preview executes no firewall commands.".into()),
+            ("Safety".into(), "Live connectivity: NOT VERIFIED. Preview does not authorize apply; existing apply settings remain in effect. Read-only preview executes no firewall commands.".into()),
             ("Keys".into(), "↑/↓ select · Enter details · PgUp/PgDn scroll · Esc return to review".into()),
         ];
         if let Some(error) = self.publication.audit.failure {

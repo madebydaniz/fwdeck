@@ -266,8 +266,7 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
             self.fail_preview(TrafficPreviewFailure::InvalidEvidence);
             return TrafficServiceEvent::Evaluation(Err(WorkspaceEventError::MalformedReport));
         }
-        let bytes = batch.bytes.saturating_add(report.serialized_len());
-        if bytes > MAX_TRAFFIC_REPORT_BYTES {
+        let Some(bytes) = retained_report_bytes(batch.bytes, report.serialized_len()) else {
             self.audit.finish(
                 report.context(),
                 TrafficAuditOutcome::EvaluationLimitExceeded,
@@ -275,7 +274,7 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
             );
             self.fail_preview(TrafficPreviewFailure::ReportBudget);
             return TrafficServiceEvent::Evaluation(Err(WorkspaceEventError::MalformedReport));
-        }
+        };
         self.audit.finish(
             report.context(),
             TrafficAuditOutcome::Completed,
@@ -437,4 +436,28 @@ fn prepare_evidence(
         pairs,
     });
     Ok(evidence)
+}
+
+fn retained_report_bytes(retained: usize, incoming: usize) -> Option<usize> {
+    retained
+        .checked_add(incoming)
+        .filter(|bytes| *bytes <= MAX_TRAFFIC_REPORT_BYTES)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{MAX_TRAFFIC_REPORT_BYTES, retained_report_bytes};
+
+    #[test]
+    fn traffic_preview_aggregate_report_budget_boundary() {
+        let half = MAX_TRAFFIC_REPORT_BYTES / 2;
+        assert_eq!(retained_report_bytes(0, half), Some(half));
+        assert_eq!(
+            retained_report_bytes(half, half),
+            Some(MAX_TRAFFIC_REPORT_BYTES)
+        );
+        assert_eq!(retained_report_bytes(half, half + 1), None);
+        assert_eq!(retained_report_bytes(MAX_TRAFFIC_REPORT_BYTES, 1), None);
+        assert_eq!(retained_report_bytes(usize::MAX, 1), None);
+    }
 }

@@ -458,3 +458,107 @@ async fn traffic_preview_stale_review_is_distinct_from_missing_suite() {
     );
     service.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn traffic_preview_file_audit_batch_cancel_and_duplicates_are_private() {
+    use crate::config::AuditRetentionConfig;
+    use crate::infrastructure::audit::traffic::FileTrafficAuditSink;
+    let mut suite = (*scenario_suite()).clone();
+    suite.name = "PRIVATE_SUITE_NAME".into();
+    suite.scenarios[0].name = "PRIVATE_SCENARIO_NAME".into();
+    suite.scenarios[0].note = Some("PRIVATE_NOTE".into());
+    let source = suite.scenarios[0].source.to_string();
+    let root = std::env::temp_dir().join(format!(
+        "fwdeck-preview-audit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let sink = Arc::new(FileTrafficAuditSink::new(
+        Some(root.clone()),
+        AuditRetentionConfig {
+            max_files: 2,
+            max_file_size: 1024 * 1024,
+        },
+    ));
+    let mut service = TrafficTestService::with_audit_sink(
+        false,
+        Arc::new(MemoryStorage::available(Arc::new(suite))),
+        sink,
+    );
+    load(&mut service).await;
+    service.observe(observation(1)).unwrap();
+    service
+        .try_preview(request(&service, ConfigurationTarget::RuntimeAndPermanent))
+        .unwrap();
+    complete(&mut service).await;
+    let TrafficPreviewState::Completed(evidence) = service.preview_state().clone() else {
+        panic!("preview did not complete");
+    };
+    let expected = evidence
+        .pairs
+        .iter()
+        .flat_map(|p| [&p.before_context, &p.after_context])
+        .map(|c| serde_json::to_value(c).unwrap())
+        .collect::<Vec<_>>();
+    for pair in &evidence.pairs {
+        for report in [&pair.before, &pair.after] {
+            assert!(matches!(
+                service.ingest(TrafficTestEvent::EvaluationFinished {
+                    report: report.as_ref().unwrap().clone(),
+                }),
+                TrafficServiceEvent::Evaluation(Err(_))
+            ));
+        }
+    }
+    service
+        .try_preview(request(&service, ConfigurationTarget::RuntimeAndPermanent))
+        .unwrap();
+    let cancelled = service.preview_batch.as_ref().unwrap().context().clone();
+    service.cancel_preview().unwrap();
+    service.cancel_preview().unwrap();
+    assert!(matches!(
+        service.ingest(TrafficTestEvent::EvaluationCancelled {
+            context: cancelled.clone(),
+            reason: crate::application::TrafficTestCancellationReason::StaleContext,
+        }),
+        TrafficServiceEvent::Evaluation(Err(_))
+    ));
+    service.shutdown().await.unwrap();
+    let raw = std::fs::read_to_string(root.join("traffic-audit/audit.jsonl")).unwrap();
+    let records = raw
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records.len(),
+        5,
+        "four completed runs and only the admitted cancelled run"
+    );
+    for (record, context) in records.iter().zip(expected) {
+        assert_eq!(record["context"], context);
+        assert_eq!(record["outcome"], "completed");
+        assert_eq!(record["configuration_only"], true);
+        assert_eq!(record["live_connectivity_verified"], false);
+    }
+    assert_eq!(
+        records[4]["context"],
+        serde_json::to_value(cancelled).unwrap()
+    );
+    assert_eq!(records[4]["outcome"], "cancelled");
+    assert_eq!(records[4]["reason"], "stale_context");
+    for secret in [
+        "PRIVATE_SUITE_NAME",
+        "PRIVATE_SCENARIO_NAME",
+        "PRIVATE_NOTE",
+        &source,
+        "RemoveService",
+        "remove_service",
+        "\"trace\"",
+    ] {
+        assert!(!raw.contains(secret), "private input leaked: {secret}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}

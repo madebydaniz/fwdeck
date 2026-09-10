@@ -465,3 +465,52 @@ async fn traffic_preview_offline_and_pending_close_are_explicit() {
     assert!(matches!(s.overlays.last(), Some(Overlay::Confirm(_))));
     shell.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn traffic_preview_selected_row_remains_visible_at_responsive_sizes() {
+    let mut many = (*suite()).clone();
+    let template = many.scenarios[0].clone();
+    many.scenarios = (0..30)
+        .map(|i| TrafficScenario {
+            id: TrafficScenarioId::parse(&format!("ssh-{i}")).unwrap(),
+            name: format!("SSH check {i:02}"),
+            ..template.clone()
+        })
+        .collect();
+    let mut shell = TrafficShell::new(Some(storage(Some(Arc::new(many)), false)));
+    let mut state = review();
+    let effects = update(&mut state, UiAction::PreviewTraffic);
+    route(&mut shell, &mut state, effects);
+    completed(&mut shell, &mut state).await;
+    assert!(preview(&state).current());
+    let theme = crate::ui::theme::Theme::new(crate::ui::theme::Variant::Dracula, true, true);
+    for (width, height) in [(80, 24), (120, 40), (160, 50)] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        for (delta, selected, name) in [
+            (i32::MAX, 59, "SSH check 29"),
+            (i32::MIN, 0, "SSH check 00"),
+        ] {
+            update(&mut state, UiAction::PreviewMove(delta));
+            terminal
+                .draw(|f| crate::ui::overlays::render(f, &mut state, &theme, f.area()))
+                .unwrap();
+            assert_eq!(preview(&state).selected, selected);
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect();
+            assert!(
+                text.contains(&format!("> {name}")),
+                "selected row missing at {width}x{height}: {text}"
+            );
+            for label in ["Before:", "After:", "Change:"] {
+                assert!(text.contains(label), "{label} missing at {width}x{height}");
+            }
+        }
+    }
+    shell.shutdown().await.unwrap();
+}
