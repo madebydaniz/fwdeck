@@ -3,7 +3,7 @@
 use crate::application::{EvaluationState, SuiteState, TrafficTestWorkspace};
 use crate::domain::{EvaluationTarget, TrafficTestReport};
 use std::sync::Arc;
-mod details;
+pub(super) mod details;
 pub(super) mod render;
 
 #[cfg(test)]
@@ -12,6 +12,7 @@ mod tests;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrafficPresentation {
+    pub preview: Box<super::traffic_preview::Publication>,
     pub audit: crate::application::traffic_test_audit::TrafficAuditStatus,
     pub save: crate::application::TrafficSaveState,
     pub suite: SuiteState,
@@ -132,6 +133,7 @@ impl TrafficPresentation {
     #[must_use]
     pub fn from_workspace(workspace: &TrafficTestWorkspace) -> Self {
         Self {
+            preview: Box::default(),
             audit: crate::application::traffic_test_audit::TrafficAuditStatus::default(),
             save: crate::application::TrafficSaveState::Idle,
             suite: workspace.suite_state().clone(),

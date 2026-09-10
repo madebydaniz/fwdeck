@@ -6,6 +6,7 @@ mod lifecycle;
 mod plans;
 mod rows;
 mod traffic_edit;
+mod traffic_preview;
 mod traffic_tests;
 
 use crate::application::MutationRequest;
@@ -41,7 +42,13 @@ const MAX_INTERACTIVE_INPUT_BYTES: usize = 4096;
 /// unit-testable.
 #[allow(clippy::too_many_lines)] // one arm per action; splitting hurts readability
 pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
+    let previous_preview = traffic_preview::owner(state);
     let mut effects = reduce(state, action);
+    if (previous_preview.is_some() && traffic_preview::owner(state).is_none())
+        || traffic_preview::invalidate_changed(state)
+    {
+        effects.insert(0, Effect::TrafficPreviewCancel);
+    }
     if (state.traffic_observation.is_some() || state.traffic.load_requested)
         && !effects
             .iter()
@@ -65,6 +72,10 @@ fn reduce(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         return effects;
     }
     match action {
+        UiAction::PreviewTraffic => return traffic_preview::open(state, false),
+        UiAction::PreviewStagedTraffic => return traffic_preview::open(state, true),
+        UiAction::PreviewMove(delta) => traffic_preview::move_selection(state, delta),
+        UiAction::PreviewDetails => traffic_preview::details(state),
         UiAction::TrafficEdit(_) | UiAction::TrafficSaveRejected(_, _) => {
             return traffic_edit::update(state, action);
         }

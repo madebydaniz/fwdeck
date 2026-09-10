@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod delivery;
+mod preview_tests;
 
 static EDIT_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 #[tokio::test]

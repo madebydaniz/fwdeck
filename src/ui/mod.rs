@@ -16,6 +16,7 @@ pub mod rich_builder;
 pub mod search;
 pub mod state;
 pub mod theme;
+pub mod traffic_preview;
 mod traffic_shell;
 pub mod traffic_test_form;
 pub mod traffic_tests;
@@ -427,7 +428,9 @@ async fn execute_effect(
         | Effect::TrafficLoad
         | Effect::TrafficEvaluate
         | Effect::TrafficTarget(_)
-        | Effect::TrafficObserve(_) => {}
+        | Effect::TrafficObserve(_)
+        | Effect::TrafficPreview(_)
+        | Effect::TrafficPreviewCancel => {}
         Effect::Quit => return ControlFlow::Break(()),
         Effect::Refresh
         | Effect::Apply(_)

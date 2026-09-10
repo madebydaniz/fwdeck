@@ -83,7 +83,10 @@ fn overlay_key(overlay: &Overlay, code: KeyCode) -> Option<UiAction> {
             };
             Some(UiAction::TrafficEdit(action))
         }
-        Overlay::Help | Overlay::About | Overlay::Details(_) => match code {
+        Overlay::Help
+        | Overlay::About
+        | Overlay::Details(_)
+        | Overlay::TrafficPreviewDetails(_) => match code {
             KeyCode::Esc | KeyCode::Char('q' | '?') | KeyCode::Enter => {
                 Some(UiAction::CloseOverlay)
             }
@@ -114,7 +117,11 @@ fn overlay_key(overlay: &Overlay, code: KeyCode) -> Option<UiAction> {
             KeyCode::Char(c) => Some(UiAction::GlobalSearchInput(c)),
             _ => None,
         },
-        Overlay::Confirm(_) => match code {
+        Overlay::TrafficPreview(_) => preview_key(code),
+        Overlay::Confirm(confirmation) => match code {
+            KeyCode::Char('p') if super::traffic_preview::is_mutation(&confirmation.on_confirm) => {
+                Some(UiAction::PreviewTraffic)
+            }
             KeyCode::Char('y') => Some(UiAction::ConfirmAccept),
             KeyCode::Char('s') => Some(UiAction::ConfirmStage),
             KeyCode::Char('n') | KeyCode::Esc => Some(UiAction::CloseOverlay),
@@ -410,6 +417,20 @@ pub const HELP: &[(&str, &[HelpEntry])] = &[
         ],
     ),
 ];
+
+fn preview_key(code: KeyCode) -> Option<UiAction> {
+    match code {
+        KeyCode::Esc => Some(UiAction::CloseOverlay),
+        KeyCode::Enter => Some(UiAction::PreviewDetails),
+        KeyCode::Down | KeyCode::Char('j') => Some(UiAction::PreviewMove(1)),
+        KeyCode::Up | KeyCode::Char('k') => Some(UiAction::PreviewMove(-1)),
+        KeyCode::PageDown => Some(UiAction::ScrollOverlay(10)),
+        KeyCode::PageUp => Some(UiAction::ScrollOverlay(-10)),
+        KeyCode::Home => Some(UiAction::ScrollOverlay(i32::MIN)),
+        KeyCode::End => Some(UiAction::ScrollOverlay(i32::MAX)),
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
