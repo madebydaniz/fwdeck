@@ -48,6 +48,41 @@ pub fn translate(state: &UiState, key: KeyEvent) -> Option<UiAction> {
 /// Overlays are modal: they swallow everything except their own keys.
 fn overlay_key(overlay: &Overlay, code: KeyCode) -> Option<UiAction> {
     match overlay {
+        Overlay::TrafficForm(editor) => {
+            use super::traffic_test_form::{EditAction as A, Stage};
+            let action = if editor.discard.is_some() {
+                match code {
+                    KeyCode::Char('y') => A::Discard,
+                    KeyCode::Char('n') | KeyCode::Esc => A::Keep,
+                    _ => return None,
+                }
+            } else if editor.stage == Stage::Draft {
+                match code {
+                    KeyCode::Esc => A::Cancel,
+                    KeyCode::Tab | KeyCode::Down => A::Move(1),
+                    KeyCode::BackTab | KeyCode::Up => A::Move(-1),
+                    KeyCode::Left => A::Cycle(-1),
+                    KeyCode::Right => A::Cycle(1),
+                    KeyCode::Enter => A::Review,
+                    KeyCode::Backspace => A::Backspace,
+                    KeyCode::Char(c) => A::Input(c),
+                    _ => return None,
+                }
+            } else {
+                match code {
+                    KeyCode::Esc => A::Cancel,
+                    KeyCode::Char('y') if editor.stage == Stage::Review => A::Save,
+                    KeyCode::Down => A::Scroll(1),
+                    KeyCode::Up => A::Scroll(-1),
+                    KeyCode::PageDown => A::Scroll(10),
+                    KeyCode::PageUp => A::Scroll(-10),
+                    KeyCode::Home => A::Scroll(i32::MIN),
+                    KeyCode::End => A::Scroll(i32::MAX),
+                    _ => return None,
+                }
+            };
+            Some(UiAction::TrafficEdit(action))
+        }
         Overlay::Help | Overlay::About | Overlay::Details(_) => match code {
             KeyCode::Esc | KeyCode::Char('q' | '?') | KeyCode::Enter => {
                 Some(UiAction::CloseOverlay)
@@ -104,6 +139,19 @@ fn overlay_key(overlay: &Overlay, code: KeyCode) -> Option<UiAction> {
 
 /// Normal-mode translation: special-cased keys first, then the `HELP` table.
 fn normal_key(state: &UiState, code: KeyCode) -> Option<UiAction> {
+    if state.view == ViewId::TrafficTests {
+        use super::traffic_test_form::EditAction as A;
+        match code {
+            KeyCode::Char('a') => return Some(UiAction::OpenTrafficTemplates),
+            KeyCode::Char('E') => return Some(UiAction::TrafficEdit(A::Edit)),
+            KeyCode::Char('d') => return Some(UiAction::TrafficEdit(A::Delete)),
+            KeyCode::Char(' ') => return Some(UiAction::TrafficEdit(A::Toggle)),
+            KeyCode::Char('e') => return Some(UiAction::TrafficEvaluate),
+            KeyCode::Char('r') => return Some(UiAction::TrafficReload),
+            KeyCode::Char('t') => return Some(UiAction::TrafficToggleTarget),
+            _ => {}
+        }
+    }
     match code {
         // Special cases a static table cannot express: the action is
         // computed from the digit / gated on view state.
@@ -136,6 +184,26 @@ pub struct HelpEntry {
     pub codes: &'static [KeyCode],
     /// Action produced when one of `codes` is pressed in normal mode.
     pub action: Option<UiAction>,
+}
+
+/// Contextual short label for the normal-mode reload key.
+#[must_use]
+pub const fn reload_hint(view: ViewId) -> &'static str {
+    if matches!(view, ViewId::TrafficTests) {
+        "reload suite"
+    } else {
+        "refresh"
+    }
+}
+
+/// Description of the binding actually active in this view.
+#[must_use]
+pub fn help_description(view: ViewId, entry: &HelpEntry) -> &'static str {
+    if view == ViewId::TrafficTests && matches!(entry.action, Some(UiAction::RefreshRequested)) {
+        "reload default traffic suite"
+    } else {
+        entry.desc
+    }
 }
 
 /// Grouped catalog of key bindings: the single source of truth for both the
@@ -191,6 +259,12 @@ pub const HELP: &[(&str, &[HelpEntry])] = &[
                 desc: "open policy workspace",
                 codes: &[KeyCode::Char('p')],
                 action: Some(UiAction::SwitchView(ViewId::Policies)),
+            },
+            HelpEntry {
+                keys: "T",
+                desc: "open Traffic Tests",
+                codes: &[KeyCode::Char('T')],
+                action: Some(UiAction::SwitchView(ViewId::TrafficTests)),
             },
         ],
     ),
@@ -374,6 +448,30 @@ mod tests {
         assert_eq!(
             translate(&s, press(KeyCode::Char('p'))),
             Some(UiAction::SwitchView(ViewId::Policies))
+        );
+    }
+
+    #[test]
+    fn uppercase_t_opens_traffic_tests_only_in_normal_navigation() {
+        let mut s = state();
+        assert_eq!(
+            translate(&s, press(KeyCode::Char('T'))),
+            Some(UiAction::SwitchView(ViewId::TrafficTests))
+        );
+        assert_eq!(
+            translate(&s, press(KeyCode::Char('t'))),
+            Some(UiAction::ToggleConfigView)
+        );
+        s.mode = InputMode::Filter;
+        assert_eq!(
+            translate(&s, press(KeyCode::Char('T'))),
+            Some(UiAction::InputChar('T'))
+        );
+        s.mode = InputMode::Normal;
+        s.overlays.push(Overlay::Palette(PaletteState::default()));
+        assert_eq!(
+            translate(&s, press(KeyCode::Char('T'))),
+            Some(UiAction::PaletteInput('T'))
         );
     }
 

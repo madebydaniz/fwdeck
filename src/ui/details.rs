@@ -249,6 +249,7 @@ pub fn for_row(
 ) -> Option<DetailsContent> {
     let cell = |index: usize| row.get(index).cloned().unwrap_or_default();
     match view {
+        ViewId::TrafficTests => None,
         ViewId::Zones => {
             let RowId::Zone(name) = &row.id else {
                 return None;

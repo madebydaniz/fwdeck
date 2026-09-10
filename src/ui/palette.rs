@@ -25,6 +25,8 @@ pub enum Category {
     Firewall,
     /// Application-level commands (help, filters, snapshots, plans).
     App,
+    /// Unsaved traffic-test scenario templates.
+    Template,
 }
 
 impl Category {
@@ -35,6 +37,7 @@ impl Category {
             Self::Views => "view",
             Self::Firewall => "firewall",
             Self::App => "app",
+            Self::Template => "template",
         }
     }
 }
@@ -67,12 +70,23 @@ pub struct PaletteCommand {
 }
 
 /// Palette overlay state (query + selection into the filtered list).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaletteScope {
+    /// Every command available in the ordinary command palette.
+    #[default]
+    All,
+    /// Only traffic-test scenario templates.
+    TrafficTemplates,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PaletteState {
     /// Current fuzzy-search query.
     pub query: String,
     /// Selected index into the filtered command list.
     pub selected: usize,
+    /// Typed catalog boundary retained even when the query is cleared.
+    pub scope: PaletteScope,
 }
 
 /// Positional constructor for a catalog entry.
@@ -783,6 +797,93 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
         ),
     ];
 
+    if state.view == ViewId::TrafficTests {
+        use super::traffic_test_form::{EditAction as A, Template};
+        let editable = matches!(
+            state.traffic.suite,
+            crate::application::SuiteState::Available(_) | crate::application::SuiteState::Missing
+        ) && !matches!(
+            state.traffic.save,
+            crate::application::TrafficSaveState::Failed { .. }
+        ) && !state
+            .overlays
+            .iter()
+            .any(|overlay| matches!(overlay, super::overlays::Overlay::TrafficForm(_)));
+        let can_add = editable
+            && !matches!(&state.traffic.suite, crate::application::SuiteState::Available(suite) if suite.scenarios.len() >= crate::domain::MAX_SCENARIOS_PER_SUITE);
+        for (template, title) in [
+            (Template::Ssh, "Keep SSH access"),
+            (Template::AllowService, "Allow service exposure"),
+            (Template::BlockAccess, "Block unwanted access"),
+            (Template::Custom, "Custom host traffic"),
+        ] {
+            commands.push(cmd(
+                UiAction::TrafficEdit(A::New(template)),
+                format!("Traffic test: {title}"),
+                "Unsaved local scenario; explicit source and review required",
+                &["traffic", "template", "new", "scenario"],
+                Category::Template,
+                if can_add {
+                    Availability::Enabled
+                } else {
+                    Availability::Disabled("Load a supported suite with room for another scenario")
+                },
+            ));
+        }
+        let selected = state
+            .visible_rows()
+            .get(state.view_state().selected)
+            .is_some_and(|row| matches!(row.id, RowId::TrafficScenario(_)));
+        for (action, title) in [
+            (A::Edit, "Edit traffic scenario"),
+            (A::Delete, "Delete traffic scenario"),
+            (A::Toggle, "Enable or disable traffic scenario"),
+        ] {
+            commands.push(cmd(
+                UiAction::TrafficEdit(action),
+                title,
+                "Review a local-file-only change",
+                &["traffic", "scenario"],
+                Category::App,
+                if editable && selected {
+                    Availability::Enabled
+                } else {
+                    Availability::Disabled("Load a supported suite and select a scenario")
+                },
+            ));
+        }
+        for (action, title, description) in [
+            (
+                UiAction::TrafficReload,
+                "Reload default traffic suite",
+                "Read local suite without refreshing firewalld",
+            ),
+            (
+                UiAction::TrafficEvaluate,
+                "Evaluate traffic tests",
+                "Configuration evaluation only; no packet probes",
+            ),
+            (
+                UiAction::TrafficToggleTarget,
+                "Toggle traffic evaluation target",
+                "Runtime or permanent; offline remains permanent",
+            ),
+            (
+                UiAction::ActivateRow,
+                "Traffic scenario details",
+                "Inspect selected scenario and evaluation identity",
+            ),
+        ] {
+            commands.push(cmd(
+                action,
+                title,
+                description,
+                &["traffic", "tests"],
+                Category::App,
+                Availability::Enabled,
+            ));
+        }
+    }
     for view in ViewId::iter() {
         commands.push(cmd(
             UiAction::SwitchView(view),
@@ -799,10 +900,13 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
 /// Catalog filtered and ranked against the open palette's query.
 #[must_use]
 pub fn filtered(state: &UiState) -> Vec<PaletteCommand> {
-    let query = state.palette().map_or("", |palette| palette.query.as_str());
+    let palette = state.palette();
+    let query = palette.map_or("", |palette| palette.query.as_str());
+    let scope = palette.map_or(PaletteScope::All, |palette| palette.scope);
     let mut ranked: Vec<(i32, usize, PaletteCommand)> = catalog(state)
         .into_iter()
         .enumerate()
+        .filter(|(_, command)| scope == PaletteScope::All || command.category == Category::Template)
         .filter_map(|(index, command)| {
             let best = std::iter::once(command.title.as_str())
                 .chain(command.keywords.iter().copied())
@@ -818,6 +922,64 @@ pub fn filtered(state: &UiState) -> Vec<PaletteCommand> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    #[test]
+    fn traffic_context_catalog_offers_local_commands() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        state.view = ViewId::TrafficTests;
+        let commands = catalog(&state);
+        for action in [
+            UiAction::TrafficReload,
+            UiAction::TrafficEvaluate,
+            UiAction::TrafficToggleTarget,
+        ] {
+            assert!(
+                commands.iter().any(|command| command.action == action),
+                "missing traffic command {action:?}"
+            );
+        }
+    }
+    #[test]
+    fn traffic_entry_requests_only_one_explicit_load() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        assert!(crate::ui::update::update(&mut state, UiAction::Tick).is_empty());
+        let effects =
+            crate::ui::update::update(&mut state, UiAction::SwitchView(ViewId::TrafficTests));
+        assert_eq!(effects.len(), 1, "explicit entry must request suite load");
+        assert!(
+            crate::ui::update::update(&mut state, UiAction::SwitchView(ViewId::TrafficTests))
+                .is_empty()
+        );
+    }
+    #[test]
+    fn traffic_tests_entry_is_opt_in_and_available_without_firewall() {
+        for offline in [false, true] {
+            let config = crate::config::Config {
+                offline,
+                ..Default::default()
+            };
+            let mut state = super::UiState::new(&config, "test".into(), false, None);
+            state.read_only = true;
+            let commands = super::catalog(&state);
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| command.title.contains("Traffic Tests")
+                        && command.availability == super::Availability::Enabled)
+            );
+            assert_eq!(super::ViewId::from_digit(0), Some(super::ViewId::Zones));
+            assert_eq!(super::ViewId::from_digit(9), Some(super::ViewId::Logs));
+            for character in ' '..='~' {
+                let action = crate::ui::keymap::translate(
+                    &state,
+                    crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char(character)),
+                );
+                assert_eq!(
+                    matches!(action, Some(super::UiAction::SwitchView(view)) if view.title() == "Traffic Tests"),
+                    character == 'T'
+                );
+            }
+        }
+    }
     use super::*;
     use crate::config::Config;
     use crate::ui::overlays::Overlay;
@@ -827,6 +989,7 @@ mod tests {
         state.overlays.push(Overlay::Palette(PaletteState {
             query: query.to_owned(),
             selected: 0,
+            ..PaletteState::default()
         }));
         state
     }
@@ -835,6 +998,69 @@ mod tests {
     fn empty_query_lists_the_full_catalog() {
         let state = state_with_palette("");
         assert_eq!(filtered(&state).len(), catalog(&state).len());
+    }
+
+    #[test]
+    fn template_scope_never_leaks_unrelated_commands() {
+        let mut state = state_with_palette("");
+        state.view = ViewId::TrafficTests;
+        state.overlays = vec![Overlay::Palette(PaletteState {
+            scope: PaletteScope::TrafficTemplates,
+            ..PaletteState::default()
+        })];
+        let commands = filtered(&state);
+        assert_eq!(commands.len(), 4);
+        assert!(commands.iter().all(|command| {
+            command.category == Category::Template && command.title.starts_with("Traffic test: ")
+        }));
+    }
+
+    #[test]
+    fn traffic_template_picker_closes_without_changing_suite() {
+        let mut state = UiState::new(&Config::default(), "test".into(), false, None);
+        state.view = ViewId::TrafficTests;
+        let suite_before = state.traffic.suite.clone();
+        crate::ui::update::update(&mut state, UiAction::OpenTrafficTemplates);
+        let palette = state.palette().expect("template picker did not open");
+        assert_eq!(palette.scope, PaletteScope::TrafficTemplates);
+        crate::ui::update::update(&mut state, UiAction::CloseOverlay);
+        assert!(state.overlays.is_empty());
+        assert_eq!(state.traffic.suite, suite_before);
+    }
+
+    #[test]
+    fn template_search_preserves_disabled_reason() {
+        let mut state = state_with_palette("ssh");
+        state.view = ViewId::TrafficTests;
+        state.overlays = vec![Overlay::Palette(PaletteState {
+            query: "ssh".into(),
+            scope: PaletteScope::TrafficTemplates,
+            ..PaletteState::default()
+        })];
+        let command = filtered(&state).into_iter().next().expect("SSH template");
+        assert_eq!(command.title, "Traffic test: Keep SSH access");
+        assert!(matches!(command.availability, Availability::Disabled(_)));
+    }
+
+    #[test]
+    fn ordinary_palette_finds_enabled_template_category() {
+        let mut state = state_with_palette("template");
+        state.view = ViewId::TrafficTests;
+        state.traffic.suite = crate::application::SuiteState::Missing;
+        let commands = filtered(&state);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.category == Category::Template)
+                .count(),
+            4
+        );
+        assert!(
+            commands
+                .iter()
+                .filter(|command| command.category == Category::Template)
+                .all(|command| command.availability == Availability::Enabled)
+        );
     }
 
     #[test]

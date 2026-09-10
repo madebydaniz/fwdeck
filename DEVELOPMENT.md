@@ -31,6 +31,11 @@ offline source:
 make run-offline
 ```
 
+`make run-offline` describes the container build path: it supplies the host
+Cargo registry and still starts normal FWDeck against the disposable daemon.
+It does not pass the application flag `fwdeck --offline`, which selects
+permanent-only configuration through `firewall-offline-cmd`.
+
 Open an interactive development shell when you need to run Cargo commands in
 the same real-daemon environment:
 
@@ -59,6 +64,20 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 ```
+
+For Traffic Tests delivery changes, start with the real-shell and privacy
+regressions before the full gate:
+
+```bash
+cargo test traffic_shell --lib
+cargo test native_completed_and_malformed_report_records_never_serialize_private_inputs --lib
+```
+
+For Traffic Tests UI changes, also run the keymap, palette, components,
+overlays and traffic details tests. Check `Shift+t` navigation, the `a`
+template chooser, independent evaluation targets, and current-versus-historical
+evidence. TestBackend coverage at multiple terminal sizes does not replace
+manual acceptance with `make run-offline`.
 
 Changes affecting the optional backend must also pass:
 

@@ -146,15 +146,11 @@ fn cross_component_evidence_is_isolated_deterministic_bounded_and_non_mutating()
         .iter()
         .map(|item| evaluate_scenario(&runtime_index, item, &runtime_context).unwrap())
         .collect::<Vec<_>>();
+    let before_runtime_context = context(3, EvaluationTarget::Runtime);
     let before_runtime_results = scenarios
         .iter()
         .map(|item| {
-            evaluate_scenario(
-                &before_runtime_index,
-                item,
-                &context(3, EvaluationTarget::Runtime),
-            )
-            .unwrap()
+            evaluate_scenario(&before_runtime_index, item, &before_runtime_context).unwrap()
         })
         .collect::<Vec<_>>();
     let permanent_results = scenarios
@@ -185,8 +181,12 @@ fn cross_component_evidence_is_isolated_deterministic_bounded_and_non_mutating()
         ["reviewed-0002", "reviewed-0001", "reviewed-0003"]
     );
 
-    let report = TrafficTestReport::new(runtime_context.clone(), runtime_results.clone()).unwrap();
-    let repeated = TrafficTestReport::new(runtime_context, runtime_results).unwrap();
+    let repeated_results = scenarios
+        .iter()
+        .map(|item| evaluate_scenario(&runtime_index, item, &runtime_context).unwrap())
+        .collect::<Vec<_>>();
+    let report = TrafficTestReport::new(runtime_context.clone(), runtime_results).unwrap();
+    let repeated = TrafficTestReport::new(runtime_context, repeated_results).unwrap();
     assert_eq!(
         serde_json::to_vec(&report).unwrap(),
         serde_json::to_vec(&repeated).unwrap()

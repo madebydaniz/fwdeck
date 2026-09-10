@@ -18,6 +18,18 @@ use super::views::ViewId;
 /// A semantic UI event fed to the reducer (`update::update`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
+    /// Pure local scenario editor transition.
+    TrafficEdit(super::traffic_test_form::EditAction),
+    /// Immediate rejection of the exact submitted local candidate.
+    TrafficSaveRejected(Arc<crate::domain::TrafficSuite>, String),
+    /// Explicit default-suite reload; does not refresh firewalld.
+    TrafficReload,
+    /// Evaluate the selected configuration target.
+    TrafficEvaluate,
+    /// Change evaluation target without evaluating.
+    TrafficToggleTarget,
+    /// Immutable service publication.
+    TrafficPresented(super::traffic_tests::TrafficPresentation),
     /// Advance the 250 ms clock: expire toasts, fire due rollbacks.
     Tick,
     /// The terminal was resized to (width, height).
@@ -35,6 +47,8 @@ pub enum UiAction {
     // Command palette (`:`)
     /// Open the command palette overlay.
     OpenPalette,
+    /// Open the palette scoped to unsaved traffic-test templates.
+    OpenTrafficTemplates,
     /// Append a character to the palette query.
     PaletteInput(char),
     /// Delete the last character of the palette query.
@@ -274,6 +288,16 @@ pub enum UiAction {
 /// Side effects the reducer asks the event loop to perform.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    /// Persist a reviewed local suite through the application-owned service.
+    TrafficSave(Arc<crate::domain::TrafficSuite>),
+    /// Explicit local default-suite load.
+    TrafficLoad,
+    /// Native configuration evaluation.
+    TrafficEvaluate,
+    /// Set the application-owned evaluation target.
+    TrafficTarget(crate::domain::EvaluationTarget),
+    /// Forward or revoke exact accepted authoritative evidence.
+    TrafficObserve(Option<ObservedSnapshot>),
     /// Tear down the terminal and exit.
     Quit,
     /// Ask the engine for a fresh snapshot.

@@ -133,6 +133,20 @@ pub fn prune(config: &RetentionConfig, scope: RetentionScope) -> Result<PruneRep
     Ok(apply_plan(plan))
 }
 
+/// Prunes only the explicitly injected audit namespace, never the operator root.
+pub(crate) fn prune_audit_root(root: &Path, max_files: usize) -> Result<(), String> {
+    let items = discover(root, is_audit_name, |_, name| name == "audit.jsonl")?;
+    let report = apply_plan(RetentionPlan {
+        audit: plan_audit(items, max_files),
+        ..RetentionPlan::default()
+    });
+    if report.failures.is_empty() {
+        Ok(())
+    } else {
+        Err("audit retention failed".into())
+    }
+}
+
 fn apply_plan(plan: RetentionPlan) -> PruneReport {
     let candidates: Vec<PruneCandidate> = plan.candidates().cloned().collect();
     let mut report = PruneReport {
