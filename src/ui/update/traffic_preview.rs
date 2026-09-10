@@ -65,7 +65,15 @@ pub(super) fn open(state: &mut UiState, staged: bool) -> Vec<Effect> {
     let Some(observation) = state
         .traffic_observation
         .as_ref()
-        .filter(|o| Arc::ptr_eq(o.snapshot_arc(), &expected))
+        .filter(|o| {
+            // An unchanged refresh can replace the reviewed allocation. Start a
+            // new run on the current publication only if all reviewed data match.
+            state
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| Arc::ptr_eq(o.snapshot_arc(), snapshot))
+                && o.snapshot() == expected.as_ref()
+        })
         .cloned()
     else {
         state.toast(

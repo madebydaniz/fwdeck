@@ -8,6 +8,8 @@ use crate::ui::{
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+mod refresh_tests;
+
 struct PreviewStorage {
     suite: Option<Arc<TrafficSuite>>,
     future: bool,
