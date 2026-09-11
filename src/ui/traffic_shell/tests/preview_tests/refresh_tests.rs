@@ -1,7 +1,11 @@
 use super::*;
 
 fn refresh(state: &mut UiState, snapshot: FirewallSnapshot) -> Vec<Effect> {
-    let id = RefreshId::new(20);
+    let generation = state
+        .traffic_observation
+        .as_ref()
+        .map_or(1, |o| o.identity().generation().get() + 1);
+    let id = RefreshId::new(generation);
     update(
         state,
         UiAction::RefreshStarted {
@@ -21,7 +25,7 @@ fn refresh(state: &mut UiState, snapshot: FirewallSnapshot) -> Vec<Effect> {
             result: Ok(ObservedSnapshot::new(
                 SnapshotIdentity::new(
                     id,
-                    SnapshotGeneration::new(std::num::NonZeroU64::new(20).unwrap()),
+                    SnapshotGeneration::new(std::num::NonZeroU64::new(generation).unwrap()),
                 ),
                 Arc::new(snapshot),
             )),
@@ -96,4 +100,80 @@ fn traffic_preview_after_changed_refresh_requires_new_review() {
 
     assert!(update(&mut state, UiAction::PreviewTraffic).is_empty());
     assert_eq!(state.overlays, parent);
+}
+
+#[tokio::test]
+async fn traffic_preview_unchanged_refresh_retains_completed_details() {
+    let mut state = review();
+    let mut shell = TrafficShell::new(Some(storage(Some(suite()), false)));
+    let effects = update(&mut state, UiAction::PreviewTraffic);
+    route(&mut shell, &mut state, effects);
+    completed(&mut shell, &mut state).await;
+    let request = preview(&state).request.clone();
+    let evidence = preview(&state)
+        .publication
+        .state
+        .evidence()
+        .unwrap()
+        .clone();
+    update(&mut state, UiAction::PreviewDetails);
+    let details = state.overlays.last().unwrap().clone();
+
+    for _ in 0..3 {
+        let identical = (**state.snapshot.as_ref().unwrap()).clone();
+        let effects = refresh(&mut state, identical);
+        assert!(matches!(&effects[..], [Effect::TrafficObserve(Some(_))]));
+        route(&mut shell, &mut state, effects);
+        assert!(preview(&state).current());
+        assert!(Arc::ptr_eq(&preview(&state).request, &request));
+        assert!(Arc::ptr_eq(
+            preview(&state).publication.state.evidence().unwrap(),
+            &evidence
+        ));
+        assert_eq!(state.overlays.last(), Some(&details));
+    }
+
+    let mut changed = (**state.snapshot.as_ref().unwrap()).clone();
+    changed.default_zone = ZoneName::parse("drop").unwrap();
+    let effects = refresh(&mut state, changed);
+    assert!(matches!(
+        effects.first(),
+        Some(Effect::TrafficPreviewCancel)
+    ));
+    route(&mut shell, &mut state, effects);
+    assert!(!preview(&state).current());
+    assert!(
+        matches!(state.overlays.last(), Some(Overlay::TrafficPreviewDetails(d)) if d.lines[0].1.contains("Stale"))
+    );
+    let effects = refresh(&mut state, request.observation.snapshot().clone());
+    route(&mut shell, &mut state, effects);
+    assert!(
+        !preview(&state).current(),
+        "changed evidence must not revive"
+    );
+    shell.shutdown().await.unwrap();
+}
+
+#[test]
+fn traffic_preview_reused_identity_and_older_observation_cancel() {
+    for older in [false, true] {
+        let mut state = review();
+        let old = state.traffic_observation.clone().unwrap();
+        refresh(&mut state, old.snapshot().clone());
+        update(&mut state, UiAction::PreviewTraffic);
+        let captured = preview(&state).request.observation.clone();
+        let invalid = if older {
+            old
+        } else {
+            ObservedSnapshot::new(captured.identity(), Arc::new(captured.snapshot().clone()))
+        };
+        state.snapshot = Some(invalid.snapshot_arc().clone());
+        state.traffic_observation = Some(invalid);
+
+        assert_eq!(
+            update(&mut state, UiAction::Tick),
+            vec![Effect::TrafficPreviewCancel]
+        );
+        assert!(preview(&state).invalidated);
+    }
 }

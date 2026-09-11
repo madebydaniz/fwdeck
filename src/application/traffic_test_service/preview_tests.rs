@@ -1,6 +1,18 @@
 use super::*;
 use crate::application::{TrafficPreviewFailure, TrafficPreviewRequest, TrafficPreviewState};
+use crate::config::AuditRetentionConfig;
 use crate::domain::*;
+use crate::infrastructure::audit::traffic::FileTrafficAuditSink;
+
+#[path = "preview_tests/refresh_tests.rs"]
+mod refresh_tests;
+
+fn changed_observation(generation: u64) -> ObservedSnapshot {
+    let observed = observation(generation);
+    let mut snapshot = observed.snapshot().clone();
+    snapshot.default_zone = ZoneName::parse("drop").unwrap();
+    ObservedSnapshot::new(observed.identity(), Arc::new(snapshot))
+}
 
 fn request(
     service: &TrafficTestService<MemoryStorage>,
@@ -110,7 +122,7 @@ async fn traffic_preview_observe_clear_save_load_and_normal_evaluation_invalidat
         complete(&mut service).await;
         match action {
             0 => {
-                service.observe(observation(2)).unwrap();
+                service.observe(changed_observation(2)).unwrap();
             }
             1 => service.clear_observation().unwrap(),
             2 => service.try_save(scenario_suite()).unwrap(),
@@ -363,7 +375,7 @@ async fn traffic_preview_active_supersession_rejects_old_terminal_events() {
         let old_context = service.preview_batch.as_ref().unwrap().context().clone();
         match action {
             0 => {
-                service.observe(observation(2)).unwrap();
+                service.observe(changed_observation(2)).unwrap();
             }
             1 => service.clear_observation().unwrap(),
             2 => service.try_save(scenario_suite()).unwrap(),
@@ -461,8 +473,6 @@ async fn traffic_preview_stale_review_is_distinct_from_missing_suite() {
 
 #[tokio::test]
 async fn traffic_preview_file_audit_batch_cancel_and_duplicates_are_private() {
-    use crate::config::AuditRetentionConfig;
-    use crate::infrastructure::audit::traffic::FileTrafficAuditSink;
     let mut suite = (*scenario_suite()).clone();
     suite.name = "PRIVATE_SUITE_NAME".into();
     suite.scenarios[0].name = "PRIVATE_SCENARIO_NAME".into();
@@ -493,7 +503,9 @@ async fn traffic_preview_file_audit_batch_cancel_and_duplicates_are_private() {
     service
         .try_preview(request(&service, ConfigurationTarget::RuntimeAndPermanent))
         .unwrap();
+    service.observe(observation(2)).unwrap();
     complete(&mut service).await;
+    service.observe(observation(3)).unwrap();
     let TrafficPreviewState::Completed(evidence) = service.preview_state().clone() else {
         panic!("preview did not complete");
     };

@@ -202,9 +202,15 @@ impl<S: TrafficSuiteStorage> TrafficTestService<S> {
     pub fn observe(&mut self, observed: ObservedSnapshot) -> Result<bool, TrafficServiceError> {
         self.ensure_open()?;
         let old = self.workspace.active_context().cloned();
+        let retain_preview = self
+            .preview
+            .evidence()
+            .is_some_and(|evidence| evidence.request.is_compatible_with(&observed));
         let changed = self.workspace.observe(observed);
         if changed {
-            self.invalidate_preview()?;
+            if !retain_preview {
+                self.invalidate_preview()?;
+            }
             self.cancel(old)?;
         }
         Ok(changed)

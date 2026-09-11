@@ -141,8 +141,11 @@ pub(super) fn invalidate_changed(state: &mut UiState) -> bool {
     };
     let changed = !p.invalidated
         && (state.traffic_observation.as_ref().is_none_or(|o| {
-            o.identity() != p.request.observation.identity()
-                || !Arc::ptr_eq(o.snapshot_arc(), p.request.observation.snapshot_arc())
+            !p.request.is_compatible_with(o)
+                || state
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|snapshot| !Arc::ptr_eq(o.snapshot_arc(), snapshot))
         }) || p.staged.as_ref().is_some_and(|s| s != &state.staged)
             || p.parent.as_ref().is_some_and(|parent| {
                 index == 0

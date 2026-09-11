@@ -13,6 +13,19 @@ pub struct TrafficPreviewRequest {
     pub plan_id: Option<PlanId>,
 }
 
+impl TrafficPreviewRequest {
+    /// Retains captured evidence across newer publications of identical data,
+    /// without changing its original request or report identities.
+    #[must_use]
+    pub fn is_compatible_with(&self, current: &ObservedSnapshot) -> bool {
+        if current.identity() == self.observation.identity() {
+            return Arc::ptr_eq(current.snapshot_arc(), self.observation.snapshot_arc());
+        }
+        current.identity().generation() > self.observation.identity().generation()
+            && current.snapshot() == self.observation.snapshot()
+    }
+}
+
 /// A bounded cause suitable for display without exposing raw worker errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TrafficPreviewFailure {
