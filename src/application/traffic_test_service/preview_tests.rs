@@ -570,7 +570,7 @@ async fn traffic_preview_file_audit_batch_cancel_and_duplicates_are_private() {
         "remove_service",
         "\"trace\"",
     ] {
-        assert!(!raw.contains(secret), "private input leaked: {secret}");
+        assert!(!raw.contains(secret), "private input leaked into audit");
     }
     std::fs::remove_dir_all(root).unwrap();
 }
