@@ -75,3 +75,8 @@ pub use traffic_test::{
     TrafficTraceStep, TrafficTransport, TrafficValidationError, UnknownReason, evaluate_scenario,
 };
 pub use zone::{ActiveZone, ZoneDetails, ZoneTarget};
+
+pub use traffic_test::{
+    TrafficChange, TrafficComparisonCounts, TrafficComparisonError, compare_traffic_reports,
+    traffic_change, validate_preview_report,
+};

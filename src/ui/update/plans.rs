@@ -24,17 +24,7 @@ pub(super) fn apply_staged_plan(state: &mut UiState) -> Vec<Effect> {
     // Re-check each edit against the *current* snapshot (state may have drifted
     // since staging), keeping "already satisfied" (a genuine no-op) distinct
     // from "invalid" (a real error that must never be silently swallowed).
-    let mut satisfied = 0usize;
-    let mut ops: Vec<FirewallOperation> = Vec::new();
-    let mut rejected: Vec<String> = Vec::new();
-    for op in &state.staged {
-        let narrowed = op.narrowed_for(&snapshot);
-        match narrowed.validate(&snapshot) {
-            Ok(()) => ops.push(narrowed),
-            Err(crate::domain::OperationError::NothingToDo(_)) => satisfied += 1,
-            Err(err) => rejected.push(format!("{}: {err}", narrowed.describe())),
-        }
-    }
+    let (ops, satisfied, rejected) = prepare(&state.staged, &snapshot);
     if !rejected.is_empty() {
         // A validation failure is not "already satisfied": stop, name the
         // offenders, and leave the whole plan staged for the operator to fix.
@@ -341,4 +331,23 @@ pub(super) fn export_plan(
     }
     let rendered = format.render(&state.staged);
     vec![Effect::ExportPlan(format, rendered)]
+}
+
+/// Shared pure normalization; callers retain their own staging semantics.
+pub(super) fn prepare(
+    staged: &[FirewallOperation],
+    snapshot: &crate::domain::FirewallSnapshot,
+) -> (Vec<FirewallOperation>, usize, Vec<String>) {
+    let mut satisfied = 0usize;
+    let mut ops: Vec<FirewallOperation> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+    for op in staged {
+        let narrowed = op.narrowed_for(snapshot);
+        match narrowed.validate(snapshot) {
+            Ok(()) => ops.push(narrowed),
+            Err(crate::domain::OperationError::NothingToDo(_)) => satisfied += 1,
+            Err(err) => rejected.push(format!("{}: {err}", narrowed.describe())),
+        }
+    }
+    (ops, satisfied, rejected)
 }

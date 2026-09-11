@@ -16,6 +16,10 @@ use super::theme::Theme;
 /// One entry of the overlay stack; the topmost is the one rendered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
+    /// Owned informational mutation preview.
+    TrafficPreview(Box<super::traffic_preview::Preview>),
+    /// Immutable captured before/after trace.
+    TrafficPreviewDetails(DetailsContent),
     /// Reviewed local scenario draft, retained through save completion.
     TrafficForm(Box<super::traffic_test_form::Editor>),
     /// Keybinding reference.
@@ -199,6 +203,18 @@ pub fn render(f: &mut Frame, state: &mut UiState, theme: &Theme, screen: Rect) {
         super::traffic_test_form::render::render(f, editor, theme, screen);
         return;
     }
+    if let Some(Overlay::TrafficPreview(preview)) = state.overlays.last_mut() {
+        state.overlay_scroll = render_details_focused(
+            f,
+            &preview.content(),
+            theme,
+            screen,
+            state.overlay_scroll,
+            preview.selection_changed,
+        );
+        preview.selection_changed = false;
+        return;
+    }
     let scroll = state.overlay_scroll;
     let clamped = match state.overlays.last() {
         Some(Overlay::Help) => Some(render_help(f, theme, screen, scroll, state.view)),
@@ -211,7 +227,12 @@ pub fn render(f: &mut Frame, state: &mut UiState, theme: &Theme, screen: Rect) {
             render_global_search(f, state, search_state, theme, screen);
             None
         }
-        Some(Overlay::Details(content)) => Some(render_details(f, content, theme, screen, scroll)),
+        Some(Overlay::TrafficPreview(preview)) => {
+            Some(render_details(f, &preview.content(), theme, screen, scroll))
+        }
+        Some(Overlay::TrafficPreviewDetails(content) | Overlay::Details(content)) => {
+            Some(render_details(f, content, theme, screen, scroll))
+        }
         Some(Overlay::Confirm(confirmation)) => {
             render_confirm(f, confirmation, theme, screen);
             None
@@ -710,10 +731,25 @@ fn render_details(
     screen: Rect,
     scroll: u16,
 ) -> u16 {
+    render_details_focused(f, content, theme, screen, scroll, false)
+}
+
+fn render_details_focused(
+    f: &mut Frame,
+    content: &DetailsContent,
+    theme: &Theme,
+    screen: Rect,
+    scroll: u16,
+    focus: bool,
+) -> u16 {
     let width = text_modal_width(screen);
     let inner_width = usize::from(width.saturating_sub(2));
     let mut lines = Vec::new();
+    let mut selected_start = None;
     for (key, value) in &content.lines {
+        if focus && key.starts_with("> ") {
+            selected_start = Some(lines.len());
+        }
         let inline = !key.is_empty() && key.chars().count() <= 12;
         if !key.is_empty() && !inline {
             lines.extend(
@@ -754,6 +790,7 @@ fn render_details(
         .unwrap_or(u16::MAX)
         .min(screen.height.saturating_sub(2));
     let area = centered(screen, width, height);
+    let scroll = selected_start.map_or(scroll, |start| u16::try_from(start).unwrap_or(u16::MAX));
     let scroll = clamp_scroll(scroll, lines.len(), area.height);
     let title = scroll_title(&content.title, scroll, lines.len(), area.height);
     let block = modal(f, theme, area, &title);
@@ -863,7 +900,35 @@ fn render_confirm(f: &mut Frame, confirmation: &Confirmation, theme: &Theme, scr
         .iter()
         .flat_map(|entry| wrap_text(entry, inner_width))
         .collect();
-    let height = u16::try_from(body.len() + 5)
+    let mut actions = vec![
+        Span::styled("y", theme.ok()),
+        Span::styled(" confirm · ", theme.muted()),
+        Span::styled("s", theme.info()),
+        Span::styled(" stage", theme.muted()),
+    ];
+    let mut remaining = Vec::new();
+    if super::traffic_preview::is_mutation(&confirmation.on_confirm) {
+        remaining.extend([
+            Span::styled("p", theme.info()),
+            Span::styled(" preview traffic · ", theme.muted()),
+        ]);
+    }
+    remaining.extend([
+        Span::styled("n", theme.danger()),
+        Span::styled("/esc cancel", theme.muted()),
+    ]);
+    let action_width: usize = actions.iter().chain(&remaining).map(Span::width).sum();
+    let action_lines = if action_width + 3 <= inner_width {
+        actions.push(Span::styled(" · ", theme.muted()));
+        actions.extend(remaining);
+        vec![Line::from(actions).alignment(Alignment::Center)]
+    } else {
+        vec![
+            Line::from(actions).alignment(Alignment::Center),
+            Line::from(remaining).alignment(Alignment::Center),
+        ]
+    };
+    let height = u16::try_from(body.len() + action_lines.len() + 5)
         .unwrap_or(u16::MAX)
         .min(screen.height);
     let area = centered(screen, width, height);
@@ -874,17 +939,7 @@ fn render_confirm(f: &mut Frame, confirmation: &Confirmation, theme: &Theme, scr
         lines.push(Line::from(Span::styled(format!(" {entry}"), theme.text())));
     }
     lines.push(Line::default());
-    lines.push(
-        Line::from(vec![
-            Span::styled("y", theme.ok()),
-            Span::styled(" confirm · ", theme.muted()),
-            Span::styled("s", theme.info()),
-            Span::styled(" stage · ", theme.muted()),
-            Span::styled("n", theme.danger()),
-            Span::styled("/esc cancel", theme.muted()),
-        ])
-        .alignment(Alignment::Center),
-    );
+    lines.extend(action_lines);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 

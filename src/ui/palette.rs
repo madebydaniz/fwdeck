@@ -565,6 +565,14 @@ pub fn catalog(state: &UiState) -> Vec<PaletteCommand> {
             staged,
         ),
         cmd(
+            UiAction::PreviewStagedTraffic,
+            "Preview staged traffic",
+            "Compare saved expectations before and after the staged plan",
+            &["preview", "traffic", "plan"],
+            Category::Firewall,
+            super::traffic_preview::staged_availability(state),
+        ),
+        cmd(
             UiAction::ApplyStagedPlan,
             "Apply staged plan",
             "Execute every staged operation in order",

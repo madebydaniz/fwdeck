@@ -118,7 +118,7 @@ fn result_summary_reason(result: &TrafficTestResult) -> String {
     "-".into()
 }
 
-fn inputs(scenario: &TrafficScenario) -> Lines {
+pub(in crate::ui) fn inputs(scenario: &TrafficScenario) -> Lines {
     vec![
         (String::new(), String::new()),
         (
@@ -328,7 +328,7 @@ fn context(context: &EvaluationContext) -> String {
     )
 }
 
-fn result_lines(lines: &mut Lines, result: &TrafficTestResult) {
+pub(in crate::ui) fn result_lines(lines: &mut Lines, result: &TrafficTestResult) {
     lines.push((
         "Result expectation".into(),
         format!("{:?}", result.expectation()),

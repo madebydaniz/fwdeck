@@ -15,6 +15,7 @@ pub(crate) struct AuditWriter {
     sink: Option<Arc<dyn TrafficAuditSink>>,
     session: String,
     active: Option<Accepted>,
+    future: usize,
     pending: VecDeque<TrafficAuditSummary>,
     job: Option<tokio::task::JoinHandle<Result<(), TrafficAuditError>>>,
     status: TrafficAuditStatus,
@@ -32,6 +33,7 @@ impl AuditWriter {
                 SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ),
             active: None,
+            future: 0,
             pending: VecDeque::new(),
             job: None,
             status: TrafficAuditStatus::default(),
@@ -40,13 +42,31 @@ impl AuditWriter {
     pub(crate) const fn status(&self) -> TrafficAuditStatus {
         self.status
     }
-    pub(crate) fn admit(&mut self) -> bool {
-        let available = self.sink.is_none() || self.reserved() < CAPACITY;
+    fn reserved(&self) -> usize {
+        self.pending.len()
+            + usize::from(self.job.is_some())
+            + usize::from(self.active.is_some())
+            + self.future
+    }
+    pub(crate) fn can_reserve_batch(&mut self, count: usize) -> bool {
+        let available = self.sink.is_none()
+            || self
+                .reserved()
+                .saturating_sub(self.future)
+                .saturating_add(count)
+                <= CAPACITY;
         self.status.backpressure = !available;
         available
     }
-    fn reserved(&self) -> usize {
-        self.pending.len() + usize::from(self.job.is_some()) + usize::from(self.active.is_some())
+    pub(crate) fn reserve_batch(&mut self, count: usize) {
+        self.future = if self.sink.is_some() { count } else { 0 };
+    }
+    pub(crate) fn release_batch(&mut self) {
+        self.future = 0;
+    }
+    pub(crate) fn accept_reserved(&mut self, context: EvaluationContext, total: usize) {
+        self.future = self.future.saturating_sub(1);
+        self.accept(context, total);
     }
     pub(crate) fn accept(&mut self, context: EvaluationContext, total: usize) {
         if self.sink.is_some() {
@@ -147,5 +167,37 @@ mod tests {
         assert_eq!(record["outcome"], "cancelled");
         assert_eq!(record["reason"], "shutdown");
         assert_eq!(record["context"], serde_json::to_value(context).unwrap());
+    }
+    #[tokio::test]
+    async fn traffic_preview_batch_reserves_future_without_phantom_completion() {
+        let sink = Arc::new(MemorySink::default());
+        let mut writer = AuditWriter::new(Some(sink.clone()));
+        assert!(writer.can_reserve_batch(4));
+        writer.reserve_batch(4);
+        assert_eq!(writer.reserved(), 4);
+        let context = crate::application::traffic_test_audit::tests::context();
+        writer.accept_reserved(context.clone(), 1);
+        assert_eq!(writer.reserved(), 4);
+        writer.cancel(TrafficAuditOutcome::StaleContext);
+        writer.release_batch();
+        assert_eq!(writer.reserved(), 1);
+        writer.finish(&context, TrafficAuditOutcome::Completed, None);
+        writer.next_event().await.unwrap();
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn traffic_preview_batch_backpressure_accounts_for_all_runs() {
+        let sink = Arc::new(MemorySink::default());
+        let mut writer = AuditWriter::new(Some(sink));
+        let context = crate::application::traffic_test_audit::tests::context();
+        for _ in 0..CAPACITY - 3 {
+            writer.accept(context.clone(), 1);
+            writer.finish(&context, TrafficAuditOutcome::Completed, None);
+        }
+        assert!(!writer.can_reserve_batch(4));
+        assert!(writer.can_reserve_batch(3));
+        while writer.has_work() {
+            writer.next_event().await.unwrap();
+        }
     }
 }

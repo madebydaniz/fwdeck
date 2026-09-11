@@ -18,6 +18,14 @@ use super::views::ViewId;
 /// A semantic UI event fed to the reducer (`update::update`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
+    /// Explicit informational review preview.
+    PreviewTraffic,
+    /// Preview normalized staged operations without applying.
+    PreviewStagedTraffic,
+    /// Select a captured preview scenario.
+    PreviewMove(i32),
+    /// Open captured before/after scenario evidence.
+    PreviewDetails,
     /// Pure local scenario editor transition.
     TrafficEdit(super::traffic_test_form::EditAction),
     /// Immediate rejection of the exact submitted local candidate.
@@ -288,6 +296,10 @@ pub enum UiAction {
 /// Side effects the reducer asks the event loop to perform.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
+    /// Informational evaluation; never dispatches a mutation.
+    TrafficPreview(Arc<crate::application::TrafficPreviewRequest>),
+    /// Revoke the owning preview and any pending load retry.
+    TrafficPreviewCancel,
     /// Persist a reviewed local suite through the application-owned service.
     TrafficSave(Arc<crate::domain::TrafficSuite>),
     /// Explicit local default-suite load.

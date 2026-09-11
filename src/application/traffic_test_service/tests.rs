@@ -819,3 +819,6 @@ async fn real_adapter_and_native_coordinator_complete_owned_round_trip() {
     );
     service.shutdown().await.unwrap();
 }
+
+#[path = "preview_tests.rs"]
+mod preview_tests;

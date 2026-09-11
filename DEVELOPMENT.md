@@ -70,6 +70,7 @@ regressions before the full gate:
 
 ```bash
 cargo test traffic_shell --lib
+cargo test traffic_preview --lib
 cargo test native_completed_and_malformed_report_records_never_serialize_private_inputs --lib
 ```
 
@@ -78,6 +79,20 @@ overlays and traffic details tests. Check `Shift+t` navigation, the `a`
 template chooser, independent evaluation targets, and current-versus-historical
 evidence. TestBackend coverage at multiple terminal sizes does not replace
 manual acceptance with `make run-offline`.
+
+For impact preview, save an enabled host-ingress expectation in a disposable
+fixture, review a relevant mutation and press `p`. Check target-separated
+Before/After/Change rows, arrow selection in a long list, Enter details and
+End reaching the final trace at 80x24, 120x40 and 160x50. Escape twice must
+return to the unchanged review; cancel that review without applying. Also
+exercise `Preview staged traffic`, lazy missing-suite loading, cancellation,
+and `confirm_destructive=false`. Preview must emit no firewall mutation or
+suite-save effect, retain staging, and preserve existing apply settings.
+The `traffic_preview` tests include the aggregate 32 MiB report boundary and
+real temporary audit-file checks for sequential runs, duplicate terminals,
+cancellation and private-input exclusion. Use the
+[operator guide](https://madebydaniz.github.io/fwdeck/docs/#traffic-tests)
+for the meaning and limits of configuration comparisons.
 
 Changes affecting the optional backend must also pass:
 

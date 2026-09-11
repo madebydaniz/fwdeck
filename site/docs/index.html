@@ -585,6 +585,34 @@ watchdog/dead-man's-switch behavior are unchanged. Application
 require an available authoritative daemon snapshot; FWDeck does not promise a
 runtime result when the daemon or required data is unavailable.</p>
 
+<h3>Preview a reviewed change</h3>
+<p>Save and enable the scenarios you want to compare, then press <kbd>p</kbd>
+from a firewall operation or staged-plan confirmation. You can also select
+<em>Preview staged traffic</em> in the palette before applying a staged plan.
+The default saved suite loads on demand; a missing, empty, or unsupported suite
+shows an explanation without creating or overwriting a file.</p>
+<p>The preview compares the same saved expectations and base observation against
+the proposed configuration. Runtime and permanent have separate Before, After,
+and Change rows; they are never compared to each other. Disabled scenarios are
+excluded. A change toward Fail is a regression, toward Pass is an improvement;
+Fail to Indeterminate is an improvement in status only. Indeterminate remains
+unknown, and unchanged status does not prove no impact. Incomplete or stale
+comparisons are unavailable.</p>
+<p>Use arrows to select a scenario and <kbd>enter</kbd> for its separate
+before/after reasons and ordered traces. Use <kbd>PgUp</kbd>/<kbd>PgDn</kbd>
+or <kbd>Home</kbd>/<kbd>End</kbd> to scroll. Press <kbd>esc</kbd> to return
+from details, then again to return to the original review or staged plan.
+Preview never applies or clears staged changes. Background refreshes retain the
+preview and open details while firewall data remain unchanged. Changed or
+unavailable firewall data, suite contents, or reviewed intent invalidate the
+preview; reopen it for fresh evidence.</p>
+<p>Preview is configuration evidence only: live connectivity is
+<strong>NOT VERIFIED</strong>. It does not authorize or gate apply. Existing
+apply settings, read-only restrictions and watchdog behavior remain in effect;
+with <code>confirm_destructive=false</code>, immediate mutations still skip
+confirmation. Staged preview remains an explicit option. Offline preview supports
+permanent-only effects; runtime effects require an authoritative daemon snapshot.</p>
+
 <h3>Default suite file</h3>
 <p>The single suite is schema&nbsp;1 at
 <code>&lt;resolved-config-dir&gt;/traffic-tests/default.toml</code>. On Linux the
