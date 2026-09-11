@@ -900,7 +900,35 @@ fn render_confirm(f: &mut Frame, confirmation: &Confirmation, theme: &Theme, scr
         .iter()
         .flat_map(|entry| wrap_text(entry, inner_width))
         .collect();
-    let height = u16::try_from(body.len() + 6)
+    let mut actions = vec![
+        Span::styled("y", theme.ok()),
+        Span::styled(" confirm · ", theme.muted()),
+        Span::styled("s", theme.info()),
+        Span::styled(" stage", theme.muted()),
+    ];
+    let mut remaining = Vec::new();
+    if super::traffic_preview::is_mutation(&confirmation.on_confirm) {
+        remaining.extend([
+            Span::styled("p", theme.info()),
+            Span::styled(" preview traffic · ", theme.muted()),
+        ]);
+    }
+    remaining.extend([
+        Span::styled("n", theme.danger()),
+        Span::styled("/esc cancel", theme.muted()),
+    ]);
+    let action_width: usize = actions.iter().chain(&remaining).map(Span::width).sum();
+    let action_lines = if action_width + 3 <= inner_width {
+        actions.push(Span::styled(" · ", theme.muted()));
+        actions.extend(remaining);
+        vec![Line::from(actions).alignment(Alignment::Center)]
+    } else {
+        vec![
+            Line::from(actions).alignment(Alignment::Center),
+            Line::from(remaining).alignment(Alignment::Center),
+        ]
+    };
+    let height = u16::try_from(body.len() + action_lines.len() + 5)
         .unwrap_or(u16::MAX)
         .min(screen.height);
     let area = centered(screen, width, height);
@@ -911,20 +939,7 @@ fn render_confirm(f: &mut Frame, confirmation: &Confirmation, theme: &Theme, scr
         lines.push(Line::from(Span::styled(format!(" {entry}"), theme.text())));
     }
     lines.push(Line::default());
-    lines.push(
-        Line::from(vec![
-            Span::styled("y", theme.ok()),
-            Span::styled(" confirm · ", theme.muted()),
-            Span::styled("s", theme.info()),
-            Span::styled(" stage · ", theme.muted()),
-            Span::styled("n", theme.danger()),
-            Span::styled("/esc cancel", theme.muted()),
-        ])
-        .alignment(Alignment::Center),
-    );
-    if super::traffic_preview::is_mutation(&confirmation.on_confirm) {
-        lines.push(Line::from("p Preview traffic").alignment(Alignment::Center));
-    }
+    lines.extend(action_lines);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
