@@ -62,6 +62,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Install Rust
+        if: endsWith(matrix.target, '-musl')
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: "1.88"
@@ -69,10 +70,27 @@ jobs:
 
       # Release artifacts are built without a shared cache so cached objects
       # can never cross the signed package boundary.
-      - name: Build fwdeck
+      - name: Build static musl fwdeck
+        if: endsWith(matrix.target, '-musl')
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: cargo build --release --locked --features dbus --target "${BUILD_TARGET}"
+
+      - name: Build GNU fwdeck against EL9 glibc
+        if: endsWith(matrix.target, '-gnu')
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          docker build --file docker/Dockerfile.release --tag fwdeck-release-el9 .
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp --env CARGO_HOME=/tmp/cargo \
+            --env RUSTUP_TOOLCHAIN=1.88.0 --env BUILD_TARGET \
+            --volume "${PWD}:/work" --workdir /work \
+            fwdeck-release-el9 \
+            cargo build --release --locked --features dbus --target "${BUILD_TARGET}"
 
       - name: Package archive
         shell: bash
@@ -124,6 +142,22 @@ jobs:
               --packager "${packager}" \
               --target dist/
           done
+
+      - name: Verify GNU packages on EL9 before upload
+        if: endsWith(matrix.target, '-gnu')
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --user "$(id -u):$(id -g)" --tmpfs /tmp:exec \
+            --env HOME=/tmp --env RELEASE_TAG --env TARGET \
+            --volume "${PWD}:/work:ro" --workdir /work \
+            fwdeck-release-el9 \
+            bash scripts/test-release-artifacts.sh "${RELEASE_TAG}" "${TARGET}" dist
 
       - name: Upload build artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

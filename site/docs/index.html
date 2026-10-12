@@ -166,6 +166,12 @@ inclusion in the official Debian and Fedora repositories, are on the roadmap.</d
 <p>Every release also ships signed archives for <code>x86_64</code> and
 <code>aarch64</code>, in glibc and fully-static musl variants. Each archive
 contains the binary, bash/zsh/fish completions, the man page, and the license.</p>
+<p>GNU release builds target <strong>glibc 2.34 or newer</strong> (EL9).
+The packaged binaries are checked on AlmaLinux 9 before upload.</p>
+<div class="note"><strong>v0.5.1:</strong> its GNU binaries require glibc 2.39.
+Until the corrected release is available, use the signed
+<code>*-unknown-linux-musl.tar.gz</code> archive on EL9, or compile from source.
+Follow the <a href="#verification">release verification</a> steps before installing.</div>
 <h3>From source</h3>
 <pre><span class="g">$</span> cargo install --git https://github.com/madebydaniz/fwdeck --locked</pre>
 <p>Needs Rust 1.88+.</p>

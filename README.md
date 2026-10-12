@@ -68,6 +68,13 @@ sudo dnf install ./fwdeck-*.rpm    # Fedora/RHEL
 Prebuilt signed binaries (`x86_64`/`aarch64`, glibc & static musl) with shell
 completions and a man page are on the same releases.
 
+GNU release builds target **glibc 2.34 or newer** (EL9). The release pipeline
+checks the packaged binaries on AlmaLinux 9 before upload.
+
+**v0.5.1:** its GNU binaries require glibc 2.39. Until the corrected release
+is available, use the signed `*-unknown-linux-musl.tar.gz` archive on EL9,
+or compile from source. Verify the archive's checksum and release signature.
+
 Prefer a script? It verifies the SHA-256 checksums and the Cosign release
 signature before installing. Read it first, then run it:
 
