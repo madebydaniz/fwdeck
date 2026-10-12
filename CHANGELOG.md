@@ -3,6 +3,14 @@
 All notable changes to FWDeck are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.5.2](https://github.com/madebydaniz/fwdeck/compare/v0.5.1...v0.5.2) (2026-10-12)
+
+
+### Bug Fixes
+
+* **ci:** keep main compatible with current Clippy ([8ccb173](https://github.com/madebydaniz/fwdeck/commit/8ccb173923051556c7675109ef8cf9d4c6c9df3a))
+* **release:** restore EL9 GNU binary compatibility ([c867b3b](https://github.com/madebydaniz/fwdeck/commit/c867b3bf2ea46ea346c6007aecda5858e54754af))
+
 ## [0.5.1](https://github.com/madebydaniz/fwdeck/compare/v0.5.0...v0.5.1) (2026-08-15)
 
 
