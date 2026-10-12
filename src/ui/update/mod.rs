@@ -222,7 +222,7 @@ pub fn update(state: &mut UiState, action: UiAction) -> Vec<Effect> {
         }
         UiAction::KeepChanges => {
             if !state.pending_rollback.is_empty() {
-                let kept: Vec<_> = state.pending_rollback.drain(..).collect();
+                let kept: Vec<_> = std::mem::take(&mut state.pending_rollback);
                 // Every kept, reversible change joins the undo stack (oldest
                 // first) now that its countdown is resolved, so undo can revert
                 // them newest-first.
@@ -1604,7 +1604,7 @@ mod tests {
         update(&mut s, UiAction::InputSubmit);
         update(&mut s, UiAction::SwitchView(ViewId::Zones));
         update(&mut s, UiAction::SwitchView(ViewId::Services));
-        assert!(s.view_state().filter.is_empty());
+        assert_eq!(s.view_state().filter, "");
     }
 
     #[test]
@@ -1626,7 +1626,7 @@ mod tests {
         type_filter(&mut s, "ssh");
         assert!(s.visible_rows().len() < all);
         update(&mut s, UiAction::InputCancel);
-        assert!(s.view_state().filter.is_empty());
+        assert_eq!(s.view_state().filter, "");
         assert_eq!(s.visible_rows().len(), all);
         assert_eq!(s.mode, InputMode::Normal);
     }
@@ -1650,7 +1650,7 @@ mod tests {
         update(&mut s, UiAction::SelectLast);
         type_filter(&mut s, "zzz-no-match");
         assert_eq!(s.view_state().selected, 0);
-        assert!(s.visible_rows().is_empty());
+        assert_eq!(s.visible_rows(), [] as [crate::ui::views::ViewRow; 0]);
     }
 
     #[test]
@@ -1676,7 +1676,10 @@ mod tests {
         let mut s = state();
         // On the Zones view, removing a forward port is impossible → disabled.
         type_palette(&mut s, "remove selected forward");
-        assert!(update(&mut s, UiAction::PaletteExecute).is_empty());
+        assert_eq!(
+            update(&mut s, UiAction::PaletteExecute),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert_eq!(s.overlays.len(), 1, "palette stays open");
         let toast = s.toasts.back().unwrap();
         assert_eq!(toast.kind, ToastKind::Warning);
@@ -1687,7 +1690,10 @@ mod tests {
     fn palette_add_service_opens_the_form() {
         let mut s = state();
         type_palette(&mut s, "add service");
-        assert!(update(&mut s, UiAction::PaletteExecute).is_empty());
+        assert_eq!(
+            update(&mut s, UiAction::PaletteExecute),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert!(
             matches!(s.overlays.last(), Some(Overlay::Form(_))),
             "enabled mutation command must open the form"
@@ -1712,7 +1718,7 @@ mod tests {
             on_confirm: UiAction::Quit,
         }));
         assert_eq!(update(&mut s, UiAction::ConfirmAccept), vec![Effect::Quit]);
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
     }
 
     #[test]
@@ -1720,7 +1726,10 @@ mod tests {
         let mut state = state_with_confirmed_remove_service();
         state.engine_normal_backpressured = true;
         let overlay_count = state.overlays.len();
-        assert!(update(&mut state, UiAction::ConfirmAccept).is_empty());
+        assert_eq!(
+            update(&mut state, UiAction::ConfirmAccept),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert_eq!(state.overlays.len(), overlay_count);
     }
 
@@ -1730,7 +1739,10 @@ mod tests {
         state.rollback_outbox_pending = 10;
         state.rollback_reservations = 10;
         state.pending_rollback = pending_rollbacks(12);
-        assert!(update(&mut state, UiAction::ConfirmAccept).is_empty());
+        assert_eq!(
+            update(&mut state, UiAction::ConfirmAccept),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert_eq!(state.rollback_reservations, 10);
     }
 
@@ -1817,7 +1829,7 @@ mod tests {
         use crate::application::ports::FirewallError;
         let mut s = state();
         update(&mut s, UiAction::ShowErrorDetails);
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         s.backend_error = Some(FirewallError::DaemonNotRunning);
         update(&mut s, UiAction::ShowErrorDetails);
         assert!(matches!(s.overlays.last(), Some(Overlay::Details(_))));
@@ -1913,7 +1925,10 @@ mod tests {
             },
         );
 
-        assert!(update(&mut state, UiAction::ToggleMasqueradeRequested).is_empty());
+        assert_eq!(
+            update(&mut state, UiAction::ToggleMasqueradeRequested),
+            [] as [crate::ui::action::Effect; 0]
+        );
         let effects = update(&mut state, UiAction::ConfirmAccept);
 
         assert!(effects.iter().any(|effect| {
@@ -2074,7 +2089,10 @@ mod tests {
             },
         );
 
-        assert!(!state.all_rows(ViewId::Zones).is_empty());
+        assert_ne!(
+            state.all_rows(ViewId::Zones),
+            [] as [crate::ui::views::ViewRow; 0]
+        );
     }
 
     #[test]
@@ -2096,7 +2114,10 @@ mod tests {
             },
         );
 
-        assert!(update(&mut state, UiAction::ToggleMasqueradeRequested).is_empty());
+        assert_eq!(
+            update(&mut state, UiAction::ToggleMasqueradeRequested),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert!(!matches!(state.overlays.last(), Some(Overlay::Confirm(_))));
     }
 
@@ -2448,14 +2469,14 @@ mod tests {
         s.last_refresh = Some(previous_refresh.clone());
         let toast_count = s.toasts.len();
 
-        assert!(
+        assert_eq!(
             update(
                 &mut s,
                 UiAction::ManualDemandRejected {
                     count: NonZeroU64::new(7).unwrap(),
                 },
-            )
-            .is_empty()
+            ),
+            [] as [crate::ui::action::Effect; 0]
         );
 
         assert_eq!(s.active_refresh, Some(refresh_id));
@@ -2566,7 +2587,10 @@ mod tests {
         for c in "mdns".chars() {
             update(&mut s, UiAction::FormInput(c));
         }
-        assert!(update(&mut s, UiAction::FormSubmit).is_empty());
+        assert_eq!(
+            update(&mut s, UiAction::FormSubmit),
+            [] as [crate::ui::action::Effect; 0]
+        );
         // Form replaced by confirmation with target + description.
         match s.overlays.last() {
             Some(Overlay::Confirm(confirmation)) => {
@@ -2585,7 +2609,7 @@ mod tests {
             }
             other => panic!("expected apply effect, got {other:?}"),
         }
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
     }
 
     #[test]
@@ -2682,7 +2706,7 @@ mod tests {
             ),
         );
 
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert!(s.toasts.back().is_some_and(|toast| {
             toast.kind == ToastKind::Warning && toast.text.contains("prefilled value")
         }));
@@ -2810,7 +2834,7 @@ mod tests {
         update(&mut s, UiAction::SwitchView(ViewId::Zones));
         // space now marks, does not toggle masquerade
         update(&mut s, UiAction::ToggleMark);
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert_eq!(s.view_state().marked.len(), 1);
     }
 
@@ -2878,8 +2902,11 @@ mod tests {
     fn read_only_blocks_mutations_with_a_toast() {
         let mut s = state();
         s.read_only = true;
-        assert!(update(&mut s, UiAction::ReloadRequested).is_empty());
-        assert!(s.overlays.is_empty());
+        assert_eq!(
+            update(&mut s, UiAction::ReloadRequested),
+            [] as [crate::ui::action::Effect; 0]
+        );
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert!(s.toasts.back().unwrap().text.contains("read-only"));
     }
 
@@ -2893,7 +2920,7 @@ mod tests {
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
         update(&mut s, UiAction::RequestOperation(op));
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert_eq!(s.toasts.back().map(|t| t.kind), Some(ToastKind::Warning));
     }
 
@@ -2906,7 +2933,7 @@ mod tests {
             &effects[..],
             [Effect::Apply(request)] if request.operation == FirewallOperation::Reload
         ));
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
     }
 
     #[test]
@@ -3119,7 +3146,7 @@ mod tests {
         update(&mut s, UiAction::OpenAbout);
         assert!(matches!(s.overlays.last(), Some(Overlay::About)));
         update(&mut s, UiAction::CloseOverlay);
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
     }
 
     #[test]
@@ -3168,7 +3195,7 @@ mod tests {
             watchdog_unit: None,
         });
         let effects = update(&mut s, UiAction::Quit);
-        assert!(effects.is_empty());
+        assert_eq!(effects, [] as [crate::ui::action::Effect; 0]);
         match s.overlays.last() {
             Some(Overlay::Confirm(confirm)) => {
                 assert!(confirm.body.iter().any(|line| line.contains("revert")));
@@ -3261,7 +3288,10 @@ mod tests {
         );
         // Keeping the change resolves the countdown and makes it undoable.
         update(&mut s, UiAction::KeepChanges);
-        assert!(s.pending_rollback.is_empty());
+        assert_eq!(
+            s.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
         assert_eq!(s.undo_stack.last(), Some(&op));
     }
 
@@ -3332,7 +3362,7 @@ mod tests {
         let mut s = state();
         // No baseline captured yet → informative toast, no overlay.
         update(&mut s, UiAction::ShowSessionDiff);
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert!(s.toasts.back().is_some_and(|t| t.text.contains("baseline")));
 
         // Capture a baseline (as the first refresh would) → diff opens read-only.
@@ -3522,7 +3552,7 @@ mod tests {
         s.snapshot = Some(std::sync::Arc::new(snapshot));
         update(&mut s, UiAction::SwitchView(ViewId::Direct));
         update(&mut s, UiAction::AddEntry);
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert!(
             s.toasts
                 .back()
@@ -3712,7 +3742,7 @@ mod tests {
         };
         s.overlays.clear();
         update(&mut s, UiAction::RequestOperation(op));
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert!(
             s.toasts
                 .back()
@@ -3746,7 +3776,7 @@ mod tests {
                 target: ConfigurationTarget::RuntimeAndPermanent,
             }),
         );
-        assert!(s.overlays.is_empty());
+        assert_eq!(s.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert!(
             s.toasts
                 .back()
@@ -4046,7 +4076,10 @@ mod tests {
             &mut s,
             UiAction::ApplyOperation(reviewed(operation.clone())),
         );
-        assert!(s.pending_rollback.is_empty());
+        assert_eq!(
+            s.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
         // The engine retracts the pre-armed guard before emitting a clean
         // failure, so the UI must not receive or create a rollback entry.
         let effects = update(
@@ -4112,7 +4145,10 @@ mod tests {
             ),
         );
         assert_eq!(state.rollback_reservations, 0);
-        assert!(state.pending_rollback.is_empty());
+        assert_eq!(
+            state.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
 
         assert!(matches!(
             update(&mut state, UiAction::ApplyOperation(reviewed(operation))).as_slice(),
@@ -4159,7 +4195,10 @@ mod tests {
             ] if unit == "fwdeck-rollback-test-1" => {}
             other => panic!("expected correlated inverse AddPort, got {other:?}"),
         }
-        assert!(s.pending_rollback.is_empty());
+        assert_eq!(
+            s.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
     }
 
     #[test]
@@ -4171,7 +4210,10 @@ mod tests {
             target: ConfigurationTarget::RuntimeAndPermanent,
         };
         update(&mut s, UiAction::ApplyOperation(reviewed(op.clone())));
-        assert!(s.pending_rollback.is_empty());
+        assert_eq!(
+            s.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
         update(
             &mut s,
             finished(
@@ -4229,7 +4271,10 @@ mod tests {
             })),
         );
         assert!(matches!(effects.as_slice(), [Effect::Apply(_)]));
-        assert!(s.pending_rollback.is_empty());
+        assert_eq!(
+            s.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
     }
 
     #[test]
@@ -4279,7 +4324,10 @@ mod tests {
             effects.iter().any(|e| matches!(e, Effect::ApplyPlan(_))),
             "the confirmed plan is dispatched"
         );
-        assert!(s.pending_rollback.is_empty());
+        assert_eq!(
+            s.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
         assert!(s.staged.is_empty(), "plan drained after apply");
     }
 
@@ -4341,12 +4389,12 @@ mod tests {
             service: ServiceName::parse("samba-client").unwrap(),
             target: ConfigurationTarget::Runtime,
         };
-        assert!(
+        assert_eq!(
             update(
                 &mut state,
                 UiAction::ApplyOperation(reviewed(mutation.clone()))
-            )
-            .is_empty()
+            ),
+            [] as [crate::ui::action::Effect; 0]
         );
         assert!(state.toasts.iter().any(|toast| {
             toast.kind == ToastKind::Warning && toast.text.contains("plan is still running")
@@ -4435,7 +4483,10 @@ mod tests {
         );
 
         assert_eq!(state.in_flight_plan_rollback, active_before);
-        assert!(state.staged.is_empty());
+        assert_eq!(
+            state.staged,
+            [] as [crate::domain::operation::FirewallOperation; 0]
+        );
         assert!(state.toasts.iter().any(|toast| {
             toast.kind == ToastKind::Error && toast.text.contains("stale plan completion")
         }));
@@ -4484,7 +4535,10 @@ mod tests {
         );
 
         assert_eq!(active_plan_id(&state), second_id);
-        assert!(state.staged.is_empty());
+        assert_eq!(
+            state.staged,
+            [] as [crate::domain::operation::FirewallOperation; 0]
+        );
     }
 
     #[test]

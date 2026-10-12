@@ -64,6 +64,10 @@ fn output(exit_code: Option<i32>, stdout: &str, stderr: &str) -> CommandOutput {
     }
 }
 
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "test double preserves lazy execution without asynchronous I/O"
+)]
 impl CommandRunner for FakeRunner {
     async fn run(&self, request: CommandRequest) -> Result<CommandOutput, ProcessError> {
         assert_eq!(request.program, "firewall-cmd");

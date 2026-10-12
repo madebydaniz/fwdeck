@@ -1451,6 +1451,10 @@ mod tests {
     #[derive(Default)]
     struct TestRollbackGuard;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl RollbackGuard for TestRollbackGuard {
         async fn arm(
             &self,
@@ -1477,6 +1481,10 @@ mod tests {
         log: Arc<Mutex<GuardLog>>,
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl RollbackGuard for RecordingRollbackGuard {
         async fn arm(
             &self,
@@ -1496,6 +1504,10 @@ mod tests {
 
     struct FailingArmGuard;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl RollbackGuard for FailingArmGuard {
         async fn arm(
             &self,
@@ -1513,6 +1525,10 @@ mod tests {
 
     struct FailingDisarmGuard;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl RollbackGuard for FailingDisarmGuard {
         async fn arm(
             &self,
@@ -1533,6 +1549,10 @@ mod tests {
         fail: bool,
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl FirewallBackend for FakeBackend {
         async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
             Err(FirewallError::DaemonNotRunning)
@@ -1647,6 +1667,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl FirewallBackend for ControlledSnapshotBackend {
         async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
             Err(FirewallError::DaemonNotRunning)
@@ -1789,6 +1813,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl FirewallBackend for ObservationBackend {
         async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
             Err(FirewallError::DaemonNotRunning)
@@ -1901,6 +1929,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl FirewallBackend for LargeBackend {
         async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
             mock::sample()
@@ -1971,6 +2003,10 @@ mod tests {
         apply_calls: Arc<AtomicUsize>,
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl FirewallBackend for DriftingBackend {
         async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
             Err(FirewallError::DaemonNotRunning)
@@ -2336,7 +2372,10 @@ mod tests {
                 assert_eq!(schedule.trigger, RefreshTrigger::Initial);
                 assert_eq!(snapshot.default_zone.as_str(), "public");
                 assert_eq!(observation.process_count, None);
-                assert!(observation.sections.is_empty());
+                assert_eq!(
+                    observation.sections,
+                    [] as [crate::domain::observation::RefreshSectionObservation; 0]
+                );
             }
             other => panic!("expected successful refresh, got {other:?}"),
         }
@@ -2462,7 +2501,13 @@ mod tests {
             other => panic!("expected rejected operation, got {other:?}"),
         }
         assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
-        assert!(guard_log.lock().unwrap().armed.is_empty());
+        assert_eq!(
+            guard_log.lock().unwrap().armed,
+            [] as [(
+                crate::application::ports::RollbackGuardId,
+                crate::domain::operation::FirewallOperation
+            ); 0]
+        );
         assert!(snapshot_calls.load(Ordering::SeqCst) >= 2);
     }
 
@@ -2564,6 +2609,10 @@ mod tests {
         fail_at: usize,
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl FirewallBackend for CountingBackend {
         async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
             Err(FirewallError::DaemonNotRunning)
@@ -2668,7 +2717,13 @@ mod tests {
             } if remaining.len() == 2
         ));
         assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
-        assert!(guard_log.lock().unwrap().armed.is_empty());
+        assert_eq!(
+            guard_log.lock().unwrap().armed,
+            [] as [(
+                crate::application::ports::RollbackGuardId,
+                crate::domain::operation::FirewallOperation
+            ); 0]
+        );
     }
 
     #[tokio::test]
@@ -2740,7 +2795,13 @@ mod tests {
             } if remaining == &[FirewallOperation::Reload]
         ));
         assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
-        assert!(guard_log.lock().unwrap().armed.is_empty());
+        assert_eq!(
+            guard_log.lock().unwrap().armed,
+            [] as [(
+                crate::application::ports::RollbackGuardId,
+                crate::domain::operation::FirewallOperation
+            ); 0]
+        );
     }
 
     #[tokio::test]
@@ -2783,7 +2844,10 @@ mod tests {
             other => panic!("expected rollback completion, got {other:?}"),
         }
         assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
-        assert!(guard_log.lock().unwrap().disarmed.is_empty());
+        assert_eq!(
+            guard_log.lock().unwrap().disarmed,
+            [] as [std::string::String; 0]
+        );
     }
 
     async fn drain_initial_refresh(rx: &mut mpsc::Receiver<EngineEvent>) {

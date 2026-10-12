@@ -234,6 +234,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl CommandRunner for FakeRunner {
         async fn run(&self, request: CommandRequest) -> Result<CommandOutput, ProcessError> {
             self.seen.lock().unwrap().push(request);
@@ -361,7 +365,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(runner.seen().is_empty());
+        assert_eq!(
+            runner.seen(),
+            [] as [crate::infrastructure::process::CommandRequest; 0]
+        );
     }
 
     #[tokio::test]

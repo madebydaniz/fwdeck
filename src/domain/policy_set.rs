@@ -77,9 +77,7 @@ impl PolicySetScope {
             .collect();
         let manifest_complete = members.len() == manifest.len()
             && manifest.iter().all(|member| {
-                PolicyName::parse(member)
-                    .ok()
-                    .is_some_and(|member| policies.contains_key(&member))
+                PolicyName::parse(member).is_ok_and(|member| policies.contains_key(&member))
             });
         let disabled = members
             .iter()

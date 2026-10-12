@@ -1044,8 +1044,8 @@ impl FirewallOperation {
                     |info: &super::snapshot::IpSetInfo| info.entries.contains(&entry) == adding;
                 PostconditionProbe::from_option(scoped_postcondition(
                     target,
-                    snapshot.ipsets.runtime.get(name).map(&desired),
-                    snapshot.ipsets.permanent.get(name).map(&desired),
+                    snapshot.ipsets.runtime.get(name).map(desired),
+                    snapshot.ipsets.permanent.get(name).map(desired),
                 ))
             }
             _ => PostconditionProbe::NotApplicable,
@@ -1097,8 +1097,8 @@ impl FirewallOperation {
                 };
                 return PostconditionProbe::from_option(scoped_postcondition(
                     target,
-                    snapshot.policies.runtime.get(policy).map(&desired),
-                    permanent(policy).map(&desired),
+                    snapshot.policies.runtime.get(policy).map(desired),
+                    permanent(policy).map(desired),
                 ));
             }
             Self::SetPolicySetEnabled {
@@ -1152,8 +1152,8 @@ impl FirewallOperation {
         };
         scoped_postcondition(
             target,
-            snapshot.runtime.get(&zone).map(&satisfied),
-            snapshot.permanent.get(&zone).map(&satisfied),
+            snapshot.runtime.get(&zone).map(satisfied),
+            snapshot.permanent.get(&zone).map(satisfied),
         )
     }
 
@@ -1193,8 +1193,8 @@ impl FirewallOperation {
                 let needs =
                     |info: &super::snapshot::IpSetInfo| info.entries.contains(&entry) != adding;
                 Some((
-                    snapshot.ipsets.runtime.get(name).is_some_and(&needs),
-                    snapshot.ipsets.permanent.get(name).is_some_and(&needs),
+                    snapshot.ipsets.runtime.get(name).is_some_and(needs),
+                    snapshot.ipsets.permanent.get(name).is_some_and(needs),
                 ))
             }
             Self::AddPolicyService {
@@ -1208,8 +1208,8 @@ impl FirewallOperation {
                     details.services.contains(service) != adding
                 };
                 Some((
-                    snapshot.policies.runtime.get(policy).is_some_and(&needs),
-                    snapshot.policies.permanent.get(policy).is_some_and(&needs),
+                    snapshot.policies.runtime.get(policy).is_some_and(needs),
+                    snapshot.policies.permanent.get(policy).is_some_and(needs),
                 ))
             }
             Self::SetPolicySetEnabled {
@@ -1252,8 +1252,8 @@ impl FirewallOperation {
                 contains(details)
             }
         };
-        let runtime_needs = snapshot.runtime.get(&zone).is_some_and(&needs);
-        let permanent_needs = snapshot.permanent.get(&zone).is_some_and(&needs);
+        let runtime_needs = snapshot.runtime.get(&zone).is_some_and(needs);
+        let permanent_needs = snapshot.permanent.get(&zone).is_some_and(needs);
         let narrowed = match (runtime_needs, permanent_needs) {
             (true, false) => ConfigurationTarget::Runtime,
             (false, true) => ConfigurationTarget::Permanent,
