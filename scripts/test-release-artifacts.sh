@@ -40,7 +40,7 @@ data_member=$(ar t "$dist_dir/$deb_name" | grep -E '^data\.tar\.(gz|xz|zst)$')
 ar p "$dist_dir/$deb_name" "$data_member" >"$tmp_dir/$data_member"
 tar -xf "$tmp_dir/$data_member" -C "$tmp_dir/deb"
 printf '\npayload mismatch\n' >>"$tmp_dir/deb/usr/bin/fwdeck"
-tar -caf "$tmp_dir/$data_member" -C "$tmp_dir/deb" .
+tar --create --auto-compress --file "$tmp_dir/$data_member" -C "$tmp_dir/deb" .
 (cd "$tmp_dir" && ar r "dist/$deb_name" "$data_member")
 assert_mismatch
 

@@ -16,7 +16,7 @@ assert_exit() {
     fi
 }
 
-printf 'int fixture(void) { return 0; }\n' >"$tmp_dir/library.c"
+printf '#include <stdio.h>\nint fixture(void) { return puts("fixture"); }\n' >"$tmp_dir/library.c"
 printf 'extern int fixture(void); int main(void) { return fixture(); }\n' >"$tmp_dir/main.c"
 
 # Real ELF imports catch numeric-ordering mistakes and permissive ABI checks.
