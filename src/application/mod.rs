@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod engine;
+mod identity;
 mod observation;
 pub mod ports;
 mod refresh_scheduler;

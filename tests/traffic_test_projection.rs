@@ -586,7 +586,7 @@ fn service_policy_and_zone_lifecycle_failures_are_typed() {
             &[operation],
         )
         .unwrap_err();
-        assert!(!error.to_string().is_empty());
+        assert_ne!(error.to_string(), "");
     }
 }
 
@@ -707,7 +707,7 @@ fn duplicate_creates_and_target_specific_missing_objects_are_rejected() {
             &[operation],
         )
         .unwrap_err();
-        assert!(!error.to_string().is_empty());
+        assert_ne!(error.to_string(), "");
     }
 }
 
@@ -777,8 +777,11 @@ fn projection_metadata_degradation_and_policy_lifecycle_are_preserved() {
         target: ConfigurationTarget::RuntimeAndPermanent,
     };
     let projection = project(&base, EvaluationTarget::Runtime, &[unsupported]);
-    assert!(!projection.unknown_effects()[0].dimensions().is_empty());
-    assert!(!format!("{:?}", projection.unknown_effects()[0].object()).is_empty());
+    assert_ne!(projection.unknown_effects()[0].dimensions(), []);
+    assert_ne!(
+        format!("{:?}", projection.unknown_effects()[0].object()),
+        ""
+    );
 }
 
 #[test]

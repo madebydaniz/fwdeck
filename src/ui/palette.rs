@@ -949,13 +949,16 @@ mod tests {
     #[test]
     fn traffic_entry_requests_only_one_explicit_load() {
         let mut state = UiState::new(&Config::default(), "test".into(), false, None);
-        assert!(crate::ui::update::update(&mut state, UiAction::Tick).is_empty());
+        assert_eq!(
+            crate::ui::update::update(&mut state, UiAction::Tick),
+            [] as [crate::ui::action::Effect; 0]
+        );
         let effects =
             crate::ui::update::update(&mut state, UiAction::SwitchView(ViewId::TrafficTests));
         assert_eq!(effects.len(), 1, "explicit entry must request suite load");
-        assert!(
-            crate::ui::update::update(&mut state, UiAction::SwitchView(ViewId::TrafficTests))
-                .is_empty()
+        assert_eq!(
+            crate::ui::update::update(&mut state, UiAction::SwitchView(ViewId::TrafficTests)),
+            [] as [crate::ui::action::Effect; 0]
         );
     }
     #[test]
@@ -1032,7 +1035,7 @@ mod tests {
         let palette = state.palette().expect("template picker did not open");
         assert_eq!(palette.scope, PaletteScope::TrafficTemplates);
         crate::ui::update::update(&mut state, UiAction::CloseOverlay);
-        assert!(state.overlays.is_empty());
+        assert_eq!(state.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert_eq!(state.traffic.suite, suite_before);
     }
 

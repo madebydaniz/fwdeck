@@ -1077,7 +1077,10 @@ mod tests {
                 effect.support, expected_support,
                 "unexpected effect classification for {operation:?}"
             );
-            assert!(!effect.dimensions.is_empty());
+            assert_ne!(
+                effect.dimensions,
+                [] as [crate::domain::operation_effect::TrafficDimension; 0]
+            );
         }
     }
 

@@ -181,7 +181,7 @@ fn assert_metadata(metadata: &FixtureMetadata) {
     assert_eq!(metadata.schema_version, 1);
     assert_eq!(metadata.fixture_version, "phase0-v1");
     assert_eq!(metadata.reviewed_on, "2026-08-21");
-    assert!(!metadata.sources.is_empty());
+    assert_ne!(metadata.sources, [] as [std::string::String; 0]);
     assert!(metadata.sources.iter().all(|source| {
         source.starts_with("https://firewalld.org/") && !source.contains(char::is_whitespace)
     }));

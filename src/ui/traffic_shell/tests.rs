@@ -181,7 +181,7 @@ async fn traffic_shell_reviewed_create_edit_reload_uses_service_revision() {
         crate::ui::update::update(&mut state, routed.unwrap());
         let action = shell.next_action().await.unwrap();
         crate::ui::update::update(&mut state, action);
-        assert!(state.overlays.is_empty());
+        assert_eq!(state.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         let SuiteState::Available(saved) = &state.traffic.suite else {
             panic!("saved suite unavailable")
         };
@@ -233,12 +233,18 @@ async fn traffic_shell_conflict_retains_candidate_and_requires_explicit_discard_
     };
     assert_eq!(editor.stage, Stage::Failed);
     assert!(Arc::ptr_eq(editor.candidate.as_ref().unwrap(), candidate));
-    assert!(crate::ui::update::update(&mut state, UiAction::TrafficEdit(A::Save)).is_empty());
+    assert_eq!(
+        crate::ui::update::update(&mut state, UiAction::TrafficEdit(A::Save)),
+        [] as [crate::ui::action::Effect; 0]
+    );
     let rejection = shell.route(&effect, &state).unwrap();
     assert!(
         matches!(rejection, UiAction::TrafficSaveRejected(_, ref error) if error.contains("unavailable"))
     );
-    assert!(crate::ui::update::update(&mut state, UiAction::TrafficReload).is_empty());
+    assert_eq!(
+        crate::ui::update::update(&mut state, UiAction::TrafficReload),
+        [] as [crate::ui::action::Effect; 0]
+    );
     let effects = crate::ui::update::update(&mut state, UiAction::TrafficEdit(A::Discard));
     assert_eq!(effects, vec![Effect::TrafficLoad]);
     let action = shell.route(&effects[0], &state).unwrap();
@@ -285,7 +291,7 @@ async fn traffic_shell_save_busy_is_visible_and_accepted_save_rearms_closed_lane
     );
     let action = shell.next_action().await.unwrap();
     crate::ui::update::update(&mut state, action);
-    assert!(state.overlays.is_empty());
+    assert_eq!(state.overlays, [] as [crate::ui::overlays::Overlay; 0]);
     shell.shutdown().await.unwrap();
 }
 
