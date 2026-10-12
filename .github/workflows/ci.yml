@@ -130,6 +130,7 @@ jobs:
           scripts/run-dbus-coverage.sh
           scripts/check-glibc.sh scripts/test-glibc-checker.sh
           scripts/check-release-artifacts.sh scripts/test-release-artifacts.sh
+          scripts/check-release-runtime.sh
       - name: Test D-Bus coverage checker
         run: ./scripts/test-dbus-coverage-checker.sh
       - name: Test D-Bus coverage runner

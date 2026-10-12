@@ -69,7 +69,8 @@ Prebuilt signed binaries (`x86_64`/`aarch64`, glibc & static musl) with shell
 completions and a man page are on the same releases.
 
 GNU release builds target **glibc 2.34 or newer** (EL9). The release pipeline
-checks the packaged binaries on AlmaLinux 9 before upload.
+checks the packaged binaries on AlmaLinux 9 and startup on clean AlmaLinux 9
+and Oracle Linux 9 runtimes before upload.
 
 **v0.5.1:** its GNU binaries require glibc 2.39. Until the corrected release
 is available, use the signed `*-unknown-linux-musl.tar.gz` archive on EL9,

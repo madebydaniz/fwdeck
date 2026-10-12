@@ -159,6 +159,24 @@ jobs:
             fwdeck-release-el9 \
             bash scripts/test-release-artifacts.sh "${RELEASE_TAG}" "${TARGET}" dist
 
+      - name: Verify GNU startup on clean EL9 runtimes
+        if: endsWith(matrix.target, '-gnu')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ALMA_IMAGE: almalinux:9@sha256:9819dc675b67b595c2b59e42be7763fca1a8bb217fa5944e04daa22e9a64db16
+          ORACLE_IMAGE: oraclelinux:9@sha256:9c17aad70aaff782a1c31d20d5121ba205c19589d1f2ae2ee04b30b1498375c5
+        run: |
+          set -euo pipefail
+          for image in "${ALMA_IMAGE}" "${ORACLE_IMAGE}"; do
+            docker run --rm --network none --read-only \
+              --cap-drop ALL --security-opt no-new-privileges \
+              --user "$(id -u):$(id -g)" --tmpfs /tmp:exec \
+              --env HOME=/tmp --volume "${PWD}:/work:ro" --workdir /work \
+              "${image}" bash scripts/check-release-runtime.sh \
+              "target/${TARGET}/release/fwdeck"
+          done
+
       - name: Upload build artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
