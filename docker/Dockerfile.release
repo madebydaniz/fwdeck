@@ -1,0 +1,15 @@
+# EL9 is the oldest glibc runtime supported by GNU release artifacts.
+FROM almalinux:9@sha256:9819dc675b67b595c2b59e42be7763fca1a8bb217fa5944e04daa22e9a64db16
+
+RUN dnf install -y gcc binutils ca-certificates curl-minimal tar gzip xz cpio rpm diffutils \
+    && dnf clean all
+
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.88.0 \
+    && rm /tmp/rustup-init.sh
+
+WORKDIR /work

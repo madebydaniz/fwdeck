@@ -7,6 +7,7 @@ on:
       - ".github/dependabot.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "docker/Dockerfile.release"
       - "flake.nix"
       - "packaging/**"
       - "scripts/**"
@@ -17,6 +18,7 @@ on:
       - ".github/dependabot.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "docker/Dockerfile.release"
       - "flake.nix"
       - "packaging/**"
       - "scripts/**"
@@ -39,7 +41,7 @@ jobs:
       release_tag: v0.0.0
       checkout_ref: ${{ github.sha }}
       build_matrix: >-
-        {"include":[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu"}]}
+        {"include":[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu"},{"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu"}]}
 
   verify:
     name: Verify release artifact chain
