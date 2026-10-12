@@ -1499,7 +1499,10 @@ mod tests {
         .unwrap();
         assert_eq!(action, UiAction::Tick);
         process_action(&mut state, &mut outbox, action).await;
-        assert!(state.pending_rollback.is_empty());
+        assert_eq!(
+            state.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
         assert_eq!(outbox.rollback_pending(), 1);
         assert!(outbox.normal_pending());
         assert_eq!(engine.requests.capacity(), 0);
@@ -1758,7 +1761,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.rollback_reservations, 0);
-        assert!(state.pending_rollback.is_empty());
+        assert_eq!(
+            state.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
         assert_eq!(outbox.rollback_pending(), 0);
         assert_eq!(
             *backend.applied_operations.lock().unwrap(),
@@ -1849,6 +1855,9 @@ mod tests {
 
         drain_rollbacks_on_exit(&mut state, &mut outbox, &mut engine).await;
         responder.await.unwrap();
-        assert!(state.pending_rollback.is_empty());
+        assert_eq!(
+            state.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
     }
 }

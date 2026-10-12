@@ -174,7 +174,10 @@ fn referenced_services_are_preexpanded_with_typed_failures() {
     let web = index
         .service(&ServiceName::parse("web-stack").unwrap())
         .unwrap();
-    assert!(web.failures.is_empty());
+    assert_eq!(
+        web.failures,
+        [] as [fwdeck::domain::ServiceResolutionFailure; 0]
+    );
     assert_eq!(
         web.effective
             .ports

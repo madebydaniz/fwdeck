@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(observed.target, ZoneTarget::Default);
         assert_eq!(observed.ingress_priority.get(), -120);
         assert_eq!(observed.egress_priority.get(), 240);
-        assert!(observed.incomplete.is_empty());
+        assert_eq!(observed.incomplete, [] as [String; 0]);
     }
 
     #[test]
@@ -877,7 +877,7 @@ mod tests {
 
         assert_eq!(observed.ingress_priority.get(), 0);
         assert_eq!(observed.egress_priority.get(), 0);
-        assert!(observed.incomplete.is_empty());
+        assert_eq!(observed.incomplete, [] as [String; 0]);
     }
 
     #[test]

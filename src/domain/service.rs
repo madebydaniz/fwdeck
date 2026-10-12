@@ -291,7 +291,10 @@ mod tests {
             vec![name("root"), name("middle"), name("leaf")]
         );
         assert_eq!(resolved.effective.ports.len(), 3);
-        assert!(resolved.failures.is_empty());
+        assert_eq!(
+            resolved.failures,
+            [] as [crate::domain::service::ServiceResolutionFailure; 0]
+        );
     }
 
     #[test]
@@ -310,7 +313,10 @@ mod tests {
             vec![name("root"), name("left"), name("shared"), name("right")]
         );
         assert_eq!(resolved.effective.ports.len(), 4);
-        assert!(resolved.failures.is_empty());
+        assert_eq!(
+            resolved.failures,
+            [] as [crate::domain::service::ServiceResolutionFailure; 0]
+        );
     }
 
     #[test]

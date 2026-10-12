@@ -86,7 +86,10 @@ mod tests {
 
     #[test]
     fn empty_query_returns_no_hits() {
-        assert!(hits(&state(), "   ").is_empty());
+        assert_eq!(
+            hits(&state(), "   "),
+            [] as [crate::ui::search::SearchHit; 0]
+        );
     }
 
     #[test]

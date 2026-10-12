@@ -2376,7 +2376,10 @@ mod tests {
                 assert_eq!(schedule.trigger, RefreshTrigger::Initial);
                 assert_eq!(snapshot.default_zone.as_str(), "public");
                 assert_eq!(observation.process_count, None);
-                assert!(observation.sections.is_empty());
+                assert_eq!(
+                    observation.sections,
+                    [] as [crate::domain::observation::RefreshSectionObservation; 0]
+                );
             }
             other => panic!("expected successful refresh, got {other:?}"),
         }
@@ -2502,7 +2505,13 @@ mod tests {
             other => panic!("expected rejected operation, got {other:?}"),
         }
         assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
-        assert!(guard_log.lock().unwrap().armed.is_empty());
+        assert_eq!(
+            guard_log.lock().unwrap().armed,
+            [] as [(
+                crate::application::ports::RollbackGuardId,
+                crate::domain::operation::FirewallOperation
+            ); 0]
+        );
         assert!(snapshot_calls.load(Ordering::SeqCst) >= 2);
     }
 
@@ -2708,7 +2717,13 @@ mod tests {
             } if remaining.len() == 2
         ));
         assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
-        assert!(guard_log.lock().unwrap().armed.is_empty());
+        assert_eq!(
+            guard_log.lock().unwrap().armed,
+            [] as [(
+                crate::application::ports::RollbackGuardId,
+                crate::domain::operation::FirewallOperation
+            ); 0]
+        );
     }
 
     #[tokio::test]
@@ -2780,7 +2795,13 @@ mod tests {
             } if remaining == &[FirewallOperation::Reload]
         ));
         assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
-        assert!(guard_log.lock().unwrap().armed.is_empty());
+        assert_eq!(
+            guard_log.lock().unwrap().armed,
+            [] as [(
+                crate::application::ports::RollbackGuardId,
+                crate::domain::operation::FirewallOperation
+            ); 0]
+        );
     }
 
     #[tokio::test]
@@ -2823,7 +2844,10 @@ mod tests {
             other => panic!("expected rollback completion, got {other:?}"),
         }
         assert_eq!(backend.apply_calls.load(Ordering::SeqCst), 0);
-        assert!(guard_log.lock().unwrap().disarmed.is_empty());
+        assert_eq!(
+            guard_log.lock().unwrap().disarmed,
+            [] as [std::string::String; 0]
+        );
     }
 
     async fn drain_initial_refresh(rx: &mut mpsc::Receiver<EngineEvent>) {

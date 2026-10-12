@@ -135,7 +135,7 @@ fn pre_priority_firewalld_may_omit_cli_fields_without_false_degradation() {
         parse::parse_list_all_zones_with_priority_support(raw, FeatureSupport::Unsupported);
 
     assert!(zones.contains_key(&zone("public")));
-    assert!(degraded.is_empty());
+    assert_eq!(degraded, [] as [std::string::String; 0]);
 }
 
 #[test]
@@ -157,8 +157,14 @@ fn tab_indented_forward_ports_and_rich_rules_attach_to_their_zone() {
     );
 
     // Entries must not leak into neighboring zones.
-    assert!(zones[&zone("trusted")].forward_ports.is_empty());
-    assert!(zones[&zone("trusted")].rich_rules.is_empty());
+    assert_eq!(
+        zones[&zone("trusted")].forward_ports,
+        [] as [fwdeck::domain::ForwardPort; 0]
+    );
+    assert_eq!(
+        zones[&zone("trusted")].rich_rules,
+        [] as [fwdeck::domain::RichRule; 0]
+    );
 }
 
 #[test]
@@ -195,7 +201,7 @@ fn runtime_permanent_drift_is_visible_after_parsing() {
     assert!(runtime_services.contains(&"http"));
     assert!(!permanent_services.contains(&"http"));
     assert!(permanent_services.contains(&"https"));
-    assert!(permanent[&name].ports.is_empty());
+    assert_eq!(permanent[&name].ports, [] as [fwdeck::domain::PortSpec; 0]);
 }
 
 #[test]
@@ -293,7 +299,10 @@ fn direct_rules_fixture_parses_verbatim() {
     let rules = parse::parse_direct_rules(DIRECT_RULES);
     assert_eq!(rules.len(), 1);
     assert!(rules[0].starts_with("ipv4 filter INPUT 9"));
-    assert!(parse::parse_direct_rules("").is_empty());
+    assert_eq!(
+        parse::parse_direct_rules(""),
+        [] as [std::string::String; 0]
+    );
 }
 
 #[test]
@@ -309,10 +318,10 @@ fn policy_info_parses() {
     assert_eq!(policy.egress_zones, vec!["ANY".to_owned()]);
     assert_eq!(policy.services.len(), 1);
     assert_eq!(policy.ports[0].to_string(), "8080/tcp");
-    assert!(policy.protocols.is_empty());
+    assert_eq!(policy.protocols, [] as [fwdeck::domain::IpProtocol; 0]);
     assert!(!policy.masquerade);
-    assert!(policy.forward_ports.is_empty());
-    assert!(policy.source_ports.is_empty());
-    assert!(policy.icmp_blocks.is_empty());
-    assert!(policy.rich_rules.is_empty());
+    assert_eq!(policy.forward_ports, [] as [fwdeck::domain::ForwardPort; 0]);
+    assert_eq!(policy.source_ports, [] as [fwdeck::domain::PortSpec; 0]);
+    assert_eq!(policy.icmp_blocks, [] as [fwdeck::domain::IcmpType; 0]);
+    assert_eq!(policy.rich_rules, [] as [fwdeck::domain::RichRule; 0]);
 }

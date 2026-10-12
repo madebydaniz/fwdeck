@@ -340,7 +340,10 @@ mod tests {
     #[test]
     fn identical_snapshots_produce_no_operations() {
         let snap = mock::sample().unwrap();
-        assert!(plan(&snap, &snap).is_empty());
+        assert_eq!(
+            plan(&snap, &snap),
+            [] as [crate::domain::operation::FirewallOperation; 0]
+        );
     }
 
     #[test]
@@ -353,7 +356,10 @@ mod tests {
 
         assert_ne!(current, target, "snapshot equality must include priorities");
         let report = analyze(&current, &target);
-        assert!(report.operations.is_empty());
+        assert_eq!(
+            report.operations,
+            [] as [crate::domain::operation::FirewallOperation; 0]
+        );
         assert_eq!(report.limitations.len(), 1);
         assert!(matches!(
             &report.limitations[0],
