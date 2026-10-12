@@ -252,7 +252,10 @@ mod tests {
     #[test]
     fn identical_snapshots_produce_no_operations() {
         let snap = mock::sample().unwrap();
-        assert!(plan(&snap, &snap).is_empty());
+        assert_eq!(
+            plan(&snap, &snap),
+            [] as [crate::domain::operation::FirewallOperation; 0]
+        );
     }
 
     #[test]

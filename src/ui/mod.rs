@@ -634,7 +634,7 @@ fn collect_armed_rollbacks(
     state: &mut UiState,
     deferred: &mut std::collections::VecDeque<RollbackRequest>,
 ) {
-    let pending: Vec<_> = state.pending_rollback.drain(..).collect();
+    let pending: Vec<_> = std::mem::take(&mut state.pending_rollback);
     for rollback in pending.into_iter().rev() {
         tracing::warn!(operation = %rollback.description, "quit inside rollback window — reverting");
         deferred.push_back(RollbackRequest {
@@ -736,6 +736,10 @@ mod tests {
 
     struct TestRollbackGuard;
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl RollbackGuard for TestRollbackGuard {
         async fn arm(
             &self,
@@ -796,6 +800,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl FirewallBackend for ControlledSnapshotBackend {
         async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
             Err(FirewallError::DaemonNotRunning)
@@ -874,6 +882,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test double preserves lazy execution without asynchronous I/O"
+    )]
     impl FirewallBackend for ControlledApplyBackend {
         async fn probe(&self) -> Result<FirewallStatus, FirewallError> {
             Err(FirewallError::DaemonNotRunning)
@@ -1385,7 +1397,10 @@ mod tests {
         .unwrap();
         assert_eq!(action, UiAction::Tick);
         process_action(&mut state, &mut outbox, action).await;
-        assert!(state.pending_rollback.is_empty());
+        assert_eq!(
+            state.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
         assert_eq!(outbox.rollback_pending(), 1);
         assert!(outbox.normal_pending());
         assert_eq!(engine.requests.capacity(), 0);
@@ -1644,7 +1659,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.rollback_reservations, 0);
-        assert!(state.pending_rollback.is_empty());
+        assert_eq!(
+            state.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
         assert_eq!(outbox.rollback_pending(), 0);
         assert_eq!(
             *backend.applied_operations.lock().unwrap(),
@@ -1735,6 +1753,9 @@ mod tests {
 
         drain_rollbacks_on_exit(&mut state, &mut outbox, &mut engine).await;
         responder.await.unwrap();
-        assert!(state.pending_rollback.is_empty());
+        assert_eq!(
+            state.pending_rollback,
+            [] as [crate::ui::state::PendingRollback; 0]
+        );
     }
 }

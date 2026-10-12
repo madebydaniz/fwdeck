@@ -128,10 +128,15 @@ jobs:
           scripts/test-dbus-coverage-checker.sh
           scripts/test-dbus-coverage-runner.sh
           scripts/run-dbus-coverage.sh
+          scripts/check-glibc.sh scripts/test-glibc-checker.sh
+          scripts/check-release-artifacts.sh scripts/test-release-artifacts.sh
+          scripts/check-release-runtime.sh
       - name: Test D-Bus coverage checker
         run: ./scripts/test-dbus-coverage-checker.sh
       - name: Test D-Bus coverage runner
         run: ./scripts/test-dbus-coverage-runner.sh
+      - name: Test GLIBC baseline checker
+        run: bash scripts/test-glibc-checker.sh
 
   zizmor:
     name: Zizmor (Actions security)
