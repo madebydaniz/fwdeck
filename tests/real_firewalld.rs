@@ -160,7 +160,10 @@ async fn probe_and_snapshot_against_real_daemon() {
         snapshot.runtime.contains_key(&snapshot.default_zone),
         "default zone must exist in the runtime set"
     );
-    assert!(!snapshot.available_services.is_empty());
+    assert_ne!(
+        snapshot.available_services,
+        [] as [fwdeck::domain::ServiceName; 0]
+    );
     let blocklist = fwdeck::domain::IpSetName::parse("blocklist").unwrap();
     assert!(snapshot.ipsets.runtime.contains_key(&blocklist));
     assert!(snapshot.ipsets.permanent.contains_key(&blocklist));

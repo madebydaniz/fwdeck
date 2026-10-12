@@ -57,13 +57,25 @@ fn loaded() -> UiState {
 fn traffic_edit_new_invalid_review_cancel_and_explicit_save() {
     let mut state = state();
     state.read_only = true;
-    assert!(act(&mut state, A::New(Template::Ssh)).is_empty());
+    assert_eq!(
+        act(&mut state, A::New(Template::Ssh)),
+        [] as [crate::ui::action::Effect; 0]
+    );
     assert_eq!(editor(&state).draft.name, "Keep SSH access");
-    assert!(act(&mut state, A::Save).is_empty());
-    assert!(act(&mut state, A::Review).is_empty());
+    assert_eq!(
+        act(&mut state, A::Save),
+        [] as [crate::ui::action::Effect; 0]
+    );
+    assert_eq!(
+        act(&mut state, A::Review),
+        [] as [crate::ui::action::Effect; 0]
+    );
     assert!(editor(&state).error.is_some());
     editor_mut(&mut state).draft.source = "203.0.113.8".into();
-    assert!(act(&mut state, A::Review).is_empty());
+    assert_eq!(
+        act(&mut state, A::Review),
+        [] as [crate::ui::action::Effect; 0]
+    );
     assert_eq!(editor(&state).stage, Stage::Review);
     act(&mut state, A::Cancel);
     assert_eq!(editor(&state).stage, Stage::Draft);
@@ -75,7 +87,10 @@ fn traffic_edit_new_invalid_review_cancel_and_explicit_save() {
     assert_eq!(editor(&state).stage, Stage::Pending);
     let retained = editor(&state).clone();
     for action in [A::Input('x'), A::New(Template::Custom), A::Save, A::Cancel] {
-        assert!(act(&mut state, action).is_empty());
+        assert_eq!(
+            act(&mut state, action),
+            [] as [crate::ui::action::Effect; 0]
+        );
     }
     assert_eq!(editor(&state), &retained);
 }
@@ -94,7 +109,10 @@ fn traffic_edit_discard_guards_close_quit_switch_reload_and_control_keys() {
         let mut state = state();
         valid_editor(&mut state);
         let draft = editor(&state).draft.clone();
-        assert!(crate::ui::update::update(&mut state, action).is_empty());
+        assert_eq!(
+            crate::ui::update::update(&mut state, action),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert!(editor(&state).discard.is_some());
         act(&mut state, A::Keep);
         assert_eq!(editor(&state).draft, draft);
@@ -107,14 +125,17 @@ fn traffic_edit_discard_guards_close_quit_switch_reload_and_control_keys() {
             KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
         )
         .unwrap();
-        assert!(crate::ui::update::update(&mut state, action).is_empty());
+        assert_eq!(
+            crate::ui::update::update(&mut state, action),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert!(editor(&state).discard.is_some());
     }
     let mut state = state();
     valid_editor(&mut state);
     crate::ui::update::update(&mut state, UiAction::TrafficReload);
     assert_eq!(act(&mut state, A::Discard), vec![Effect::TrafficLoad]);
-    assert!(state.overlays.is_empty());
+    assert_eq!(state.overlays, [] as [crate::ui::overlays::Overlay; 0]);
     valid_editor(&mut state);
     assert_eq!(
         crate::ui::update::update(&mut state, UiAction::QuitConfirmed),
@@ -129,7 +150,10 @@ fn traffic_edit_delete_and_toggle_require_review_and_preserve_order() {
         let SuiteState::Available(base) = state.traffic.suite.clone() else {
             unreachable!()
         };
-        assert!(act(&mut state, action.clone()).is_empty());
+        assert_eq!(
+            act(&mut state, action.clone()),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert_eq!(editor(&state).stage, Stage::Review);
         let effects = act(&mut state, A::Save);
         let [Effect::TrafficSave(candidate)] = effects.as_slice() else {
@@ -137,7 +161,10 @@ fn traffic_edit_delete_and_toggle_require_review_and_preserve_order() {
         };
         assert_eq!(candidate.revision, base.revision);
         if action == A::Delete {
-            assert!(candidate.scenarios.is_empty());
+            assert_eq!(
+                candidate.scenarios,
+                [] as [crate::domain::TrafficScenario; 0]
+            );
         } else {
             assert!(!candidate.scenarios[0].enabled);
             assert_eq!(candidate.scenarios[0].id, base.scenarios[0].id);
@@ -154,8 +181,11 @@ fn traffic_edit_load_states_block_forms_and_global_actions_cannot_bypass_modal()
     ] {
         let mut state = state();
         state.traffic.suite = suite;
-        assert!(act(&mut state, A::New(Template::Custom)).is_empty());
-        assert!(state.overlays.is_empty());
+        assert_eq!(
+            act(&mut state, A::New(Template::Custom)),
+            [] as [crate::ui::action::Effect; 0]
+        );
+        assert_eq!(state.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         assert!(state.traffic.error.is_some());
     }
     let mut state = state();
@@ -168,7 +198,10 @@ fn traffic_edit_load_states_block_forms_and_global_actions_cannot_bypass_modal()
         UiAction::DeleteEntry,
         UiAction::TrafficEvaluate,
     ] {
-        assert!(crate::ui::update::update(&mut state, action).is_empty());
+        assert_eq!(
+            crate::ui::update::update(&mut state, action),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert_eq!(editor(&state), &before);
     }
 }
@@ -206,12 +239,13 @@ fn traffic_edit_keyboard_and_palette_expose_local_reviewed_actions() {
     for (selected, expected_name) in [(0, "Keep SSH access"), (3, "")] {
         let mut picker_state = loaded();
         let suite_before = picker_state.traffic.suite.clone();
-        assert!(
-            crate::ui::update::update(&mut picker_state, UiAction::OpenTrafficTemplates).is_empty()
+        assert_eq!(
+            crate::ui::update::update(&mut picker_state, UiAction::OpenTrafficTemplates),
+            [] as [crate::ui::action::Effect; 0]
         );
-        assert!(
-            crate::ui::update::update(&mut picker_state, UiAction::PaletteMove(selected))
-                .is_empty()
+        assert_eq!(
+            crate::ui::update::update(&mut picker_state, UiAction::PaletteMove(selected)),
+            [] as [crate::ui::action::Effect; 0]
         );
         assert!(
             crate::ui::update::update(&mut picker_state, UiAction::PaletteExecute).is_empty(),
@@ -287,7 +321,10 @@ fn traffic_edit_save_completion_matches_exact_candidate_and_failed_draft_needs_r
     ));
     assert!(editor(&state).error.as_deref().unwrap().contains("reload"));
     for action in [A::Save, A::Review, A::Input('x')] {
-        assert!(act(&mut state, action).is_empty());
+        assert_eq!(
+            act(&mut state, action),
+            [] as [crate::ui::action::Effect; 0]
+        );
     }
     crate::ui::update::update(&mut state, UiAction::TrafficReload);
     assert!(editor(&state).discard.is_some());
@@ -333,7 +370,10 @@ fn traffic_edit_failed_save_cannot_be_reopened_without_reload() {
         draft: base,
         error: TrafficStorageError::Conflict,
     };
-    assert!(act(&mut state, A::New(Template::Ssh)).is_empty());
+    assert_eq!(
+        act(&mut state, A::New(Template::Ssh)),
+        [] as [crate::ui::action::Effect; 0]
+    );
     assert!(
         state.overlays.is_empty(),
         "failed authority must block new editors until reload"
@@ -477,7 +517,10 @@ fn traffic_edit_covered_dirty_draft_guards_real_background_outcomes() {
             act(&mut state, A::Keep);
             assert!(retained(&state).discard.is_none());
         }
-        assert!(crate::ui::update::update(&mut state, UiAction::CloseOverlay).is_empty());
+        assert_eq!(
+            crate::ui::update::update(&mut state, UiAction::CloseOverlay),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert_eq!(editor(&state).draft, draft);
     }
 }
@@ -607,7 +650,10 @@ fn traffic_edit_covered_rejection_and_discard_target_only_editor() {
             .unwrap()
             .contains("service busy")
     );
-    assert!(crate::ui::update::update(&mut state, UiAction::TrafficReload).is_empty());
+    assert_eq!(
+        crate::ui::update::update(&mut state, UiAction::TrafficReload),
+        [] as [crate::ui::action::Effect; 0]
+    );
     assert!(retained(&state).discard.is_some());
     assert_eq!(act(&mut state, A::Discard), vec![Effect::TrafficLoad]);
     assert_eq!(
@@ -641,7 +687,10 @@ fn traffic_edit_covered_editor_does_not_interrupt_existing_rollback_tick() {
             |effect| matches!(effect, Effect::ApplyRollback { id: actual, .. } if *actual == id)
         )
     );
-    assert!(state.pending_rollback.is_empty());
+    assert_eq!(
+        state.pending_rollback,
+        [] as [crate::ui::state::PendingRollback; 0]
+    );
     assert_eq!(retained(&state), &pending);
     assert_eq!(state.overlays.last(), Some(&details));
 }

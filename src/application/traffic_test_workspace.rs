@@ -1,7 +1,7 @@
 //! Pure application-owned lifecycle for current-configuration traffic tests.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use crate::domain::{
     EvaluationContext, EvaluationPhase, EvaluationSnapshotIdentity, EvaluationTarget, TrafficSuite,
@@ -441,10 +441,7 @@ impl TrafficTestWorkspace {
 }
 
 fn allocate(counter: &AtomicU64) -> Result<u64, WorkspaceError> {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .map(|previous| previous + 1)
-        .map_err(|_| WorkspaceError::IdentityExhausted)
+    super::identity::next_id(counter).ok_or(WorkspaceError::IdentityExhausted)
 }
 
 fn map_failure(reason: &TrafficTestFailureReason) -> WorkspaceFailure {

@@ -123,8 +123,8 @@ mod tests {
             InstallMethod::SystemPackage,
             InstallMethod::Unknown,
         ] {
-            assert!(!method.upgrade_hint().is_empty());
-            assert!(!method.label().is_empty());
+            assert_ne!(method.upgrade_hint(), "");
+            assert_ne!(method.label(), "");
         }
     }
 }

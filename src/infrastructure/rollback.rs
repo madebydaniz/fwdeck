@@ -366,7 +366,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(runner.seen().is_empty());
+        assert_eq!(
+            runner.seen(),
+            [] as [crate::infrastructure::process::CommandRequest; 0]
+        );
     }
 
     #[tokio::test]

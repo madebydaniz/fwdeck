@@ -535,7 +535,7 @@ mod tests {
         let report = apply_plan(plan);
         assert_eq!(report.removed, vec![old]);
         assert_eq!(report.reclaimed_bytes, 3);
-        assert!(report.failures.is_empty());
+        assert_eq!(report.failures, [] as [std::string::String; 0]);
         assert!(!dir.join("snapshot-1.json").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -566,7 +566,7 @@ mod tests {
             ..RetentionPlan::default()
         };
         let report = apply_plan(plan);
-        assert!(report.removed.is_empty());
+        assert_eq!(report.removed, [] as [std::path::PathBuf; 0]);
         assert_eq!(report.failures.len(), 1);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
         let _ = std::fs::remove_dir_all(dir);
@@ -595,7 +595,7 @@ mod tests {
         };
         std::fs::write(dir.join(pin_name("snapshot-1.json")), "pinned").unwrap();
         let report = apply_plan(plan);
-        assert!(report.removed.is_empty());
+        assert_eq!(report.removed, [] as [std::path::PathBuf; 0]);
         assert_eq!(report.skipped_protected, vec![path.clone()]);
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(root);

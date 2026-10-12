@@ -98,7 +98,10 @@ fn traffic_preview_after_changed_refresh_requires_new_review() {
     changed.default_zone = ZoneName::parse("drop").unwrap();
     refresh(&mut state, changed);
 
-    assert!(update(&mut state, UiAction::PreviewTraffic).is_empty());
+    assert_eq!(
+        update(&mut state, UiAction::PreviewTraffic),
+        [] as [crate::ui::action::Effect; 0]
+    );
     assert_eq!(state.overlays, parent);
 }
 

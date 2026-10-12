@@ -170,7 +170,10 @@ mod tests {
 
         let counters = read_with(&runner).await.unwrap();
 
-        assert!(!counters.is_empty());
+        assert_ne!(
+            counters,
+            [] as [crate::domain::observation::ChainCounter; 0]
+        );
         assert_eq!(
             runner.seen.lock().unwrap().as_slice(),
             [CommandRequest {
@@ -208,7 +211,10 @@ mod tests {
     #[test]
     fn no_counters_is_empty_not_an_error() {
         let empty = r#"{ "nftables": [ { "metainfo": { "version": "1.0.9" } } ] }"#;
-        assert!(parse(empty).unwrap().is_empty());
+        assert_eq!(
+            parse(empty).unwrap(),
+            [] as [crate::domain::observation::ChainCounter; 0]
+        );
     }
 
     #[test]

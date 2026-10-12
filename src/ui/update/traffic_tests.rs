@@ -84,7 +84,7 @@ mod tests {
                 assert_eq!(effects, vec![Effect::TrafficObserve(Some(envelope))]);
             } else {
                 assert!(state.traffic_observation.is_none());
-                assert!(effects.is_empty());
+                assert_eq!(effects, [] as [crate::ui::action::Effect; 0]);
             }
         }
     }

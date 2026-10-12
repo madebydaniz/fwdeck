@@ -343,7 +343,7 @@ async fn real_shell_preserves_malformed_and_future_default_suite_bytes() {
             &mut state,
             UiAction::TrafficEdit(EditAction::New(crate::ui::traffic_test_form::Template::Ssh)),
         );
-        assert!(state.overlays.is_empty());
+        assert_eq!(state.overlays, [] as [crate::ui::overlays::Overlay; 0]);
         let candidate = Arc::new(TrafficSuite {
             id: TrafficSuiteId::parse("default").unwrap(),
             name: "Replacement".into(),

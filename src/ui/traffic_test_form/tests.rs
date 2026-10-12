@@ -47,9 +47,9 @@ fn traffic_test_form_templates_require_explicit_source_and_never_enable_gates() 
         assert_eq!(draft.destination_port, port);
         assert_eq!(draft.expectation, expectation);
         assert_eq!(draft.severity, severity);
-        assert!(draft.source.is_empty());
+        assert_eq!(draft.source, "");
         assert_eq!(draft.ingress, 0);
-        assert!(draft.ingress_value.is_empty());
+        assert_eq!(draft.ingress_value, "");
         assert!(draft.enabled);
         assert!(draft.scenario(id()).is_err());
         draft.name = "Explicit name".into();

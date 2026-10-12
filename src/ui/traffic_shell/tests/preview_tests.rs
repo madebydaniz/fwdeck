@@ -159,7 +159,10 @@ fn traffic_preview_scoped_key_and_exact_review_only() {
         keymap::translate(&s, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
         None
     );
-    assert!(update(&mut s, UiAction::PreviewTraffic).is_empty());
+    assert_eq!(
+        update(&mut s, UiAction::PreviewTraffic),
+        [] as [crate::ui::action::Effect; 0]
+    );
     s.overlays = vec![Overlay::Palette(crate::ui::palette::PaletteState::default())];
     for ch in ['p', 'پ'] {
         assert_eq!(
@@ -249,7 +252,10 @@ fn traffic_preview_stale_before_p_and_disabled_palette_reasons() {
         s.traffic_observation.as_ref().unwrap().identity(),
         other,
     ));
-    assert!(update(&mut s, UiAction::PreviewTraffic).is_empty());
+    assert_eq!(
+        update(&mut s, UiAction::PreviewTraffic),
+        [] as [crate::ui::action::Effect; 0]
+    );
     assert_eq!(s.overlays.len(), 1);
     s.staged = vec![operation()];
     assert!(
@@ -326,7 +332,10 @@ async fn traffic_preview_lazy_both_targets_details_and_responsive_final_trace() 
             text.contains(&last),
             "final trace missing at {width}x{height}: {last}"
         );
-        assert!(update(&mut s, UiAction::CloseOverlay).is_empty());
+        assert_eq!(
+            update(&mut s, UiAction::CloseOverlay),
+            [] as [crate::ui::action::Effect; 0]
+        );
         assert!(preview(&s).current());
     }
     update(&mut s, UiAction::PreviewDetails);

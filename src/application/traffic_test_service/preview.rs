@@ -14,7 +14,7 @@ use crate::domain::{
     OperationTargetSequence, OrderedOperationDigest, compare_traffic_reports,
     validate_preview_report,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 static INTENT: AtomicU64 = AtomicU64::new(0);
 
 pub(super) struct PreviewBatch {
@@ -369,10 +369,8 @@ fn prepare_evidence(
     runtime: bool,
     permanent: bool,
 ) -> Result<Arc<TrafficPreviewEvidence>, TrafficServiceError> {
-    let intent = INTENT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .map_err(|_| TrafficServiceError::IdentityExhausted)?
-        + 1;
+    let intent =
+        super::super::identity::next_id(&INTENT).ok_or(TrafficServiceError::IdentityExhausted)?;
     let intent_id =
         MutationIntentId::new(intent).map_err(|_| TrafficServiceError::IdentityExhausted)?;
     let identity = request.observation.identity();
