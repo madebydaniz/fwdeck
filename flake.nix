@@ -14,7 +14,7 @@
       packages = forAll (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "fwdeck";
-          version = "0.5.1"; # x-release-please-version
+          version = "0.5.2"; # x-release-please-version
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
           # firewalld / firewall-cmd is a runtime dependency, resolved on PATH

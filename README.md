@@ -72,9 +72,9 @@ GNU release builds target **glibc 2.34 or newer** (EL9). The release pipeline
 checks the packaged binaries on AlmaLinux 9 and startup on clean AlmaLinux 9
 and Oracle Linux 9 runtimes before upload.
 
-**v0.5.1:** its GNU binaries require glibc 2.39. Until the corrected release
-is available, use the signed `*-unknown-linux-musl.tar.gz` archive on EL9,
-or compile from source. Verify the archive's checksum and release signature.
+**v0.5.1:** its GNU binaries require glibc 2.39. On EL9, upgrade to v0.5.2
+or newer, or use the signed `*-unknown-linux-musl.tar.gz` archive for v0.5.1.
+Verify the archive's checksum and release signature before installing.
 
 Prefer a script? It verifies the SHA-256 checksums and the Cosign release
 signature before installing. Read it first, then run it:
